@@ -1,0 +1,68 @@
+# Example config.yaml - Copy this to config.yaml and customize
+
+# Log Management Settings
+logManagement:
+  autoDelete: true              # Enable automatic deletion of old logs
+  retentionDays: 7             # Keep logs for 7 days
+  checkInterval: 3600000       # Check every hour (in milliseconds)
+
+# Cloudflare Tunnel Settings (Optional)
+# When tunnel token is provided, a Cloudflare Tunnel will be created
+# allowing you to access the dashboard online securely
+cloudflare:
+  enabled: false                # Set to true to enable Cloudflare Tunnel
+  tunnelToken: ""              # Your Cloudflare Tunnel token (get from Cloudflare Zero Trust dashboard)
+
+# Scripts Configuration
+# PM2 automatically detects script types based on file extension:
+# - .js, .mjs, .cjs, .ts → Runs with node
+# - .py → Runs with python
+# - .sh → Runs with bash
+# - .rb → Runs with ruby
+# - Any other executable file → Runs directly
+scripts:
+  # Example 1: Long-running JavaScript script (Forever type)
+  - name: exampleForever
+    path: ./scripts/exampleForever.js
+    type: forever                # Runs continuously, auto-restarts on crash
+    args: []                     # Command-line arguments
+    env: {}                      # Environment variables
+
+  # Example 2: Scheduled Python script (Cron type)
+  - name: exampleCron
+    path: ./scripts/exampleCron.py
+    type: cron                   # Runs on schedule
+    schedule: '0 * * * *'        # Cron syntax: runs every hour
+    count: 5                     # Optional: limit number of runs (remove for unlimited)
+    args: ["--foo", "bar"]       # Command-line arguments
+    env: {FOO: "bar"}           # Environment variables
+
+  # Example 3: Shell script running forever
+  # - name: myShellScript
+  #   path: ./scripts/backup.sh
+  #   type: forever
+  #   args: []
+  #   env: {BACKUP_DIR: "/data"}
+
+  # Example 4: Scheduled task that runs daily at midnight
+  # - name: dailyCleanup
+  #   path: ./scripts/cleanup.py
+  #   type: cron
+  #   schedule: '0 0 * * *'      # Daily at midnight
+  #   args: []
+  #   env: {}
+
+  # Example 5: Direct command line execution (no script file needed)
+  # - name: apiWebhook
+  #   command: curl -X POST https://api.example.com/webhook -H "Content-Type: application/json" -d '{"status":"running"}'
+  #   type: cron
+  #   schedule: '*/5 * * * *'    # Every 5 minutes
+  #   args: []
+  #   env: {API_KEY: "your-key"}
+
+  # Example 6: Forever command that runs continuously
+  # - name: monitorService
+  #   command: ping -c 1 google.com && echo "Service is up"
+  #   type: forever
+  #   args: []
+  #   env: {}

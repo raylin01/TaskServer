@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TaskServer - Scripts</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>TaskServer</h1>
+    <nav>
+      <a href="/scripts">Scripts</a> |
+      <a href="/add-script">Add Script</a> |
+      <a href="/settings">Settings</a>
+    </nav>
+  </header>
+  <main>
+    <h2>Scripts</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th><th>Type</th><th>Source</th><th>Schedule</th><th>Status</th><th>Actions</th><th>Logs</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% scripts.forEach(script => { %>
+          <tr>
+            <td><strong><%= script.name %></strong></td>
+            <td><span class="badge badge-<%= script.type %>"><%= script.type %></span></td>
+            <td>
+              <% if (script.command) { %>
+                <span title="<%= script.command %>" style="font-family: monospace; font-size: 0.85em;">
+                  💻 <%= script.command.length > 40 ? script.command.substring(0, 40) + '...' : script.command %>
+                </span>
+              <% } else { %>
+                <span title="<%= script.path %>" style="font-family: monospace; font-size: 0.85em;">
+                  📄 <%= script.path %>
+                </span>
+              <% } %>
+            </td>
+            <td><%= script.schedule || '-' %></td>
+            <td>
+              <% if (script.type === 'cron') { %>
+                <% const cronHistory = cronRunHistory[script.name]; %>
+                <% if (cronHistory && cronHistory.lastRun) { %>
+                  <span class="status status-cron">Last run: <%= new Date(cronHistory.lastRun).toLocaleString() %></span>
+                <% } else { %>
+                  <span class="status status-pending">Last run: None</span>
+                <% } %>
+              <% } else { %>
+                <% const pm2proc = pm2list.find(p => p.name === script.name); %>
+                <% if (pm2proc) { %>
+                  <span class="status status-<%= pm2proc.pm2_env.status %>"><%= pm2proc.pm2_env.status %></span>
+                <% } else { %>
+                  <span class="status status-stopped">Stopped</span>
+                <% } %>
+              <% } %>
+            </td>
+            <td class="actions">
+              <form method="post" action="/stop-script/<%= script.name %>" style="display:inline">
+                <button type="submit" class="btn-action btn-stop" title="Stop">
+                  <span class="icon">■</span>
+                </button>
+              </form>
+              <form method="post" action="/restart-script/<%= script.name %>" style="display:inline">
+                <button type="submit" class="btn-action btn-restart" title="Restart">
+                  <span class="icon">↻</span>
+                </button>
+              </form>
+              <a href="/edit-script/<%= script.name %>" class="btn-action btn-edit" title="Edit">
+                <span class="icon">✎</span>
+              </a>
+            </td>
+            <td><a href="/logs/<%= script.name %>" class="btn-link">
+              <span class="icon">☰</span> View Logs
+            </a></td>
+          </tr>
+        <% }) %>
+      </tbody>
+    </table>
+  </main>
+  <footer>
+    <small>&copy; 2025 TaskServer</small>
+  </footer>
+</body>
+</html>

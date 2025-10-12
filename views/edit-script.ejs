@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TaskServer - Edit Script</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>TaskServer</h1>
+    <nav>
+      <a href="/scripts">Scripts</a> |
+      <a href="/add-script">Add Script</a> |
+      <a href="/settings">Settings</a>
+    </nav>
+  </header>
+  <main>
+    <h2>Edit Script: <%= script.name %></h2>
+    <form method="post" action="/edit-script/<%= script.name %>" class="script-form">
+      <div class="form-group">
+        <label for="name">Script Name <span class="required">*</span></label>
+        <input type="text" id="name" name="name" required value="<%= script.name %>">
+        <small>Unique identifier for this script</small>
+      </div>
+
+      <div class="form-group">
+        <label for="sourceType">Script Source <span class="required">*</span></label>
+        <select id="sourceType" name="sourceType" onchange="toggleSourceType()">
+          <option value="file" <%= script.path ? 'selected' : '' %>>Script File</option>
+          <option value="command" <%= script.command ? 'selected' : '' %>>Command Line</option>
+        </select>
+        <small id="sourceTypeHelp">Run a script file from disk</small>
+      </div>
+
+      <div class="form-group" id="pathGroup" style="display: <%= script.path ? 'block' : 'none' %>;">
+        <label for="path">Script Path <span class="required">*</span></label>
+        <input type="text" id="path" name="path" value="<%= script.path || '' %>">
+        <small>Relative or absolute path to your script file</small>
+      </div>
+
+      <div class="form-group" id="commandGroup" style="display: <%= script.command ? 'block' : 'none' %>;">
+        <label for="command">Command <span class="required">*</span></label>
+        <input type="text" id="command" name="command" value="<%= script.command || '' %>">
+        <small>Any shell command to execute (e.g., curl, wget, echo, custom scripts)</small>
+      </div>
+
+      <div class="form-group">
+        <label for="type">Execution Type <span class="required">*</span></label>
+        <select id="type" name="type" onchange="toggleCronOptions()">
+          <option value="forever" <%= script.type === 'forever' ? 'selected' : '' %>>Forever (Always Running)</option>
+          <option value="cron" <%= script.type === 'cron' ? 'selected' : '' %>>Cron (Scheduled)</option>
+        </select>
+        <small id="typeHelp">Script will run continuously and restart on crash</small>
+      </div>
+
+      <div id="cronOptions" style="display: <%= script.type === 'cron' ? 'block' : 'none' %>;">
+        <div class="form-group">
+          <label>Cron Schedule Builder</label>
+          <div class="cron-builder">
+            <div class="cron-quick">
+              <strong>Quick Presets:</strong>
+              <button type="button" onclick="setCronFromPreset('* * * * *')">Every Minute</button>
+              <button type="button" onclick="setCronFromPreset('*/5 * * * *')">Every 5 Min</button>
+              <button type="button" onclick="setCronFromPreset('0 * * * *')">Hourly</button>
+              <button type="button" onclick="setCronFromPreset('0 0 * * *')">Daily at Midnight</button>
+              <button type="button" onclick="setCronFromPreset('0 9 * * 1-5')">Weekdays at 9am</button>
+            </div>
+            
+            <div class="cron-builder-interactive">
+              <strong>Or build your schedule:</strong>
+              <div class="cron-fields">
+                <div class="cron-field">
+                  <label>Minute</label>
+                  <select id="cronMinute" onchange="buildCronString()">
+                    <option value="*">Every minute (*)</option>
+                    <option value="0">0</option>
+                    <option value="*/5">Every 5 (*/5)</option>
+                    <option value="*/10">Every 10 (*/10)</option>
+                    <option value="*/15">Every 15 (*/15)</option>
+                    <option value="*/30">Every 30 (*/30)</option>
+                  </select>
+                </div>
+                
+                <div class="cron-field">
+                  <label>Hour</label>
+                  <select id="cronHour" onchange="buildCronString()">
+                    <option value="*">Every hour (*)</option>
+                    <option value="0">Midnight (0)</option>
+                    <option value="6">6 AM</option>
+                    <option value="9">9 AM</option>
+                    <option value="12">Noon (12)</option>
+                    <option value="18">6 PM</option>
+                    <option value="*/2">Every 2 hours (*/2)</option>
+                    <option value="*/6">Every 6 hours (*/6)</option>
+                  </select>
+                </div>
+                
+                <div class="cron-field">
+                  <label>Day of Month</label>
+                  <select id="cronDay" onchange="buildCronString()">
+                    <option value="*">Every day (*)</option>
+                    <option value="1">1st</option>
+                    <option value="15">15th</option>
+                    <option value="*/7">Every 7 days (*/7)</option>
+                  </select>
+                </div>
+                
+                <div class="cron-field">
+                  <label>Month</label>
+                  <select id="cronMonth" onchange="buildCronString()">
+                    <option value="*">Every month (*)</option>
+                    <option value="1">January</option>
+                    <option value="2">February</option>
+                    <option value="3">March</option>
+                    <option value="4">April</option>
+                    <option value="5">May</option>
+                    <option value="6">June</option>
+                    <option value="7">July</option>
+                    <option value="8">August</option>
+                    <option value="9">September</option>
+                    <option value="10">October</option>
+                    <option value="11">November</option>
+                    <option value="12">December</option>
+                  </select>
+                </div>
+                
+                <div class="cron-field">
+                  <label>Day of Week</label>
+                  <select id="cronWeekday" onchange="buildCronString()">
+                    <option value="*">Every day (*)</option>
+                    <option value="1">Monday</option>
+                    <option value="2">Tuesday</option>
+                    <option value="3">Wednesday</option>
+                    <option value="4">Thursday</option>
+                    <option value="5">Friday</option>
+                    <option value="6">Saturday</option>
+                    <option value="0">Sunday</option>
+                    <option value="1-5">Weekdays (Mon-Fri)</option>
+                    <option value="0,6">Weekends (Sat-Sun)</option>
+                  </select>
+                </div>
+              </div>
+              
+              <div class="cron-preview">
+                <strong>Generated Cron Expression:</strong>
+                <div class="cron-output">
+                  <code id="cronPreview"><%= script.schedule || '* * * * *' %></code>
+                  <span id="cronDescription" class="cron-desc">Custom schedule</span>
+                </div>
+              </div>
+            </div>
+            
+            <div class="cron-custom">
+              <label for="schedule">Manual Override (Advanced):</label>
+              <input type="text" id="schedule" name="schedule" value="<%= script.schedule || '' %>" placeholder="* * * * *" oninput="updateCronDescription()">
+              <small>Format: minute hour day month weekday</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="count">Max Runs (optional)</label>
+          <input type="number" id="count" name="count" min="1" value="<%= script.count || '' %>" placeholder="Leave empty for unlimited">
+          <small>Maximum number of times this cron job should run</small>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="args">Arguments (optional)</label>
+        <input type="text" id="args" name="args" value="<%= (script.args || []).join(', ') %>" placeholder="--flag1, value1, --flag2, value2">
+        <small>Comma-separated list of arguments to pass to the script</small>
+      </div>
+
+      <div class="form-group">
+        <label for="env">Environment Variables (optional)</label>
+        <textarea id="env" name="env" rows="3" placeholder='{"KEY1": "value1", "KEY2": "value2"}'><%= JSON.stringify(script.env || {}) %></textarea>
+        <small>JSON object of environment variables</small>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit" class="btn-primary">Save Changes</button>
+        <a href="/scripts" class="btn-secondary">Cancel</a>
+      </div>
+    </form>
+  </main>
+  <footer>
+    <small>&copy; 2025 TaskServer</small>
+  </footer>
+
+  <script>
+    function toggleSourceType() {
+      const sourceType = document.getElementById('sourceType').value;
+      const pathGroup = document.getElementById('pathGroup');
+      const commandGroup = document.getElementById('commandGroup');
+      const sourceTypeHelp = document.getElementById('sourceTypeHelp');
+      const pathInput = document.getElementById('path');
+      const commandInput = document.getElementById('command');
+      
+      if (sourceType === 'command') {
+        pathGroup.style.display = 'none';
+        commandGroup.style.display = 'block';
+        sourceTypeHelp.textContent = 'Execute a shell command directly';
+        pathInput.removeAttribute('required');
+        commandInput.setAttribute('required', 'required');
+      } else {
+        pathGroup.style.display = 'block';
+        commandGroup.style.display = 'none';
+        sourceTypeHelp.textContent = 'Run a script file from disk';
+        pathInput.setAttribute('required', 'required');
+        commandInput.removeAttribute('required');
+      }
+    }
+
+    function toggleCronOptions() {
+      const type = document.getElementById('type').value;
+      const cronOptions = document.getElementById('cronOptions');
+      const typeHelp = document.getElementById('typeHelp');
+      
+      if (type === 'cron') {
+        cronOptions.style.display = 'block';
+        typeHelp.textContent = 'Script will run on a schedule';
+      } else {
+        cronOptions.style.display = 'none';
+        typeHelp.textContent = 'Script will run continuously and restart on crash';
+      }
+    }
+
+    function setCronFromPreset(cronString) {
+      document.getElementById('schedule').value = cronString;
+      parseCronString(cronString);
+      updateCronDescription();
+    }
+
+    function buildCronString() {
+      const minute = document.getElementById('cronMinute').value;
+      const hour = document.getElementById('cronHour').value;
+      const day = document.getElementById('cronDay').value;
+      const month = document.getElementById('cronMonth').value;
+      const weekday = document.getElementById('cronWeekday').value;
+      
+      const cronString = `${minute} ${hour} ${day} ${month} ${weekday}`;
+      document.getElementById('schedule').value = cronString;
+      document.getElementById('cronPreview').textContent = cronString;
+      updateCronDescription();
+    }
+
+    function parseCronString(cronString) {
+      const parts = cronString.split(' ');
+      if (parts.length >= 5) {
+        const selects = ['cronMinute', 'cronHour', 'cronDay', 'cronMonth', 'cronWeekday'];
+        selects.forEach((id, i) => {
+          const select = document.getElementById(id);
+          const value = parts[i];
+          // Try to set the value, or keep default if not in options
+          const option = Array.from(select.options).find(opt => opt.value === value);
+          if (option) select.value = value;
+        });
+        document.getElementById('cronPreview').textContent = cronString;
+      }
+    }
+
+    function updateCronDescription() {
+      const cron = document.getElementById('schedule').value;
+      const desc = document.getElementById('cronDescription');
+      
+      const descriptions = {
+        '* * * * *': 'Runs every minute',
+        '*/5 * * * *': 'Runs every 5 minutes',
+        '0 * * * *': 'Runs every hour at minute 0',
+        '0 0 * * *': 'Runs daily at midnight',
+        '0 0 * * 0': 'Runs weekly on Sunday at midnight',
+        '0 9 * * 1-5': 'Runs weekdays at 9:00 AM',
+        '*/10 * * * *': 'Runs every 10 minutes',
+        '*/15 * * * *': 'Runs every 15 minutes',
+        '*/30 * * * *': 'Runs every 30 minutes',
+        '0 */2 * * *': 'Runs every 2 hours',
+        '0 */6 * * *': 'Runs every 6 hours',
+        '0 12 * * *': 'Runs daily at noon',
+      };
+      
+      desc.textContent = descriptions[cron] || 'Custom schedule';
+      document.getElementById('cronPreview').textContent = cron;
+    }
+
+    // Initialize on page load
+    toggleSourceType();
+    toggleCronOptions();
+    const existingCron = document.getElementById('schedule').value;
+    if (existingCron) {
+      parseCronString(existingCron);
+      updateCronDescription();
+    }
+  </script>
+</body>
+</html>

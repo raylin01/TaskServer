@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TaskServer - Logs - <%= scriptName %></title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>TaskServer</h1>
+    <nav>
+      <a href="/scripts">Scripts</a> |
+      <a href="/add-script">Add Script</a> |
+      <a href="/settings">Settings</a>
+    </nav>
+  </header>
+  <main class="logs-page">
+    <div class="logs-header">
+      <h2>📋 Logs for <code><%= scriptName %></code></h2>
+      <a href="/scripts" class="btn-secondary">← Back to Scripts</a>
+    </div>
+
+    <div class="logs-stats">
+      <div class="stat-card">
+        <div class="stat-label">Total Log Files</div>
+        <div class="stat-value"><%= stats.count %></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Size</div>
+        <div class="stat-value"><%= stats.count > 0 ? logs.reduce((sum, l) => sum + l.size, 0) : 0 %> bytes</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Latest Log</div>
+        <div class="stat-value"><%= stats.newest ? new Date(stats.newest.mtime).toLocaleString() : 'None' %></div>
+      </div>
+    </div>
+
+    <div class="logs-controls">
+      <button class="refresh-btn" onclick="refreshLogs()">
+        <span class="icon">↻</span> Refresh Now
+      </button>
+      <div class="auto-refresh-wrapper">
+        <span class="toggle-label">Auto-refresh (5s)</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="autoRefresh" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <select id="logFilter" onchange="filterLogs()">
+        <option value="all">All Logs</option>
+        <option value="out">Output Only</option>
+        <option value="error">Errors Only</option>
+      </select>
+    </div>
+
+    <div class="logs-container">
+      <div class="logs-sidebar">
+        <h3>Log Files <span class="file-count">(<span id="fileCount"><%= logs.length %></span>)</span></h3>
+        <div id="logList" class="log-list">
+          <% if (logs.length === 0) { %>
+            <div class="no-logs">No log files found</div>
+          <% } else { %>
+            <% logs.forEach(log => { %>
+              <a href="/logs/<%= scriptName %>?file=<%= log.name %>" 
+                 class="log-item <%= log.name === selectedLog ? 'active' : '' %>"
+                 data-type="<%= log.name.includes('error') ? 'error' : 'out' %>">
+                <div class="log-item-header">
+                  <span class="log-icon <%= log.name.includes('error') ? 'error' : 'out' %>">
+                    <%= log.name.includes('error') ? '✕' : '○' %>
+                  </span>
+                  <span class="log-name"><%= log.name %></span>
+                </div>
+                <div class="log-item-meta">
+                  <span class="log-size"><%= log.sizeFormatted %></span>
+                  <span class="log-time"><%= new Date(log.mtime).toLocaleTimeString() %></span>
+                </div>
+              </a>
+            <% }) %>
+          <% } %>
+        </div>
+      </div>
+
+      <div class="logs-content">
+        <div class="log-viewer-header">
+          <h3 id="currentLog"><%= selectedLog || 'Select a log file' %></h3>
+          <div class="log-actions">
+            <button onclick="downloadLog()" class="btn-action btn-download" title="Download Log">
+              <span class="icon">⇓</span>
+            </button>
+            <button onclick="deleteLog()" class="btn-action btn-delete" title="Delete Log">
+              <span class="icon">✕</span>
+            </button>
+          </div>
+        </div>
+        <pre id="logContent" class="log-viewer"><%= logContent || 'No log content' %></pre>
+      </div>
+    </div>
+  </main>
+  <footer>
+    <small>&copy; 2025 TaskServer</small>
+  </footer>
+  
+  <script>
+    const scriptName = '<%= scriptName %>';
+    let currentFile = '<%= selectedLog %>';
+    let refreshInterval = null;
+    
+    function refreshLogs() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const file = urlParams.get('file') || currentFile;
+      
+      fetch(`/api/logs/${scriptName}?file=${file}`)
+        .then(res => res.json())
+        .then(data => {
+          document.getElementById('logContent').textContent = data.logContent;
+          document.getElementById('currentLog').textContent = data.selectedLog;
+          
+          // Update log list
+          const logList = document.getElementById('logList');
+          logList.innerHTML = data.logs.map(log => {
+            const isError = log.name.includes('error');
+            return `<a href="/logs/${scriptName}?file=${log.name}" 
+                       class="log-item ${log.name === data.selectedLog ? 'active' : ''}"
+                       data-type="${isError ? 'error' : 'out'}">
+                      <div class="log-item-header">
+                        <span class="log-icon ${isError ? 'error' : 'out'}">${isError ? '✕' : '○'}</span>
+                        <span class="log-name">${log.name}</span>
+                      </div>
+                      <div class="log-item-meta">
+                        <span class="log-size">${log.sizeFormatted}</span>
+                        <span class="log-time">${new Date(log.mtime).toLocaleTimeString()}</span>
+                      </div>
+                    </a>`;
+          }).join('');
+          
+          document.getElementById('fileCount').textContent = data.logs.length;
+          currentFile = data.selectedLog;
+          filterLogs(); // Reapply filter
+        })
+        .catch(err => console.error('Failed to refresh logs:', err));
+    }
+    
+    function filterLogs() {
+      const filter = document.getElementById('logFilter').value;
+      const items = document.querySelectorAll('.log-item');
+      let visibleCount = 0;
+      
+      items.forEach(item => {
+        const type = item.getAttribute('data-type');
+        if (filter === 'all' || filter === type) {
+          item.style.display = 'block';
+          visibleCount++;
+        } else {
+          item.style.display = 'none';
+        }
+      });
+      
+      document.getElementById('fileCount').textContent = visibleCount;
+    }
+    
+    function downloadLog() {
+      if (!currentFile) {
+        alert('No log file selected');
+        return;
+      }
+      // Create a download link
+      const link = document.createElement('a');
+      link.href = `/api/logs/${scriptName}/download?file=${currentFile}`;
+      link.download = currentFile;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+    
+    function deleteLog() {
+      if (!currentFile) {
+        alert('No log file selected');
+        return;
+      }
+      
+      if (!confirm(`Are you sure you want to delete ${currentFile}?`)) {
+        return;
+      }
+      
+      fetch(`/api/logs/${scriptName}/delete?file=${currentFile}`, { method: 'DELETE' })
+        .then(res => res.json())
+        .then(data => {
+          if (data.success) {
+            alert('Log file deleted successfully');
+            window.location.reload();
+          } else {
+            alert('Failed to delete log: ' + data.error);
+          }
+        })
+        .catch(err => {
+          alert('Error deleting log: ' + err.message);
+        });
+    }
+    
+    // Auto-refresh toggle
+    document.getElementById('autoRefresh').addEventListener('change', function(e) {
+      if (e.target.checked) {
+        refreshInterval = setInterval(refreshLogs, 5000);
+      } else {
+        if (refreshInterval) {
+          clearInterval(refreshInterval);
+          refreshInterval = null;
+        }
+      }
+    });
+    
+    // Start auto-refresh by default
+    refreshInterval = setInterval(refreshLogs, 5000);
+    
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      if (refreshInterval) clearInterval(refreshInterval);
+    });
+  </script>
+</body>
+</html>
