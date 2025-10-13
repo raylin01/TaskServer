@@ -99,6 +99,11 @@
               <a href="/edit-script/<%= script.name %>" class="btn-action btn-edit" title="Edit">
                 <span class="icon">✎</span>
               </a>
+              <form method="post" action="/delete-script/<%= script.name %>" style="display:inline" onsubmit="return confirmDelete('<%= script.name %>')">
+                <button type="submit" class="btn-action btn-delete" title="Delete">
+                  <span class="icon">✕</span>
+                </button>
+              </form>
             </td>
             <td><a href="/logs/<%= script.name %>" class="btn-link">
               <span class="icon">☰</span> View Logs
@@ -111,5 +116,10 @@
   <footer>
     <small>&copy; 2025 TaskServer</small>
   </footer>
+  <script>
+    function confirmDelete(scriptName) {
+      return confirm(`Are you sure you want to delete the script "${scriptName}"?\n\nThis will:\n- Remove the script from the configuration\n- Stop the script if it's running\n- Keep the log files (you can delete them separately)\n\nThis action cannot be undone.`);
+    }
+  </script>
 </body>
 </html>

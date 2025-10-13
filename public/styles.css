@@ -66,6 +66,8 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
 .btn-restart:hover { background: #e0a800; }
 .btn-edit { background: #17a2b8; color: white; }
 .btn-edit:hover { background: #138496; }
+.btn-delete { background: #6c757d; color: white; }
+.btn-delete:hover { background: #5a6268; }
 
 .btn-link { color: #007bff; text-decoration: none; }
 .btn-link:hover { text-decoration: underline; }

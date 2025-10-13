@@ -182,6 +182,39 @@ router.post('/edit-script/:scriptName', (req, res) => {
   res.redirect('/scripts');
 });
 
+// Delete a script
+router.post('/delete-script/:scriptName', (req, res) => {
+  const config = configHandler.loadConfig();
+  const scriptIndex = config.scripts.findIndex(s => s.name === req.params.scriptName);
+  
+  if (scriptIndex === -1) {
+    return res.status(404).send('Script not found');
+  }
+  
+  const script = config.scripts[scriptIndex];
+  
+  // If it's a forever script, stop it from PM2 first
+  if (script.type === 'forever') {
+    pm2.connect(() => {
+      pm2.delete(req.params.scriptName, (err) => {
+        if (err) console.error(`Failed to delete ${req.params.scriptName} from PM2:`, err);
+        pm2.disconnect();
+      });
+    });
+  }
+  
+  // If it's a cron job, mark it in suspended state (it will be removed on next restart)
+  if (script.type === 'cron' && req.app.locals.cronSuspended) {
+    req.app.locals.cronSuspended[req.params.scriptName] = true;
+  }
+  
+  // Remove from config
+  config.scripts.splice(scriptIndex, 1);
+  configHandler.writeConfig(config);
+  
+  res.redirect('/scripts');
+});
+
 // Stop a running script (forever tasks only)
 router.post('/stop-script/:scriptName', (req, res) => {
   pm2.connect(() => {
