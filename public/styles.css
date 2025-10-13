@@ -60,6 +60,8 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
 }
 .btn-stop { background: #dc3545; color: white; }
 .btn-stop:hover { background: #c82333; }
+.btn-start { background: #28a745; color: white; }
+.btn-start:hover { background: #218838; }
 .btn-restart { background: #ffc107; color: #000; }
 .btn-restart:hover { background: #e0a800; }
 .btn-edit { background: #17a2b8; color: white; }

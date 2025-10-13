@@ -35,6 +35,12 @@ pm2.connect(function(err) {
   }
   config.scripts.forEach(script => {
     if (script.type === 'forever') {
+      // Only start if not marked as stopped
+      if (script.stopped) {
+        console.log(`Skipping ${script.name} (marked as stopped)`);
+        return;
+      }
+      
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const pm2Config = {
         name: script.name,
@@ -67,6 +73,7 @@ pm2.connect(function(err) {
 // Setup cron jobs with last run tracking
 const cronJobs = [];
 const cronRunHistory = {}; // Track last run times
+const cronSuspended = {}; // Track suspended cron jobs
 
 config.scripts.forEach(script => {
   if (script.type === 'cron' && script.schedule) {
@@ -75,9 +82,11 @@ config.scripts.forEach(script => {
     
     // Initialize tracking
     cronRunHistory[script.name] = { lastRun: null, nextRun: null };
+    // Load suspended state from config
+    cronSuspended[script.name] = script.suspended || false;
     
     const job = cron.schedule(script.schedule, () => {
-      if (runCount >= maxRuns) return;
+      if (runCount >= maxRuns || cronSuspended[script.name]) return;
       runCount++;
       
       // Update last run time
@@ -111,8 +120,10 @@ config.scripts.forEach(script => {
   }
 });
 
-// Make cron history available to routes
+// Make cron history and jobs available to routes
 app.locals.cronRunHistory = cronRunHistory;
+app.locals.cronJobs = cronJobs;
+app.locals.cronSuspended = cronSuspended;
 
 // Use scripts router
 app.use('/', scriptsRouter);

@@ -20,6 +20,7 @@ router.get('/scripts', (req, res) => {
         scripts: config.scripts,
         pm2list: list || [],
         cronRunHistory: req.app.locals.cronRunHistory || {},
+        cronSuspended: req.app.locals.cronSuspended || {},
       });
       pm2.disconnect();
     });
@@ -164,12 +165,76 @@ router.post('/edit-script/:scriptName', (req, res) => {
   res.redirect('/scripts');
 });
 
-// Stop a running script
+// Stop a running script (forever tasks only)
 router.post('/stop-script/:scriptName', (req, res) => {
   pm2.connect(() => {
     pm2.stop(req.params.scriptName, () => {
+      // Save stopped status to config
+      const config = configHandler.loadConfig();
+      const script = config.scripts.find(s => s.name === req.params.scriptName);
+      if (script && script.type === 'forever') {
+        script.stopped = true;
+        configHandler.writeConfig(config);
+      }
       pm2.disconnect();
       res.redirect('/scripts');
+    });
+  });
+});
+
+// Start a stopped script (forever tasks only)
+router.post('/start-script/:scriptName', (req, res) => {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
+  
+  if (!script) {
+    return res.status(404).send('Script not found or not a forever task');
+  }
+  
+  pm2.connect(() => {
+    // Check if already running
+    pm2.list((err, list) => {
+      const isRunning = list.some(p => p.name === script.name);
+      
+      if (isRunning) {
+        // Just restart if already exists
+        pm2.restart(script.name, () => {
+          // Clear stopped status in config
+          script.stopped = false;
+          configHandler.writeConfig(config);
+          pm2.disconnect();
+          res.redirect('/scripts');
+        });
+      } else {
+        // Start fresh
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const pm2Config = {
+          name: script.name,
+          args: script.args || [],
+          env: script.env || {},
+          cwd: process.cwd(),
+          autorestart: true,
+          max_restarts: 10000,
+          out_file: `logs/${script.name}-out-${timestamp}.log`,
+          error_file: `logs/${script.name}-error-${timestamp}.log`,
+        };
+
+        if (script.command) {
+          pm2Config.script = '/bin/bash';
+          pm2Config.args = ['-c', script.command];
+        } else {
+          pm2Config.script = script.path;
+        }
+
+        pm2.start(pm2Config, (err) => {
+          if (err) console.error(`Failed to start ${script.name}:`, err);
+          // Clear stopped status in config
+          script.stopped = false;
+          configHandler.writeConfig(config);
+          pm2.disconnect();
+          res.redirect('/scripts');
+        });
+      }
     });
   });
 });
@@ -182,6 +247,40 @@ router.post('/restart-script/:scriptName', (req, res) => {
       res.redirect('/scripts');
     });
   });
+});
+
+// Suspend a cron job
+router.post('/suspend-cron/:scriptName', (req, res) => {
+  if (req.app.locals.cronSuspended) {
+    req.app.locals.cronSuspended[req.params.scriptName] = true;
+  }
+  
+  // Save suspended status to config
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'cron');
+  if (script) {
+    script.suspended = true;
+    configHandler.writeConfig(config);
+  }
+  
+  res.redirect('/scripts');
+});
+
+// Resume a cron job
+router.post('/resume-cron/:scriptName', (req, res) => {
+  if (req.app.locals.cronSuspended) {
+    req.app.locals.cronSuspended[req.params.scriptName] = false;
+  }
+  
+  // Clear suspended status from config
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'cron');
+  if (script) {
+    script.suspended = false;
+    configHandler.writeConfig(config);
+  }
+  
+  res.redirect('/scripts');
 });
 
 // Settings page

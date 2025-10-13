@@ -41,31 +41,61 @@
             <td>
               <% if (script.type === 'cron') { %>
                 <% const cronHistory = cronRunHistory[script.name]; %>
-                <% if (cronHistory && cronHistory.lastRun) { %>
+                <% const isSuspended = cronSuspended && cronSuspended[script.name]; %>
+                <% if (isSuspended) { %>
+                  <span class="status status-stopped">Suspended</span>
+                <% } else if (cronHistory && cronHistory.lastRun) { %>
                   <span class="status status-cron">Last run: <%= new Date(cronHistory.lastRun).toLocaleString() %></span>
                 <% } else { %>
                   <span class="status status-pending">Last run: None</span>
                 <% } %>
               <% } else { %>
                 <% const pm2proc = pm2list.find(p => p.name === script.name); %>
-                <% if (pm2proc) { %>
-                  <span class="status status-<%= pm2proc.pm2_env.status %>"><%= pm2proc.pm2_env.status %></span>
-                <% } else { %>
+                <% if (script.stopped || !pm2proc) { %>
                   <span class="status status-stopped">Stopped</span>
+                <% } else if (pm2proc) { %>
+                  <span class="status status-<%= pm2proc.pm2_env.status %>"><%= pm2proc.pm2_env.status %></span>
                 <% } %>
               <% } %>
             </td>
             <td class="actions">
-              <form method="post" action="/stop-script/<%= script.name %>" style="display:inline">
-                <button type="submit" class="btn-action btn-stop" title="Stop">
-                  <span class="icon">■</span>
-                </button>
-              </form>
-              <form method="post" action="/restart-script/<%= script.name %>" style="display:inline">
-                <button type="submit" class="btn-action btn-restart" title="Restart">
-                  <span class="icon">↻</span>
-                </button>
-              </form>
+              <% if (script.type === 'cron') { %>
+                <% const isSuspended = cronSuspended && cronSuspended[script.name]; %>
+                <% if (isSuspended) { %>
+                  <form method="post" action="/resume-cron/<%= script.name %>" style="display:inline">
+                    <button type="submit" class="btn-action btn-start" title="Resume">
+                      <span class="icon">▶</span>
+                    </button>
+                  </form>
+                <% } else { %>
+                  <form method="post" action="/suspend-cron/<%= script.name %>" style="display:inline">
+                    <button type="submit" class="btn-action btn-stop" title="Suspend">
+                      <span class="icon">■</span>
+                    </button>
+                  </form>
+                <% } %>
+              <% } else { %>
+                <% const pm2proc = pm2list.find(p => p.name === script.name); %>
+                <% const isStopped = script.stopped || !pm2proc || pm2proc.pm2_env.status === 'stopped'; %>
+                <% if (isStopped) { %>
+                  <form method="post" action="/start-script/<%= script.name %>" style="display:inline">
+                    <button type="submit" class="btn-action btn-start" title="Start">
+                      <span class="icon">▶</span>
+                    </button>
+                  </form>
+                <% } else { %>
+                  <form method="post" action="/stop-script/<%= script.name %>" style="display:inline">
+                    <button type="submit" class="btn-action btn-stop" title="Stop">
+                      <span class="icon">■</span>
+                    </button>
+                  </form>
+                <% } %>
+                <form method="post" action="/restart-script/<%= script.name %>" style="display:inline">
+                  <button type="submit" class="btn-action btn-restart" title="Restart">
+                    <span class="icon">↻</span>
+                  </button>
+                </form>
+              <% } %>
               <a href="/edit-script/<%= script.name %>" class="btn-action btn-edit" title="Edit">
                 <span class="icon">✎</span>
               </a>
