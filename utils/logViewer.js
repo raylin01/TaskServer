@@ -31,6 +31,42 @@ function readLog(filename, lines = 500) {
   return allLines.slice(-lines).join('\n');
 }
 
+function readLogChunk(filename, options = {}) {
+  const filePath = path.join(logsDir, filename);
+  if (!fs.existsSync(filePath)) return { content: '', totalLines: 0, hasMore: false };
+  
+  const data = fs.readFileSync(filePath, 'utf8');
+  const allLines = data.split('\n');
+  const totalLines = allLines.length;
+  
+  const { offset = 0, limit = 500, fromEnd = true } = options;
+  
+  let lines, startIndex, endIndex, hasMore;
+  
+  if (fromEnd) {
+    // Reading from end (tail mode)
+    startIndex = Math.max(0, totalLines - offset - limit);
+    endIndex = totalLines - offset;
+    lines = allLines.slice(startIndex, endIndex);
+    hasMore = startIndex > 0;
+  } else {
+    // Reading from beginning
+    startIndex = offset;
+    endIndex = Math.min(totalLines, offset + limit);
+    lines = allLines.slice(startIndex, endIndex);
+    hasMore = endIndex < totalLines;
+  }
+  
+  return {
+    content: lines.join('\n'),
+    totalLines,
+    startLine: startIndex,
+    endLine: endIndex,
+    hasMore,
+    loadedLines: lines.length
+  };
+}
+
 function getLogStats(scriptName) {
   const logs = listLogs(scriptName);
   return {
@@ -49,4 +85,4 @@ function formatBytes(bytes) {
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
 }
 
-module.exports = { listLogs, readLog, getLogStats };
+module.exports = { listLogs, readLog, readLogChunk, getLogStats };

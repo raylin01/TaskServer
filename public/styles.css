@@ -381,7 +381,8 @@ pre {
   display: grid; 
   grid-template-columns: 300px 1fr; 
   gap: 1.5em; 
-  min-height: 600px; 
+  height: 80vh; 
+  max-height: 80vh; 
 }
 
 .logs-sidebar { 
@@ -390,7 +391,8 @@ pre {
   box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
   padding: 1em; 
   overflow-y: auto; 
-  max-height: 80vh; 
+  height: 100%; 
+  max-height: 100%; 
 }
 .logs-sidebar h3 { 
   margin: 0 0 1em 0; 
@@ -464,6 +466,8 @@ pre {
   display: flex; 
   flex-direction: column; 
   overflow: hidden; 
+  height: 100%; 
+  max-height: 100%; 
 }
 .log-viewer-header { 
   padding: 1em; 
@@ -511,6 +515,28 @@ pre {
   line-height: 1.5; 
   white-space: pre-wrap; 
   word-wrap: break-word; 
+  position: relative;
+}
+
+.log-viewer.loading::before {
+  content: '↻ Loading more...';
+  position: sticky;
+  top: 0;
+  left: 0;
+  right: 0;
+  background: rgba(0, 123, 255, 0.9);
+  color: white;
+  padding: 0.5em;
+  text-align: center;
+  font-size: 12px;
+  z-index: 10;
+  display: block;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
 }
 
 /* Settings Page */

@@ -39,6 +39,13 @@
         <span class="icon">↻</span> Refresh Now
       </button>
       <div class="auto-refresh-wrapper">
+        <span class="toggle-label">Tail Mode</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="tailMode" checked>
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="auto-refresh-wrapper">
         <span class="toggle-label">Auto-refresh (5s)</span>
         <label class="toggle-switch">
           <input type="checkbox" id="autoRefresh" checked>
@@ -103,40 +110,121 @@
     const scriptName = '<%= scriptName %>';
     let currentFile = '<%= selectedLog %>';
     let refreshInterval = null;
+    let tailMode = true;
+    let loadedOffset = 0; // Lines loaded from end
+    let isLoading = false;
+    let hasMoreLogs = true;
+    let totalLines = 0;
+    
+    const logViewer = document.getElementById('logContent');
+    
+    // Load initial chunk in tail mode
+    function loadInitialLogs() {
+      if (!currentFile) return;
+      
+      fetch(`/api/logs/${scriptName}/chunk?file=${currentFile}&offset=0&limit=500&fromEnd=true`)
+        .then(res => res.json())
+        .then(data => {
+          logViewer.textContent = data.content;
+          loadedOffset = data.loadedLines;
+          totalLines = data.totalLines;
+          hasMoreLogs = data.hasMore;
+          
+          if (tailMode) {
+            scrollToBottom();
+          }
+        })
+        .catch(err => console.error('Failed to load logs:', err));
+    }
+    
+    // Load more logs when scrolling up
+    function loadMoreLogs() {
+      if (!currentFile || isLoading || !hasMoreLogs) return;
+      
+      isLoading = true;
+      logViewer.classList.add('loading');
+      const previousHeight = logViewer.scrollHeight;
+      
+      fetch(`/api/logs/${scriptName}/chunk?file=${currentFile}&offset=${loadedOffset}&limit=500&fromEnd=true`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.content) {
+            // Prepend content
+            logViewer.textContent = data.content + '\n' + logViewer.textContent;
+            loadedOffset += data.loadedLines;
+            hasMoreLogs = data.hasMore;
+            
+            // Maintain scroll position
+            const newHeight = logViewer.scrollHeight;
+            logViewer.scrollTop = newHeight - previousHeight;
+          }
+          isLoading = false;
+          logViewer.classList.remove('loading');
+        })
+        .catch(err => {
+          console.error('Failed to load more logs:', err);
+          isLoading = false;
+          logViewer.classList.remove('loading');
+        });
+    }
     
     function refreshLogs() {
       const urlParams = new URLSearchParams(window.location.search);
       const file = urlParams.get('file') || currentFile;
       
-      fetch(`/api/logs/${scriptName}?file=${file}`)
-        .then(res => res.json())
-        .then(data => {
-          document.getElementById('logContent').textContent = data.logContent;
-          document.getElementById('currentLog').textContent = data.selectedLog;
-          
-          // Update log list
-          const logList = document.getElementById('logList');
-          logList.innerHTML = data.logs.map(log => {
-            const isError = log.name.includes('error');
-            return `<a href="/logs/${scriptName}?file=${log.name}" 
-                       class="log-item ${log.name === data.selectedLog ? 'active' : ''}"
-                       data-type="${isError ? 'error' : 'out'}">
-                      <div class="log-item-header">
-                        <span class="log-icon ${isError ? 'error' : 'out'}">${isError ? '✕' : '○'}</span>
-                        <span class="log-name">${log.name}</span>
-                      </div>
-                      <div class="log-item-meta">
-                        <span class="log-size">${log.sizeFormatted}</span>
-                        <span class="log-time">${new Date(log.mtime).toLocaleTimeString()}</span>
-                      </div>
-                    </a>`;
-          }).join('');
-          
-          document.getElementById('fileCount').textContent = data.logs.length;
-          currentFile = data.selectedLog;
-          filterLogs(); // Reapply filter
-        })
-        .catch(err => console.error('Failed to refresh logs:', err));
+      if (tailMode && file) {
+        // In tail mode, just append new content
+        fetch(`/api/logs/${scriptName}/chunk?file=${file}&offset=0&limit=500&fromEnd=true`)
+          .then(res => res.json())
+          .then(data => {
+            const wasAtBottom = isScrolledToBottom();
+            logViewer.textContent = data.content;
+            
+            if (wasAtBottom) {
+              scrollToBottom();
+            }
+          })
+          .catch(err => console.error('Failed to refresh logs:', err));
+      } else {
+        // Full refresh
+        fetch(`/api/logs/${scriptName}?file=${file}`)
+          .then(res => res.json())
+          .then(data => {
+            logViewer.textContent = data.logContent;
+            document.getElementById('currentLog').textContent = data.selectedLog;
+            
+            // Update log list
+            const logList = document.getElementById('logList');
+            logList.innerHTML = data.logs.map(log => {
+              const isError = log.name.includes('error');
+              return `<a href="/logs/${scriptName}?file=${log.name}" 
+                         class="log-item ${log.name === data.selectedLog ? 'active' : ''}"
+                         data-type="${isError ? 'error' : 'out'}">
+                        <div class="log-item-header">
+                          <span class="log-icon ${isError ? 'error' : 'out'}">${isError ? '✕' : '○'}</span>
+                          <span class="log-name">${log.name}</span>
+                        </div>
+                        <div class="log-item-meta">
+                          <span class="log-size">${log.sizeFormatted}</span>
+                          <span class="log-time">${new Date(log.mtime).toLocaleTimeString()}</span>
+                        </div>
+                      </a>`;
+            }).join('');
+            
+            document.getElementById('fileCount').textContent = data.logs.length;
+            currentFile = data.selectedLog;
+            filterLogs(); // Reapply filter
+          })
+          .catch(err => console.error('Failed to refresh logs:', err));
+      }
+    }
+    
+    function scrollToBottom() {
+      logViewer.scrollTop = logViewer.scrollHeight;
+    }
+    
+    function isScrolledToBottom() {
+      return logViewer.scrollHeight - logViewer.scrollTop <= logViewer.clientHeight + 50;
     }
     
     function filterLogs() {
@@ -196,6 +284,25 @@
         });
     }
     
+    // Scroll detection for progressive loading
+    logViewer.addEventListener('scroll', function() {
+      if (logViewer.scrollTop < 100 && hasMoreLogs && !isLoading) {
+        loadMoreLogs();
+      }
+    });
+    
+    // Tail mode toggle
+    document.getElementById('tailMode').addEventListener('change', function(e) {
+      tailMode = e.target.checked;
+      
+      if (tailMode) {
+        // Reset and load in tail mode
+        loadedOffset = 0;
+        hasMoreLogs = true;
+        loadInitialLogs();
+      }
+    });
+    
     // Auto-refresh toggle
     document.getElementById('autoRefresh').addEventListener('change', function(e) {
       if (e.target.checked) {
@@ -207,6 +314,11 @@
         }
       }
     });
+    
+    // Initialize
+    if (currentFile && tailMode) {
+      loadInitialLogs();
+    }
     
     // Start auto-refresh by default
     refreshInterval = setInterval(refreshLogs, 5000);

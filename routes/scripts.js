@@ -46,6 +46,23 @@ router.get('/api/logs/:scriptName', (req, res) => {
   res.json({ logs, logContent, selectedLog });
 });
 
+// API endpoint to fetch log chunks (for progressive loading)
+router.get('/api/logs/:scriptName/chunk', (req, res) => {
+  const scriptName = req.params.scriptName;
+  const filename = req.query.file;
+  
+  if (!filename) {
+    return res.status(400).json({ error: 'No file specified' });
+  }
+  
+  const offset = parseInt(req.query.offset) || 0;
+  const limit = parseInt(req.query.limit) || 500;
+  const fromEnd = req.query.fromEnd !== 'false'; // default true
+  
+  const result = logViewer.readLogChunk(filename, { offset, limit, fromEnd });
+  res.json(result);
+});
+
 // API endpoint to download log file
 router.get('/api/logs/:scriptName/download', (req, res) => {
   const scriptName = req.params.scriptName;
