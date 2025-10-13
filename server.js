@@ -55,9 +55,9 @@ pm2.connect(function(err) {
 
       // Check if it's a command (no path) or a script file (has path)
       if (script.command) {
-        // Run as shell command
+        // Run as shell command - redirect stderr to stdout so all output goes to out log
         pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', script.command];
+        pm2Config.args = ['-c', `${script.command} 2>&1`];
       } else {
         // Run as script file
         pm2Config.script = script.path;
@@ -104,9 +104,9 @@ config.scripts.forEach(script => {
 
       // Check if it's a command (no path) or a script file (has path)
       if (script.command) {
-        // Run as shell command
+        // Run as shell command - redirect stderr to stdout so all output goes to out log
         pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', script.command];
+        pm2Config.args = ['-c', `${script.command} 2>&1`];
       } else {
         // Run as script file
         pm2Config.script = script.path;

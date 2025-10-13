@@ -246,17 +246,8 @@ router.post('/start-script/:scriptName', (req, res) => {
     pm2.list((err, list) => {
       const isRunning = list.some(p => p.name === script.name);
       
-      if (isRunning) {
-        // Just restart if already exists
-        pm2.restart(script.name, () => {
-          // Clear stopped status in config
-          script.stopped = false;
-          configHandler.writeConfig(config);
-          pm2.disconnect();
-          res.redirect('/scripts');
-        });
-      } else {
-        // Start fresh
+      const startFreshProcess = () => {
+        // Start with new log files
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const pm2Config = {
           name: script.name,
@@ -270,8 +261,9 @@ router.post('/start-script/:scriptName', (req, res) => {
         };
 
         if (script.command) {
+          // Redirect stderr to stdout so all output goes to out log
           pm2Config.script = '/bin/bash';
-          pm2Config.args = ['-c', script.command];
+          pm2Config.args = ['-c', `${script.command} 2>&1`];
         } else {
           pm2Config.script = script.path;
         }
@@ -284,17 +276,62 @@ router.post('/start-script/:scriptName', (req, res) => {
           pm2.disconnect();
           res.redirect('/scripts');
         });
+      };
+      
+      if (isRunning) {
+        // Delete existing process first, then start fresh with new logs
+        pm2.delete(script.name, (err) => {
+          if (err) console.error(`Failed to delete ${script.name}:`, err);
+          startFreshProcess();
+        });
+      } else {
+        // Start fresh
+        startFreshProcess();
       }
     });
   });
 });
 
-// Restart a script
+// Restart a script (creates new log files)
 router.post('/restart-script/:scriptName', (req, res) => {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
+  
+  if (!script) {
+    return res.status(404).send('Script not found or not a forever task');
+  }
+  
   pm2.connect(() => {
-    pm2.restart(req.params.scriptName, () => {
-      pm2.disconnect();
-      res.redirect('/scripts');
+    // Delete the existing process
+    pm2.delete(req.params.scriptName, (err) => {
+      if (err) console.error(`Failed to delete ${req.params.scriptName}:`, err);
+      
+      // Start fresh with new log files
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const pm2Config = {
+        name: script.name,
+        args: script.args || [],
+        env: script.env || {},
+        cwd: process.cwd(),
+        autorestart: true,
+        max_restarts: 10000,
+        out_file: `logs/${script.name}-out-${timestamp}.log`,
+        error_file: `logs/${script.name}-error-${timestamp}.log`,
+      };
+
+      if (script.command) {
+        // Redirect stderr to stdout so all output goes to out log
+        pm2Config.script = '/bin/bash';
+        pm2Config.args = ['-c', `${script.command} 2>&1`];
+      } else {
+        pm2Config.script = script.path;
+      }
+
+      pm2.start(pm2Config, (err) => {
+        if (err) console.error(`Failed to restart ${script.name}:`, err);
+        pm2.disconnect();
+        res.redirect('/scripts');
+      });
     });
   });
 });
