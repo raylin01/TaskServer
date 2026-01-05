@@ -298,6 +298,36 @@ Dashboard accessible online at: https://xxx-xxx-xxx.trycloudflare.com
 - **No Static IP Required**: Works from anywhere, even behind NAT
 - **Free**: Cloudflare Tunnel is free to use
 
+### Using cloudflared as a Managed Script
+
+You can also run `cloudflared` as a TaskServer forever script to expose **other services** (like [GitSync](https://github.com/raylin01/GitSync) webhooks) to the internet:
+
+```yaml
+scripts:
+  # Expose a service on port 4000 (e.g., GitSync webhook server)
+  - name: my-tunnel
+    command: cloudflared tunnel --url http://localhost:4000
+    type: forever
+
+  # Or use a named tunnel with a token for a permanent URL
+  - name: my-named-tunnel
+    command: cloudflared tunnel run --token YOUR_TUNNEL_TOKEN
+    type: forever
+```
+
+**Quick tunnel** (auto-generated URL):
+```bash
+cloudflared tunnel --url http://localhost:4000
+# Outputs: https://xxx-xxx-xxx.trycloudflare.com
+```
+
+**Named tunnel** (permanent custom domain):
+1. Create a tunnel in [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/)
+2. Configure routing to your local service
+3. Use the token in TaskServer config above
+
+> **Tip**: Running cloudflared via TaskServer gives you auto-restart on failure, log management, and unified control over all your tunnels.
+
 ## Log Management
 
 TaskServer automatically manages logs for all your scripts.
@@ -335,7 +365,7 @@ Logs are stored in the `logs/` directory with the following naming convention:
 
 TaskServer provides REST API endpoints for programmatic access.
 
-### Scripts
+### Scripts (Web UI)
 
 - `GET /scripts` - List all scripts with status
 - `GET /add-script` - Show add script form
@@ -343,6 +373,34 @@ TaskServer provides REST API endpoints for programmatic access.
 - `GET /edit-script/:scriptName` - Show edit form
 - `POST /edit-script/:scriptName` - Update a script
 - `POST /delete-script/:scriptName` - Delete a script
+
+### JSON API (Programmatic Access)
+
+These endpoints return JSON and support optional API key authentication:
+
+- `GET /api/scripts` - List all scripts with status as JSON
+- `POST /api/restart-script/:scriptName` - Restart a forever script
+- `POST /api/stop-script/:scriptName` - Stop a forever script
+- `POST /api/start-script/:scriptName` - Start a forever script
+
+**Authentication** (optional):
+
+Enable in `config.yaml`:
+```yaml
+api:
+  authEnabled: true
+  apiKey: "your-secret-key"
+```
+
+Include the API key in requests:
+```bash
+# Via header
+curl -X POST http://localhost:3000/api/restart-script/myScript \
+  -H "X-API-Key: your-secret-key"
+
+# Via query parameter
+curl -X POST "http://localhost:3000/api/restart-script/myScript?apiKey=your-secret-key"
+```
 
 ### Logs
 

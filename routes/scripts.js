@@ -6,6 +6,25 @@ const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
 const path = require('path');
 
+// API key authentication middleware (optional, configured in config.yaml)
+function apiAuth(req, res, next) {
+  const config = configHandler.loadConfig();
+  
+  // If auth is not enabled, skip authentication
+  if (!config.api?.authEnabled) {
+    return next();
+  }
+  
+  // Check for API key in header or query param
+  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+  
+  if (apiKey && apiKey === config.api.apiKey) {
+    return next();
+  }
+  
+  res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required' });
+}
+
 // Home page - redirect to scripts
 router.get('/', (req, res) => {
   res.redirect('/scripts');
@@ -393,4 +412,206 @@ router.post('/settings', (req, res) => {
   res.redirect('/settings?saved=true');
 });
 
+// =============================================================================
+// JSON API Endpoints (for programmatic access, e.g., from GitSync)
+// These endpoints return JSON instead of redirects and support API key auth
+// =============================================================================
+
+// Restart a script (JSON API)
+router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
+  
+  if (!script) {
+    return res.status(404).json({ 
+      success: false, 
+      error: 'Script not found or not a forever task' 
+    });
+  }
+  
+  pm2.connect((err) => {
+    if (err) {
+      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
+    }
+    
+    // Delete the existing process
+    pm2.delete(req.params.scriptName, (deleteErr) => {
+      if (deleteErr) console.error(`Failed to delete ${req.params.scriptName}:`, deleteErr);
+      
+      // Start fresh with new log files
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const pm2Config = {
+        name: script.name,
+        args: script.args || [],
+        env: script.env || {},
+        cwd: process.cwd(),
+        autorestart: true,
+        max_restarts: 10000,
+        out_file: `logs/${script.name}-out-${timestamp}.log`,
+        error_file: `logs/${script.name}-error-${timestamp}.log`,
+      };
+
+      if (script.command) {
+        pm2Config.script = '/bin/bash';
+        pm2Config.args = ['-c', `${script.command} 2>&1`];
+      } else {
+        pm2Config.script = script.path;
+      }
+
+      pm2.start(pm2Config, (startErr) => {
+        pm2.disconnect();
+        if (startErr) {
+          console.error(`Failed to restart ${script.name}:`, startErr);
+          return res.status(500).json({ 
+            success: false, 
+            error: `Failed to restart: ${startErr.message}` 
+          });
+        }
+        res.json({ 
+          success: true, 
+          message: `Script '${script.name}' restarted successfully`,
+          logFile: `${script.name}-out-${timestamp}.log`
+        });
+      });
+    });
+  });
+});
+
+// Stop a script (JSON API)
+router.post('/api/stop-script/:scriptName', apiAuth, (req, res) => {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
+  
+  if (!script) {
+    return res.status(404).json({ 
+      success: false, 
+      error: 'Script not found or not a forever task' 
+    });
+  }
+  
+  pm2.connect((err) => {
+    if (err) {
+      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
+    }
+    
+    pm2.stop(req.params.scriptName, (stopErr) => {
+      // Save stopped status to config
+      script.stopped = true;
+      configHandler.writeConfig(config);
+      pm2.disconnect();
+      
+      if (stopErr) {
+        return res.status(500).json({ 
+          success: false, 
+          error: `Failed to stop: ${stopErr.message}` 
+        });
+      }
+      res.json({ 
+        success: true, 
+        message: `Script '${script.name}' stopped successfully` 
+      });
+    });
+  });
+});
+
+// Start a script (JSON API)
+router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
+  
+  if (!script) {
+    return res.status(404).json({ 
+      success: false, 
+      error: 'Script not found or not a forever task' 
+    });
+  }
+  
+  pm2.connect((err) => {
+    if (err) {
+      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
+    }
+    
+    pm2.list((listErr, list) => {
+      const isRunning = list && list.some(p => p.name === script.name && p.pm2_env.status === 'online');
+      
+      if (isRunning) {
+        pm2.disconnect();
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Script is already running' 
+        });
+      }
+      
+      // Start fresh with new log files
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const pm2Config = {
+        name: script.name,
+        args: script.args || [],
+        env: script.env || {},
+        cwd: process.cwd(),
+        autorestart: true,
+        max_restarts: 10000,
+        out_file: `logs/${script.name}-out-${timestamp}.log`,
+        error_file: `logs/${script.name}-error-${timestamp}.log`,
+      };
+
+      if (script.command) {
+        pm2Config.script = '/bin/bash';
+        pm2Config.args = ['-c', `${script.command} 2>&1`];
+      } else {
+        pm2Config.script = script.path;
+      }
+
+      pm2.start(pm2Config, (startErr) => {
+        // Clear stopped status
+        script.stopped = false;
+        configHandler.writeConfig(config);
+        pm2.disconnect();
+        
+        if (startErr) {
+          return res.status(500).json({ 
+            success: false, 
+            error: `Failed to start: ${startErr.message}` 
+          });
+        }
+        res.json({ 
+          success: true, 
+          message: `Script '${script.name}' started successfully`,
+          logFile: `${script.name}-out-${timestamp}.log`
+        });
+      });
+    });
+  });
+});
+
+// List all scripts (JSON API)
+router.get('/api/scripts', apiAuth, (req, res) => {
+  pm2.connect((err) => {
+    if (err) {
+      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
+    }
+    
+    pm2.list((listErr, list) => {
+      const config = configHandler.loadConfig();
+      
+      const scripts = config.scripts.map(script => {
+        const pm2Process = list && list.find(p => p.name === script.name);
+        return {
+          name: script.name,
+          type: script.type,
+          status: pm2Process ? pm2Process.pm2_env.status : (script.type === 'cron' ? 'scheduled' : 'stopped'),
+          path: script.path || null,
+          command: script.command || null,
+          schedule: script.schedule || null,
+          suspended: script.suspended || false,
+        };
+      });
+      
+      pm2.disconnect();
+      res.json({ success: true, scripts });
+    });
+  });
+});
+
 module.exports = router;
+
