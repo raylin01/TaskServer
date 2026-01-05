@@ -613,5 +613,100 @@ router.get('/api/scripts', apiAuth, (req, res) => {
   });
 });
 
+// Add a new script (JSON API)
+router.post('/api/add-script', apiAuth, (req, res) => {
+  const config = configHandler.loadConfig();
+  const { name, path: scriptPath, command, type, schedule, count, args, env } = req.body;
+  
+  // Validate required fields
+  if (!name) {
+    return res.status(400).json({ success: false, error: 'Script name is required' });
+  }
+  if (!type || !['forever', 'cron'].includes(type)) {
+    return res.status(400).json({ success: false, error: 'Script type must be "forever" or "cron"' });
+  }
+  if (!scriptPath && !command) {
+    return res.status(400).json({ success: false, error: 'Either path or command is required' });
+  }
+  if (type === 'cron' && !schedule) {
+    return res.status(400).json({ success: false, error: 'Schedule is required for cron scripts' });
+  }
+  
+  // Check if script already exists
+  const existingScript = config.scripts.find(s => s.name === name);
+  if (existingScript) {
+    return res.status(409).json({ success: false, error: `Script '${name}' already exists` });
+  }
+  
+  // Build the new script config
+  const newScript = {
+    name,
+    type,
+    schedule: type === 'cron' ? schedule : undefined,
+    count: (type === 'cron' && count) ? parseInt(count) : undefined,
+    args: Array.isArray(args) ? args : (args ? args.split(',').map(a => a.trim()).filter(a => a) : []),
+    env: typeof env === 'object' ? env : (env ? JSON.parse(env) : {}),
+  };
+  
+  // Use either command or path
+  if (command && command.trim()) {
+    newScript.command = command;
+  } else {
+    newScript.path = scriptPath;
+  }
+  
+  // Add to config and save
+  config.scripts.push(newScript);
+  configHandler.writeConfig(config);
+  
+  // If it's a forever script, optionally start it immediately
+  if (type === 'forever' && req.body.autoStart !== false) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const pm2Config = {
+      name: newScript.name,
+      args: newScript.args || [],
+      env: newScript.env || {},
+      cwd: process.cwd(),
+      autorestart: true,
+      max_restarts: 10000,
+      out_file: `logs/${newScript.name}-out-${timestamp}.log`,
+      error_file: `logs/${newScript.name}-error-${timestamp}.log`,
+    };
+
+    if (newScript.command) {
+      pm2Config.script = '/bin/bash';
+      pm2Config.args = ['-c', `${newScript.command} 2>&1`];
+    } else {
+      pm2Config.script = newScript.path;
+    }
+
+    pm2.connect((err) => {
+      if (err) {
+        return res.json({ 
+          success: true, 
+          message: `Script '${name}' added but failed to auto-start: ${err.message}`,
+          autoStarted: false
+        });
+      }
+      
+      pm2.start(pm2Config, (startErr) => {
+        pm2.disconnect();
+        res.json({ 
+          success: true, 
+          message: `Script '${name}' added${startErr ? ' (auto-start failed)' : ' and started'}`,
+          autoStarted: !startErr
+        });
+      });
+    });
+  } else {
+    res.json({ 
+      success: true, 
+      message: `Script '${name}' added`,
+      autoStarted: false
+    });
+  }
+});
+
 module.exports = router;
+
 
