@@ -109,6 +109,9 @@
   <script>
     const scriptName = '<%= scriptName %>';
     let currentFile = '<%= selectedLog %>';
+    // Initialize latest known log from server-side rendered stats
+    let latestKnownLog = '<%= stats.newest ? stats.newest.name : "" %>'; 
+    
     let refreshInterval = null;
     let tailMode = true;
     let loadedOffset = 0; // Lines loaded from end
@@ -169,54 +172,101 @@
     }
     
     function refreshLogs() {
-      const urlParams = new URLSearchParams(window.location.search);
-      const file = urlParams.get('file') || currentFile;
-      
-      if (tailMode && file) {
-        // In tail mode, just append new content
-        fetch(`/api/logs/${scriptName}/chunk?file=${file}&offset=0&limit=500&fromEnd=true`)
-          .then(res => res.json())
-          .then(data => {
-            const wasAtBottom = isScrolledToBottom();
-            logViewer.textContent = data.content;
-            
-            if (wasAtBottom) {
-              scrollToBottom();
-            }
-          })
-          .catch(err => console.error('Failed to refresh logs:', err));
-      } else {
-        // Full refresh
-        fetch(`/api/logs/${scriptName}?file=${file}`)
-          .then(res => res.json())
-          .then(data => {
-            logViewer.textContent = data.logContent;
-            document.getElementById('currentLog').textContent = data.selectedLog;
-            
-            // Update log list
-            const logList = document.getElementById('logList');
-            logList.innerHTML = data.logs.map(log => {
-              const isError = log.name.includes('error');
-              return `<a href="/logs/${scriptName}?file=${log.name}" 
-                         class="log-item ${log.name === data.selectedLog ? 'active' : ''}"
-                         data-type="${isError ? 'error' : 'out'}">
-                        <div class="log-item-header">
-                          <span class="log-icon ${isError ? 'error' : 'out'}">${isError ? '✕' : '○'}</span>
-                          <span class="log-name">${log.name}</span>
-                        </div>
-                        <div class="log-item-meta">
-                          <span class="log-size">${log.sizeFormatted}</span>
-                          <span class="log-time">${new Date(log.mtime).toLocaleTimeString()}</span>
-                        </div>
-                      </a>`;
-            }).join('');
-            
-            document.getElementById('fileCount').textContent = data.logs.length;
-            currentFile = data.selectedLog;
-            filterLogs(); // Reapply filter
-          })
-          .catch(err => console.error('Failed to refresh logs:', err));
-      }
+      // First, check for new logs
+      fetch(`/api/logs/${scriptName}/stats`)
+        .then(res => res.json())
+        .then(stats => {
+          // Update Stats UI
+          document.querySelector('.stat-card:nth-child(1) .stat-value').textContent = stats.count;
+          document.querySelector('.stat-card:nth-child(2) .stat-value').textContent = formatBytes(stats.totalSize);
+          if (stats.newest) {
+             document.querySelector('.stat-card:nth-child(3) .stat-value').textContent = new Date(stats.newest.mtime).toLocaleString();
+          }
+
+          let forceFullRefresh = false;
+          const newLatest = stats.newest ? stats.newest.name : '';
+          
+          // Check for new log file
+          if (newLatest && newLatest !== latestKnownLog) {
+             // If we are currently watching the "latest" log, switch to the NEW latest
+             if (tailMode && currentFile === latestKnownLog) {
+                console.log('New log file detected, switching:', newLatest);
+                currentFile = newLatest;
+                latestKnownLog = newLatest;
+                
+                // Update URL parameter without reload
+                const url = new URL(window.location);
+                url.searchParams.set('file', currentFile);
+                window.history.replaceState(null, '', url);
+                
+                // Reset scroll/offset state
+                loadedOffset = 0;
+                hasMoreLogs = true;
+                
+                // Force a full refresh to update the list and load updated content
+                forceFullRefresh = true;
+             } else {
+                // Just update our knowledge of what's latest
+                latestKnownLog = newLatest;
+             }
+          }
+
+          // Continue with content refresh
+          const urlParams = new URLSearchParams(window.location.search);
+          const file = urlParams.get('file') || currentFile;
+          
+          if (tailMode && file && !forceFullRefresh) {
+            // In tail mode, just append new content
+            fetch(`/api/logs/${scriptName}/chunk?file=${file}&offset=0&limit=500&fromEnd=true`)
+              .then(res => res.json())
+              .then(data => {
+                const wasAtBottom = isScrolledToBottom();
+                logViewer.textContent = data.content;
+                
+                if (wasAtBottom) {
+                  scrollToBottom();
+                }
+              })
+              .catch(err => console.error('Failed to refresh logs:', err));
+          } else {
+            // Full refresh (updates list and content)
+            fetch(`/api/logs/${scriptName}?file=${file}`)
+              .then(res => res.json())
+              .then(data => {
+                logViewer.textContent = data.logContent;
+                document.getElementById('currentLog').textContent = data.selectedLog;
+                
+                // Update log list
+                const logList = document.getElementById('logList');
+                logList.innerHTML = data.logs.map(log => {
+                  const isError = log.name.includes('error');
+                  return `<a href="/logs/${scriptName}?file=${log.name}" 
+                             class="log-item ${log.name === data.selectedLog ? 'active' : ''}"
+                             data-type="${isError ? 'error' : 'out'}">
+                            <div class="log-item-header">
+                              <span class="log-icon ${isError ? 'error' : 'out'}">${isError ? '✕' : '○'}</span>
+                              <span class="log-name">${log.name}</span>
+                            </div>
+                            <div class="log-item-meta">
+                              <span class="log-size">${log.sizeFormatted}</span>
+                              <span class="log-time">${new Date(log.mtime).toLocaleTimeString()}</span>
+                            </div>
+                          </a>`;
+                }).join('');
+                
+                document.getElementById('fileCount').textContent = data.logs.length;
+                currentFile = data.selectedLog;
+                filterLogs(); // Reapply filter
+                
+                // specific logic if we just switched: scroll to bottom
+                if (forceFullRefresh) {
+                    scrollToBottom();
+                }
+              })
+              .catch(err => console.error('Failed to refresh logs:', err));
+          }
+        })
+        .catch(err => console.error('Failed to fetch stats:', err));
     }
     
     function scrollToBottom() {
@@ -327,6 +377,14 @@
     window.addEventListener('beforeunload', () => {
       if (refreshInterval) clearInterval(refreshInterval);
     });
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024;
+      const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+    }
   </script>
 </body>
 </html>

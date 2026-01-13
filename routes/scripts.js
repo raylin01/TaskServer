@@ -65,6 +65,13 @@ router.get('/api/logs/:scriptName', (req, res) => {
   res.json({ logs, logContent, selectedLog });
 });
 
+// API endpoint to fetch log stats (for auto-refresh detection)
+router.get('/api/logs/:scriptName/stats', (req, res) => {
+  const scriptName = req.params.scriptName;
+  const stats = logViewer.getLogStats(scriptName);
+  res.json(stats);
+});
+
 // API endpoint to fetch log chunks (for progressive loading)
 router.get('/api/logs/:scriptName/chunk', (req, res) => {
   const scriptName = req.params.scriptName;
