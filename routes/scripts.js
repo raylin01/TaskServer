@@ -420,9 +420,19 @@ router.post('/settings', (req, res) => {
 // Restart a script (JSON API)
 router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
   const config = configHandler.loadConfig();
-  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
+  // Find script (either in config or just in PM2 if we want to allow restarting unmanaged scripts, but config is safer)
+  // For self-restart (taskserver), it might not be in config.scripts if we decided not to add it there. 
+  // But standard practice: only manage what's in config.
+  // HOWEVER: User plan said "No Self-Config", so we might need to allow it if name matches.
   
-  if (!script) {
+  const scriptName = req.params.scriptName;
+  const script = config.scripts.find(s => s.name === scriptName && s.type === 'forever');
+  
+  // Special handling for TaskServer self-restart
+  // Check if we are restarting OURSELVES (the current process)
+  const isSelf = (process.env.name === scriptName) || (scriptName === 'taskserver');
+
+  if (!script && !isSelf) {
     return res.status(404).json({ 
       success: false, 
       error: 'Script not found or not a forever task' 
@@ -434,7 +444,28 @@ router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
       return res.status(500).json({ success: false, error: 'PM2 connection failed' });
     }
     
-    // Delete the existing process
+    // IF SELF: Use pm2.restart (preserves process identity, doesn't wait for completion in same way)
+    if (isSelf) {
+        pm2.restart(scriptName, (restartErr) => {
+            pm2.disconnect();
+            if (restartErr) {
+                console.error(`Failed to restart self (${scriptName}):`, restartErr);
+                return res.status(500).json({ 
+                    success: false, 
+                    error: `Failed to restart self: ${restartErr.message}` 
+                });
+            }
+            // We might technically die before sending this, but usually restart has a small delay
+            res.json({ 
+                success: true, 
+                message: `TaskServer (${scriptName}) restarting...`,
+                logFile: 'pending...' 
+            });
+        });
+        return;
+    }
+
+    // IF OTHER: Delete and Start Fresh (for new log files)
     pm2.delete(req.params.scriptName, (deleteErr) => {
       if (deleteErr) console.error(`Failed to delete ${req.params.scriptName}:`, deleteErr);
       

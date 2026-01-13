@@ -88,6 +88,18 @@ npm start
 
 Navigate to `http://localhost:3000` in your browser.
 
+## Self-Management & GitSync Integration
+TaskServer supports self-updates via GitSync!
+
+To enable this:
+1.  **Run with PM2**: You MUST start TaskServer using PM2 with the name `taskserver`.
+    ```bash
+    pm2 start server.js --name taskserver
+    ```
+2.  **Configure GitSync**: Add TaskServer to your GitSync config (see GitSync docs).
+
+When updated, GitSync will call the restart API. TaskServer detects it is restarting itself and performs a graceful `pm2 restart` instead of a full stop/start cycle.
+
 ## Configuration
 
 All configuration is done in the `config.yaml` file.
