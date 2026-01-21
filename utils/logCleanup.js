@@ -2,9 +2,14 @@
 const fs = require('fs');
 const path = require('path');
 
-const logsDir = path.join(__dirname, '../logs');
+const configHandler = require('./configHandler');
+
+function funcGetLogsDir() {
+    return configHandler.getLogsDir();
+}
 
 function cleanupOldLogs(retentionDays) {
+  const logsDir = configHandler.getLogsDir();
   if (!fs.existsSync(logsDir)) return;
   
   const now = Date.now();

@@ -114,6 +114,16 @@ logManagement:
   retentionDays: 7             # Keep logs for 7 days
   checkInterval: 3600000       # Check every hour (in milliseconds)
 
+# Server Settings (Optional)
+server:
+  port: 3000                   # Web interface port (default: 3000)
+  logsDir: "./logs"            # Directory to store logs (default: ./logs)
+
+# PM2 Settings (Optional)
+pm2:
+  maxRestarts: 10000           # Max restarts before giving up (default: 10000)
+  autoRestart: true            # Auto restart on crash (default: true)
+
 # Cloudflare Tunnel Settings (Optional)
 cloudflare:
   enabled: false                # Set to true to enable Cloudflare Tunnel

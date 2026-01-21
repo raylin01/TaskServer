@@ -43,15 +43,16 @@ pm2.connect(function(err) {
       }
       
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const logsDir = configHandler.getLogsDir();
       const pm2Config = {
         name: script.name,
         args: script.args || [],
         env: script.env || {},
         cwd: process.cwd(),
-        autorestart: true,
-        max_restarts: 10000, // Allow many restarts
-        out_file: `logs/${script.name}-out-${timestamp}.log`,
-        error_file: `logs/${script.name}-error-${timestamp}.log`,
+        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
+        max_restarts: config.pm2.maxRestarts || 10000,
+        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
+        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
       };
 
       // Check if it's a command (no path) or a script file (has path)
@@ -93,14 +94,15 @@ config.scripts.forEach(script => {
       // Update last run time
       cronRunHistory[script.name].lastRun = new Date();
       
+      const logsDir = configHandler.getLogsDir();
       const pm2Config = {
         name: `${script.name}-cron-${Date.now()}`,
         args: script.args || [],
         env: script.env || {},
         cwd: process.cwd(),
         autorestart: false,
-        out_file: `logs/${script.name}-out-${Date.now()}.log`,
-        error_file: `logs/${script.name}-error-${Date.now()}.log`,
+        out_file: path.join(logsDir, `${script.name}-out-${Date.now()}.log`),
+        error_file: path.join(logsDir, `${script.name}-error-${Date.now()}.log`),
       };
 
       // Check if it's a command (no path) or a script file (has path)
@@ -130,7 +132,7 @@ app.locals.cronSuspended = cronSuspended;
 app.use('/', scriptsRouter);
 
 // Start server
-const PORT = 3000;
+const PORT = config.server.port || 3000;
 app.listen(PORT, async () => {
   console.log(`TaskServer running at http://localhost:${PORT}`);
   

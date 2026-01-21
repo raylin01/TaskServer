@@ -2,9 +2,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const logsDir = path.join(__dirname, '../logs');
+const configHandler = require('./configHandler');
 
 function listLogs(scriptName) {
+  const logsDir = configHandler.getLogsDir();
   if (!fs.existsSync(logsDir)) return [];
   
   return fs.readdirSync(logsDir)
@@ -23,6 +24,7 @@ function listLogs(scriptName) {
 }
 
 function readLog(filename, lines = 500) {
+  const logsDir = configHandler.getLogsDir();
   const filePath = path.join(logsDir, filename);
   if (!fs.existsSync(filePath)) return '';
   const data = fs.readFileSync(filePath, 'utf8');
@@ -32,6 +34,7 @@ function readLog(filename, lines = 500) {
 }
 
 function readLogChunk(filename, options = {}) {
+  const logsDir = configHandler.getLogsDir();
   const filePath = path.join(logsDir, filename);
   if (!fs.existsSync(filePath)) return { content: '', totalLines: 0, hasMore: false };
   

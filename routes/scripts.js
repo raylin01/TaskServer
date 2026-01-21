@@ -99,7 +99,7 @@ router.get('/api/logs/:scriptName/download', (req, res) => {
   }
   
   const fs = require('fs');
-  const logsDir = path.join(__dirname, '../logs');
+  const logsDir = configHandler.getLogsDir();
   const filePath = path.join(logsDir, filename);
   
   if (!fs.existsSync(filePath) || !filename.startsWith(scriptName)) {
@@ -119,7 +119,7 @@ router.delete('/api/logs/:scriptName/delete', (req, res) => {
   }
   
   const fs = require('fs');
-  const logsDir = path.join(__dirname, '../logs');
+  const logsDir = configHandler.getLogsDir();
   const filePath = path.join(logsDir, filename);
   
   // Security check: ensure file belongs to this script
@@ -275,15 +275,16 @@ router.post('/start-script/:scriptName', (req, res) => {
       const startFreshProcess = () => {
         // Start with new log files
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const logsDir = configHandler.getLogsDir();
         const pm2Config = {
           name: script.name,
           args: script.args || [],
           env: script.env || {},
           cwd: process.cwd(),
-          autorestart: true,
-          max_restarts: 10000,
-          out_file: `logs/${script.name}-out-${timestamp}.log`,
-          error_file: `logs/${script.name}-error-${timestamp}.log`,
+          autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
+          max_restarts: config.pm2.maxRestarts || 10000,
+          out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
+          error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
         };
 
         if (script.command) {
@@ -334,15 +335,16 @@ router.post('/restart-script/:scriptName', (req, res) => {
       
       // Start fresh with new log files
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const logsDir = configHandler.getLogsDir();
       const pm2Config = {
         name: script.name,
         args: script.args || [],
         env: script.env || {},
         cwd: process.cwd(),
-        autorestart: true,
-        max_restarts: 10000,
-        out_file: `logs/${script.name}-out-${timestamp}.log`,
-        error_file: `logs/${script.name}-error-${timestamp}.log`,
+        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
+        max_restarts: config.pm2.maxRestarts || 10000,
+        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
+        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
       };
 
       if (script.command) {
@@ -478,15 +480,16 @@ router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
       
       // Start fresh with new log files
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const logsDir = configHandler.getLogsDir();
       const pm2Config = {
         name: script.name,
         args: script.args || [],
         env: script.env || {},
         cwd: process.cwd(),
-        autorestart: true,
-        max_restarts: 10000,
-        out_file: `logs/${script.name}-out-${timestamp}.log`,
-        error_file: `logs/${script.name}-error-${timestamp}.log`,
+        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
+        max_restarts: config.pm2.maxRestarts || 10000,
+        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
+        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
       };
 
       if (script.command) {
@@ -582,15 +585,16 @@ router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
       
       // Start fresh with new log files
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const logsDir = configHandler.getLogsDir();
       const pm2Config = {
         name: script.name,
         args: script.args || [],
         env: script.env || {},
         cwd: process.cwd(),
-        autorestart: true,
-        max_restarts: 10000,
-        out_file: `logs/${script.name}-out-${timestamp}.log`,
-        error_file: `logs/${script.name}-error-${timestamp}.log`,
+        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
+        max_restarts: config.pm2.maxRestarts || 10000,
+        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
+        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
       };
 
       if (script.command) {
@@ -700,15 +704,16 @@ router.post('/api/add-script', apiAuth, (req, res) => {
   // If it's a forever script, optionally start it immediately
   if (type === 'forever' && req.body.autoStart !== false) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const logsDir = configHandler.getLogsDir();
     const pm2Config = {
       name: newScript.name,
       args: newScript.args || [],
       env: newScript.env || {},
       cwd: process.cwd(),
-      autorestart: true,
-      max_restarts: 10000,
-      out_file: `logs/${newScript.name}-out-${timestamp}.log`,
-      error_file: `logs/${newScript.name}-error-${timestamp}.log`,
+      autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
+      max_restarts: config.pm2.maxRestarts || 10000,
+      out_file: path.join(logsDir, `${newScript.name}-out-${timestamp}.log`),
+      error_file: path.join(logsDir, `${newScript.name}-error-${timestamp}.log`),
     };
 
     if (newScript.command) {
