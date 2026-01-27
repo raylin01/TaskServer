@@ -500,16 +500,20 @@ router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
       }
 
       pm2.start(pm2Config, (startErr) => {
+        // Clear stopped status (important: ensures UI shows correct status after restart)
+        script.stopped = false;
+        configHandler.writeConfig(config);
         pm2.disconnect();
+
         if (startErr) {
           console.error(`Failed to restart ${script.name}:`, startErr);
-          return res.status(500).json({ 
-            success: false, 
-            error: `Failed to restart: ${startErr.message}` 
+          return res.status(500).json({
+            success: false,
+            error: `Failed to restart: ${startErr.message}`
           });
         }
-        res.json({ 
-          success: true, 
+        res.json({
+          success: true,
           message: `Script '${script.name}' restarted successfully`,
           logFile: `${script.name}-out-${timestamp}.log`
         });
