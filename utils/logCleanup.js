@@ -4,10 +4,6 @@ const path = require('path');
 
 const configHandler = require('./configHandler');
 
-function funcGetLogsDir() {
-    return configHandler.getLogsDir();
-}
-
 function cleanupOldLogs(retentionDays) {
   const logsDir = configHandler.getLogsDir();
   if (!fs.existsSync(logsDir)) return;

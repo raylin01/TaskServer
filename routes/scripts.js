@@ -6,6 +6,36 @@ const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
 const path = require('path');
 
+/**
+ * Build PM2 config for a script (reduces code duplication)
+ * @param {Object} script - Script config object
+ * @param {Object} pm2Settings - PM2 settings from config
+ * @returns {Object} PM2 config object
+ */
+function buildPm2Config(script, pm2Settings) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const logsDir = configHandler.getLogsDir();
+  const pm2Config = {
+    name: script.name,
+    args: script.args || [],
+    env: script.env || {},
+    cwd: process.cwd(),
+    autorestart: pm2Settings.autoRestart !== undefined ? pm2Settings.autoRestart : true,
+    max_restarts: pm2Settings.maxRestarts || 10000,
+    out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
+    error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
+  };
+
+  if (script.command) {
+    pm2Config.script = '/bin/bash';
+    pm2Config.args = ['-c', `${script.command} 2>&1`];
+  } else {
+    pm2Config.script = script.path;
+  }
+
+  return pm2Config;
+}
+
 // API key authentication middleware (optional, configured in config.yaml)
 function apiAuth(req, res, next) {
   const config = configHandler.loadConfig();
@@ -93,44 +123,51 @@ router.get('/api/logs/:scriptName/chunk', (req, res) => {
 router.get('/api/logs/:scriptName/download', (req, res) => {
   const scriptName = req.params.scriptName;
   const filename = req.query.file;
-  
+
   if (!filename) {
     return res.status(400).send('No file specified');
   }
-  
+
+  // Security: use basename to prevent path traversal
+  const safeFilename = path.basename(filename);
+  if (safeFilename !== filename || !safeFilename.startsWith(scriptName)) {
+    return res.status(403).send('Access denied');
+  }
+
   const fs = require('fs');
   const logsDir = configHandler.getLogsDir();
-  const filePath = path.join(logsDir, filename);
-  
-  if (!fs.existsSync(filePath) || !filename.startsWith(scriptName)) {
+  const filePath = path.join(logsDir, safeFilename);
+
+  if (!fs.existsSync(filePath)) {
     return res.status(404).send('Log file not found');
   }
-  
-  res.download(filePath, filename);
+
+  res.download(filePath, safeFilename);
 });
 
 // API endpoint to delete log file
 router.delete('/api/logs/:scriptName/delete', (req, res) => {
   const scriptName = req.params.scriptName;
   const filename = req.query.file;
-  
+
   if (!filename) {
     return res.status(400).json({ success: false, error: 'No file specified' });
   }
-  
-  const fs = require('fs');
-  const logsDir = configHandler.getLogsDir();
-  const filePath = path.join(logsDir, filename);
-  
-  // Security check: ensure file belongs to this script
-  if (!filename.startsWith(scriptName)) {
+
+  // Security: use basename to prevent path traversal
+  const safeFilename = path.basename(filename);
+  if (safeFilename !== filename || !safeFilename.startsWith(scriptName)) {
     return res.status(403).json({ success: false, error: 'Access denied' });
   }
-  
+
+  const fs = require('fs');
+  const logsDir = configHandler.getLogsDir();
+  const filePath = path.join(logsDir, safeFilename);
+
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ success: false, error: 'Log file not found' });
   }
-  
+
   try {
     fs.unlinkSync(filePath);
     res.json({ success: true });
@@ -273,27 +310,7 @@ router.post('/start-script/:scriptName', (req, res) => {
       const isRunning = list.some(p => p.name === script.name);
       
       const startFreshProcess = () => {
-        // Start with new log files
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const logsDir = configHandler.getLogsDir();
-        const pm2Config = {
-          name: script.name,
-          args: script.args || [],
-          env: script.env || {},
-          cwd: process.cwd(),
-          autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
-          max_restarts: config.pm2.maxRestarts || 10000,
-          out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
-          error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
-        };
-
-        if (script.command) {
-          // Redirect stderr to stdout so all output goes to out log
-          pm2Config.script = '/bin/bash';
-          pm2Config.args = ['-c', `${script.command} 2>&1`];
-        } else {
-          pm2Config.script = script.path;
-        }
+        const pm2Config = buildPm2Config(script, config.pm2);
 
         pm2.start(pm2Config, (err) => {
           if (err) console.error(`Failed to start ${script.name}:`, err);
@@ -323,37 +340,17 @@ router.post('/start-script/:scriptName', (req, res) => {
 router.post('/restart-script/:scriptName', (req, res) => {
   const config = configHandler.loadConfig();
   const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
-  
+
   if (!script) {
     return res.status(404).send('Script not found or not a forever task');
   }
-  
+
   pm2.connect(() => {
     // Delete the existing process
     pm2.delete(req.params.scriptName, (err) => {
       if (err) console.error(`Failed to delete ${req.params.scriptName}:`, err);
-      
-      // Start fresh with new log files
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logsDir = configHandler.getLogsDir();
-      const pm2Config = {
-        name: script.name,
-        args: script.args || [],
-        env: script.env || {},
-        cwd: process.cwd(),
-        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
-        max_restarts: config.pm2.maxRestarts || 10000,
-        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
-        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
-      };
 
-      if (script.command) {
-        // Redirect stderr to stdout so all output goes to out log
-        pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', `${script.command} 2>&1`];
-      } else {
-        pm2Config.script = script.path;
-      }
+      const pm2Config = buildPm2Config(script, config.pm2);
 
       pm2.start(pm2Config, (err) => {
         if (err) console.error(`Failed to restart ${script.name}:`, err);
@@ -477,27 +474,8 @@ router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
     // IF OTHER: Delete and Start Fresh (for new log files)
     pm2.delete(req.params.scriptName, (deleteErr) => {
       if (deleteErr) console.error(`Failed to delete ${req.params.scriptName}:`, deleteErr);
-      
-      // Start fresh with new log files
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logsDir = configHandler.getLogsDir();
-      const pm2Config = {
-        name: script.name,
-        args: script.args || [],
-        env: script.env || {},
-        cwd: process.cwd(),
-        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
-        max_restarts: config.pm2.maxRestarts || 10000,
-        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
-        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
-      };
 
-      if (script.command) {
-        pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', `${script.command} 2>&1`];
-      } else {
-        pm2Config.script = script.path;
-      }
+      const pm2Config = buildPm2Config(script, config.pm2);
 
       pm2.start(pm2Config, (startErr) => {
         // Clear stopped status (important: ensures UI shows correct status after restart)
@@ -515,7 +493,7 @@ router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
         res.json({
           success: true,
           message: `Script '${script.name}' restarted successfully`,
-          logFile: `${script.name}-out-${timestamp}.log`
+          logFile: path.basename(pm2Config.out_file)
         });
       });
     });
@@ -581,49 +559,30 @@ router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
       
       if (isRunning) {
         pm2.disconnect();
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Script is already running' 
+        return res.status(400).json({
+          success: false,
+          error: 'Script is already running'
         });
       }
-      
-      // Start fresh with new log files
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logsDir = configHandler.getLogsDir();
-      const pm2Config = {
-        name: script.name,
-        args: script.args || [],
-        env: script.env || {},
-        cwd: process.cwd(),
-        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
-        max_restarts: config.pm2.maxRestarts || 10000,
-        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
-        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
-      };
 
-      if (script.command) {
-        pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', `${script.command} 2>&1`];
-      } else {
-        pm2Config.script = script.path;
-      }
+      const pm2Config = buildPm2Config(script, config.pm2);
 
       pm2.start(pm2Config, (startErr) => {
         // Clear stopped status
         script.stopped = false;
         configHandler.writeConfig(config);
         pm2.disconnect();
-        
+
         if (startErr) {
-          return res.status(500).json({ 
-            success: false, 
-            error: `Failed to start: ${startErr.message}` 
+          return res.status(500).json({
+            success: false,
+            error: `Failed to start: ${startErr.message}`
           });
         }
-        res.json({ 
-          success: true, 
+        res.json({
+          success: true,
           message: `Script '${script.name}' started successfully`,
-          logFile: `${script.name}-out-${timestamp}.log`
+          logFile: path.basename(pm2Config.out_file)
         });
       });
     });
@@ -707,47 +666,29 @@ router.post('/api/add-script', apiAuth, (req, res) => {
   
   // If it's a forever script, optionally start it immediately
   if (type === 'forever' && req.body.autoStart !== false) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const logsDir = configHandler.getLogsDir();
-    const pm2Config = {
-      name: newScript.name,
-      args: newScript.args || [],
-      env: newScript.env || {},
-      cwd: process.cwd(),
-      autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
-      max_restarts: config.pm2.maxRestarts || 10000,
-      out_file: path.join(logsDir, `${newScript.name}-out-${timestamp}.log`),
-      error_file: path.join(logsDir, `${newScript.name}-error-${timestamp}.log`),
-    };
-
-    if (newScript.command) {
-      pm2Config.script = '/bin/bash';
-      pm2Config.args = ['-c', `${newScript.command} 2>&1`];
-    } else {
-      pm2Config.script = newScript.path;
-    }
+    const pm2Config = buildPm2Config(newScript, config.pm2);
 
     pm2.connect((err) => {
       if (err) {
-        return res.json({ 
-          success: true, 
+        return res.json({
+          success: true,
           message: `Script '${name}' added but failed to auto-start: ${err.message}`,
           autoStarted: false
         });
       }
-      
+
       pm2.start(pm2Config, (startErr) => {
         pm2.disconnect();
-        res.json({ 
-          success: true, 
+        res.json({
+          success: true,
           message: `Script '${name}' added${startErr ? ' (auto-start failed)' : ' and started'}`,
           autoStarted: !startErr
         });
       });
     });
   } else {
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `Script '${name}' added`,
       autoStarted: false
     });
@@ -755,5 +696,3 @@ router.post('/api/add-script', apiAuth, (req, res) => {
 });
 
 module.exports = router;
-
-
