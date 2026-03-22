@@ -8,6 +8,7 @@ const configHandler = require('./utils/configHandler');
 const logViewer = require('./utils/logViewer');
 const logCleanup = require('./utils/logCleanup');
 const cloudflareTunnel = require('./utils/cloudflareTunnel');
+const { applyScriptExecution } = require('./utils/scriptRunner');
 const scriptsRouter = require('./routes/scripts');
 
 const app = express();
@@ -48,24 +49,13 @@ pm2.connect(function(err) {
         name: script.name,
         args: script.args || [],
         env: script.env || {},
-        cwd: process.cwd(),
         autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
         max_restarts: config.pm2.maxRestarts || 10000,
         out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
         error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
       };
 
-      // Check if it's a command (no path) or a script file (has path)
-      if (script.command) {
-        // Run as shell command - redirect stderr to stdout so all output goes to out log
-        pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', `${script.command} 2>&1`];
-      } else {
-        // Run as script file
-        pm2Config.script = script.path;
-      }
-
-      pm2.start(pm2Config, (err) => {
+      pm2.start(applyScriptExecution(pm2Config, script), (err) => {
         if (err) console.error(`Failed to start ${script.name}:`, err);
       });
     }
@@ -99,23 +89,12 @@ config.scripts.forEach(script => {
         name: `${script.name}-cron-${Date.now()}`,
         args: script.args || [],
         env: script.env || {},
-        cwd: process.cwd(),
         autorestart: false,
         out_file: path.join(logsDir, `${script.name}-out-${Date.now()}.log`),
         error_file: path.join(logsDir, `${script.name}-error-${Date.now()}.log`),
       };
-
-      // Check if it's a command (no path) or a script file (has path)
-      if (script.command) {
-        // Run as shell command - redirect stderr to stdout so all output goes to out log
-        pm2Config.script = '/bin/bash';
-        pm2Config.args = ['-c', `${script.command} 2>&1`];
-      } else {
-        // Run as script file
-        pm2Config.script = script.path;
-      }
       
-      pm2.start(pm2Config, (err) => {
+      pm2.start(applyScriptExecution(pm2Config, script), (err) => {
         if (err) console.error(`Failed to start cron ${script.name}:`, err);
       });
     });

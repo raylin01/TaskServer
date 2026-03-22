@@ -5,6 +5,7 @@ const pm2 = require('pm2');
 const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
 const path = require('path');
+const { applyScriptExecution } = require('../utils/scriptRunner');
 
 /**
  * Build PM2 config for a script (reduces code duplication)
@@ -19,21 +20,13 @@ function buildPm2Config(script, pm2Settings) {
     name: script.name,
     args: script.args || [],
     env: script.env || {},
-    cwd: process.cwd(),
     autorestart: pm2Settings.autoRestart !== undefined ? pm2Settings.autoRestart : true,
     max_restarts: pm2Settings.maxRestarts || 10000,
     out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
     error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
   };
 
-  if (script.command) {
-    pm2Config.script = '/bin/bash';
-    pm2Config.args = ['-c', `${script.command} 2>&1`];
-  } else {
-    pm2Config.script = script.path;
-  }
-
-  return pm2Config;
+  return applyScriptExecution(pm2Config, script);
 }
 
 // API key authentication middleware (optional, configured in config.yaml)
@@ -184,7 +177,7 @@ router.get('/add-script', (req, res) => {
 // Add a new script (POST)
 router.post('/add-script', (req, res) => {
   const config = configHandler.loadConfig();
-  const { name, path: scriptPath, command, type, schedule, count, args, env } = req.body;
+  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = req.body;
   const newScript = {
     name,
     type,
@@ -193,6 +186,10 @@ router.post('/add-script', (req, res) => {
     args: args ? args.split(',').map(a => a.trim()).filter(a => a) : [],
     env: env ? JSON.parse(env) : {},
   };
+
+  if (cwd && cwd.trim()) {
+    newScript.cwd = cwd.trim();
+  }
   
   // Use either command or path
   if (command && command.trim()) {
@@ -224,7 +221,7 @@ router.post('/edit-script/:scriptName', (req, res) => {
     return res.status(404).send('Script not found');
   }
   
-  const { name, path: scriptPath, command, type, schedule, count, args, env } = req.body;
+  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = req.body;
   config.scripts[scriptIndex] = {
     name,
     type,
@@ -233,6 +230,10 @@ router.post('/edit-script/:scriptName', (req, res) => {
     args: args ? args.split(',').map(a => a.trim()).filter(a => a) : [],
     env: env ? JSON.parse(env) : {},
   };
+
+  if (cwd && cwd.trim()) {
+    config.scripts[scriptIndex].cwd = cwd.trim();
+  }
   
   // Use either command or path
   if (command && command.trim()) {
@@ -607,6 +608,7 @@ router.get('/api/scripts', apiAuth, (req, res) => {
           status: pm2Process ? pm2Process.pm2_env.status : (script.type === 'cron' ? 'scheduled' : 'stopped'),
           path: script.path || null,
           command: script.command || null,
+          cwd: script.cwd || null,
           schedule: script.schedule || null,
           suspended: script.suspended || false,
         };
@@ -621,7 +623,7 @@ router.get('/api/scripts', apiAuth, (req, res) => {
 // Add a new script (JSON API)
 router.post('/api/add-script', apiAuth, (req, res) => {
   const config = configHandler.loadConfig();
-  const { name, path: scriptPath, command, type, schedule, count, args, env } = req.body;
+  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = req.body;
   
   // Validate required fields
   if (!name) {
@@ -652,6 +654,10 @@ router.post('/api/add-script', apiAuth, (req, res) => {
     args: Array.isArray(args) ? args : (args ? args.split(',').map(a => a.trim()).filter(a => a) : []),
     env: typeof env === 'object' ? env : (env ? JSON.parse(env) : {}),
   };
+
+  if (cwd && String(cwd).trim()) {
+    newScript.cwd = String(cwd).trim();
+  }
   
   // Use either command or path
   if (command && command.trim()) {

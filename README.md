@@ -74,6 +74,7 @@ scripts:
   - name: myForeverScript
     path: ./scripts/myScript.js
     type: forever
+    cwd: .
     args: []
     env: {}
 ```
@@ -134,6 +135,7 @@ scripts:
   - name: exampleForever
     path: ./scripts/exampleForever.js
     type: forever
+    cwd: .                       # Optional working directory
     args: []
     env: {}
   
@@ -209,6 +211,7 @@ scripts:
   - name: apiWebhook
     command: curl -X POST https://api.example.com/webhook -H "Content-Type: application/json"
     type: cron
+    cwd: .
     schedule: '*/5 * * * *'
     env:
       API_KEY: your-key
@@ -217,7 +220,22 @@ scripts:
   - name: healthCheck
     command: ping -c 1 google.com && echo "Service is up"
     type: forever
+    cwd: .
 ```
+
+### Working Directory
+
+Each script can optionally define `cwd` to control the working directory used by PM2:
+
+```yaml
+scripts:
+  - name: myBunApp
+    command: bun start
+    type: forever
+    cwd: C:/Users/x/test
+```
+
+This is the recommended way to run commands on Windows. It avoids shell-specific `cd ... && ...` wrappers and works for both file-based scripts and command-based scripts.
 
 **Common use cases:**
 - API webhooks and HTTP requests (`curl`, `wget`)

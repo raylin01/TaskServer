@@ -31,6 +31,7 @@ scripts:
   - name: exampleForever
     path: ./scripts/exampleForever.js
     type: forever                # Runs continuously, auto-restarts on crash
+    cwd: .                       # Optional working directory for this script/command
     args: []                     # Command-line arguments
     env: {}                      # Environment variables
 
@@ -62,13 +63,15 @@ scripts:
   # - name: apiWebhook
   #   command: curl -X POST https://api.example.com/webhook -H "Content-Type: application/json" -d '{"status":"running"}'
   #   type: cron
+  #   cwd: .                     # Optional working directory
   #   schedule: '*/5 * * * *'    # Every 5 minutes
   #   args: []
   #   env: {API_KEY: "your-key"}
 
   # Example 6: Forever command that runs continuously
   # - name: monitorService
-  #   command: ping -c 1 google.com && echo "Service is up"
+  #   command: bun start
   #   type: forever
+  #   cwd: C:/Users/x/test       # On Windows, prefer cwd over "cd ... &&"
   #   args: []
   #   env: {}

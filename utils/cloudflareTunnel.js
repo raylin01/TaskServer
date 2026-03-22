@@ -20,7 +20,8 @@ function startTunnel(tunnelToken, port = 3000) {
     console.log('Starting Cloudflare Tunnel...');
     
     // Use cloudflared from node_modules
-    const cloudflaredPath = path.join(__dirname, '..', 'node_modules', 'cloudflared', 'bin', 'cloudflared');
+    const binaryName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
+    const cloudflaredPath = path.join(__dirname, '..', 'node_modules', 'cloudflared', 'bin', binaryName);
     
     // Start cloudflared tunnel with token
     tunnelProcess = spawn(cloudflaredPath, [
