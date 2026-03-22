@@ -51,6 +51,7 @@ pm2.connect(function(err) {
         env: script.env || {},
         autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
         max_restarts: config.pm2.maxRestarts || 10000,
+        restart_delay: config.pm2.restartDelay !== undefined ? config.pm2.restartDelay : 1000,
         out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
         error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
       };

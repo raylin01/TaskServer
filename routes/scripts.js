@@ -22,6 +22,7 @@ function buildPm2Config(script, pm2Settings) {
     env: script.env || {},
     autorestart: pm2Settings.autoRestart !== undefined ? pm2Settings.autoRestart : true,
     max_restarts: pm2Settings.maxRestarts || 10000,
+    restart_delay: pm2Settings.restartDelay !== undefined ? pm2Settings.restartDelay : 1000,
     out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
     error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
   };

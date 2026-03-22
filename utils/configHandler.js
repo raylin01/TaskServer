@@ -17,7 +17,8 @@ const DEFAULT_CONFIG = {
   },
   pm2: {
     maxRestarts: 10000,
-    autoRestart: true
+    autoRestart: true,
+    restartDelay: 1000
   },
   scripts: []
 };

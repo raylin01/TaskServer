@@ -124,6 +124,7 @@ server:
 pm2:
   maxRestarts: 10000           # Max restarts before giving up (default: 10000)
   autoRestart: true            # Auto restart on crash (default: true)
+  restartDelay: 1000           # Wait 1 second before restarting a crashed forever script
 
 # Cloudflare Tunnel Settings (Optional)
 cloudflare:
@@ -236,6 +237,17 @@ scripts:
 ```
 
 This is the recommended way to run commands on Windows. It avoids shell-specific `cd ... && ...` wrappers and works for both file-based scripts and command-based scripts.
+
+### Crash Restart Delay
+
+Forever scripts now wait `1000ms` before PM2 restarts them after a crash. This avoids tight crash loops that can spike CPU usage when a command exits immediately.
+
+You can override it in `config.yaml`:
+
+```yaml
+pm2:
+  restartDelay: 1000
+```
 
 **Common use cases:**
 - API webhooks and HTTP requests (`curl`, `wget`)
