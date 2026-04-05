@@ -14,10 +14,11 @@
     </nav>
   </header>
   <main>
+    <% const effectiveServerTimeZone = typeof serverTimeZone !== 'undefined' ? serverTimeZone : 'Local server time'; %>
     <h2>Scripts</h2>
     <div class="info-box scheduler-info">
       <h4>Cron Time</h4>
-      <p>Cron schedules use the TaskServer server's local time zone: <strong><%= serverTimeZone %></strong>.</p>
+      <p>Cron schedules use the TaskServer server's local time zone: <strong><%= effectiveServerTimeZone %></strong>.</p>
       <p>Current server time: <strong><%= serverNow.toLocaleString() %></strong></p>
     </div>
     <table>

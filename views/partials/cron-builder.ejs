@@ -1,3 +1,4 @@
+<% const effectiveServerTimeZone = typeof serverTimeZone !== 'undefined' ? serverTimeZone : 'Local server time'; %>
 <div class="form-group">
   <label>Cron Schedule Builder</label>
   <div class="cron-builder">
@@ -50,7 +51,7 @@
           <code id="cronPreview"><%= schedule %></code>
           <span id="cronDescription" class="cron-desc">Custom schedule</span>
         </div>
-        <small class="cron-note">Uses the TaskServer server's local time: <strong><%= serverTimeZone %></strong></small>
+        <small class="cron-note">Uses the TaskServer server's local time: <strong><%= effectiveServerTimeZone %></strong></small>
       </div>
     </div>
 

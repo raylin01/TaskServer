@@ -59,7 +59,7 @@
       </div>
 
       <div id="cronOptions" style="display: none;">
-        <%- include('partials/cron-builder', { schedule: '* * * * *', count: '', serverTimeZone }) %>
+        <%- include('partials/cron-builder', { schedule: '* * * * *', count: '', serverTimeZone: typeof serverTimeZone !== 'undefined' ? serverTimeZone : 'Local server time' }) %>
       </div>
 
       <div class="form-group">

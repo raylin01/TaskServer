@@ -76,6 +76,11 @@ app.locals.cronJobs = cronManager.listJobs();
 app.locals.cronSuspended = cronManager.cronSuspended;
 app.locals.serverTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+app.use((req, res, next) => {
+  res.locals.serverTimeZone = req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  next();
+});
+
 // Use scripts router
 app.use('/', scriptsRouter);
 
