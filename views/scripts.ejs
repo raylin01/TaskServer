@@ -15,6 +15,11 @@
   </header>
   <main>
     <h2>Scripts</h2>
+    <div class="info-box scheduler-info">
+      <h4>Cron Time</h4>
+      <p>Cron schedules use the TaskServer server's local time zone: <strong><%= serverTimeZone %></strong>.</p>
+      <p>Current server time: <strong><%= serverNow.toLocaleString() %></strong></p>
+    </div>
     <table>
       <thead>
         <tr>
@@ -45,7 +50,9 @@
                 <% if (isSuspended) { %>
                   <span class="status status-stopped">Suspended</span>
                 <% } else if (cronHistory && cronHistory.lastRun) { %>
-                  <span class="status status-cron">Last run: <%= new Date(cronHistory.lastRun).toLocaleString() %></span>
+                  <span class="status status-cron">
+                    Last run: <%= new Date(cronHistory.lastRun).toLocaleString() %><%= cronHistory.lastTrigger === 'manual' ? ' (manual)' : '' %>
+                  </span>
                 <% } else { %>
                   <span class="status status-pending">Last run: None</span>
                 <% } %>
@@ -74,6 +81,11 @@
                     </button>
                   </form>
                 <% } %>
+                <form method="post" action="/run-cron-now/<%= script.name %>" style="display:inline">
+                  <button type="submit" class="btn-action btn-run-now" title="Run Now">
+                    <span class="icon">⚡</span>
+                  </button>
+                </form>
               <% } else { %>
                 <% const pm2proc = pm2list.find(p => p.name === script.name); %>
                 <% const isStopped = script.stopped || !pm2proc || pm2proc.pm2_env.status === 'stopped'; %>

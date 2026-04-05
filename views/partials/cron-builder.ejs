@@ -1,0 +1,69 @@
+<div class="form-group">
+  <label>Cron Schedule Builder</label>
+  <div class="cron-builder">
+    <div class="cron-quick">
+      <strong>Quick Presets:</strong>
+      <button type="button" data-cron-preset="* * * * *">Every Minute</button>
+      <button type="button" data-cron-preset="*/5 * * * *">Every 5 Min</button>
+      <button type="button" data-cron-preset="0 * * * *">Hourly</button>
+      <button type="button" data-cron-preset="0 0 * * *">Daily at Midnight</button>
+      <button type="button" data-cron-preset="0 9 * * 1-5">Weekdays at 9am</button>
+    </div>
+
+    <div class="cron-builder-interactive">
+      <strong>Custom schedule:</strong>
+      <div class="cron-fields">
+        <div class="cron-field">
+          <label for="cronMinute">Minute</label>
+          <input type="text" id="cronMinute" data-cron-part="minute" value="*" placeholder="*, 0-59, */5">
+          <small>0-59. Example: <code>35</code></small>
+        </div>
+
+        <div class="cron-field">
+          <label for="cronHour">Hour</label>
+          <input type="text" id="cronHour" data-cron-part="hour" value="*" placeholder="*, 0-23, */2">
+          <small>0-23. Example: <code>21</code> for 9 PM</small>
+        </div>
+
+        <div class="cron-field">
+          <label for="cronDay">Day of Month</label>
+          <input type="text" id="cronDay" data-cron-part="day" value="*" placeholder="*, 1-31, */7">
+          <small>1-31 or <code>*</code></small>
+        </div>
+
+        <div class="cron-field">
+          <label for="cronMonth">Month</label>
+          <input type="text" id="cronMonth" data-cron-part="month" value="*" placeholder="*, 1-12">
+          <small>1-12 or <code>*</code></small>
+        </div>
+
+        <div class="cron-field">
+          <label for="cronWeekday">Day of Week</label>
+          <input type="text" id="cronWeekday" data-cron-part="weekday" value="*" placeholder="*, 0-6, 1-5">
+          <small>0 = Sunday, 1 = Monday</small>
+        </div>
+      </div>
+
+      <div class="cron-preview">
+        <strong>Generated Cron Expression:</strong>
+        <div class="cron-output">
+          <code id="cronPreview"><%= schedule %></code>
+          <span id="cronDescription" class="cron-desc">Custom schedule</span>
+        </div>
+        <small class="cron-note">Uses the TaskServer server's local time: <strong><%= serverTimeZone %></strong></small>
+      </div>
+    </div>
+
+    <div class="cron-custom">
+      <label for="schedule">Raw Cron Expression (Advanced)</label>
+      <input type="text" id="schedule" name="schedule" value="<%= schedule %>" placeholder="* * * * *">
+      <small>Format: minute hour day month weekday</small>
+    </div>
+  </div>
+</div>
+
+<div class="form-group">
+  <label for="count">Max Runs (optional)</label>
+  <input type="number" id="count" name="count" min="1" value="<%= count %>" placeholder="Leave empty for unlimited">
+  <small>Maximum number of scheduled runs for this cron job. Manual "Run now" launches do not count against this limit.</small>
+</div>

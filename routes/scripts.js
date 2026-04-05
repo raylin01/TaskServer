@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const pm2 = require('pm2');
+const cron = require('node-cron');
 const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
 const path = require('path');
@@ -28,6 +29,34 @@ function buildPm2Config(script, pm2Settings) {
   };
 
   return applyScriptExecution(pm2Config, script);
+}
+
+function validateCronSchedule(schedule) {
+  return typeof schedule === 'string' && cron.validate(schedule.trim());
+}
+
+function buildScriptFromRequest(body) {
+  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = body;
+  const script = {
+    name,
+    type,
+    schedule: type === 'cron' ? schedule?.trim() : undefined,
+    count: (type === 'cron' && count) ? parseInt(count, 10) : undefined,
+    args: Array.isArray(args) ? args : (args ? args.split(',').map(a => a.trim()).filter(a => a) : []),
+    env: typeof env === 'object' ? env : (env ? JSON.parse(env) : {}),
+  };
+
+  if (cwd && String(cwd).trim()) {
+    script.cwd = String(cwd).trim();
+  }
+
+  if (command && command.trim()) {
+    script.command = command;
+  } else {
+    script.path = scriptPath;
+  }
+
+  return script;
 }
 
 // API key authentication middleware (optional, configured in config.yaml)
@@ -64,6 +93,8 @@ router.get('/scripts', (req, res) => {
         pm2list: list || [],
         cronRunHistory: req.app.locals.cronRunHistory || {},
         cronSuspended: req.app.locals.cronSuspended || {},
+        serverTimeZone: req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+        serverNow: new Date(),
       });
       pm2.disconnect();
     });
@@ -172,35 +203,29 @@ router.delete('/api/logs/:scriptName/delete', (req, res) => {
 
 // Add a new script (form)
 router.get('/add-script', (req, res) => {
-  res.render('add-script', { script: null, isEdit: false });
+  res.render('add-script', {
+    script: null,
+    isEdit: false,
+    serverTimeZone: req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
 });
 
 // Add a new script (POST)
 router.post('/add-script', (req, res) => {
   const config = configHandler.loadConfig();
-  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = req.body;
-  const newScript = {
-    name,
-    type,
-    schedule: type === 'cron' ? schedule : undefined,
-    count: (type === 'cron' && count) ? parseInt(count) : undefined,
-    args: args ? args.split(',').map(a => a.trim()).filter(a => a) : [],
-    env: env ? JSON.parse(env) : {},
-  };
+  const newScript = buildScriptFromRequest(req.body);
 
-  if (cwd && cwd.trim()) {
-    newScript.cwd = cwd.trim();
+  if (newScript.type === 'cron' && !validateCronSchedule(newScript.schedule)) {
+    return res.status(400).send('Invalid cron schedule');
   }
-  
-  // Use either command or path
-  if (command && command.trim()) {
-    newScript.command = command;
-  } else {
-    newScript.path = scriptPath;
-  }
-  
+
   config.scripts.push(newScript);
   configHandler.writeConfig(config);
+
+  if (req.app.locals.cronManager) {
+    req.app.locals.cronManager.upsertScript(newScript);
+  }
+
   res.redirect('/scripts');
 });
 
@@ -211,7 +236,11 @@ router.get('/edit-script/:scriptName', (req, res) => {
   if (!script) {
     return res.status(404).send('Script not found');
   }
-  res.render('edit-script', { script, isEdit: true });
+  res.render('edit-script', {
+    script,
+    isEdit: true,
+    serverTimeZone: req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+  });
 });
 
 // Edit a script (POST)
@@ -221,29 +250,36 @@ router.post('/edit-script/:scriptName', (req, res) => {
   if (scriptIndex === -1) {
     return res.status(404).send('Script not found');
   }
-  
-  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = req.body;
-  config.scripts[scriptIndex] = {
-    name,
-    type,
-    schedule: type === 'cron' ? schedule : undefined,
-    count: (type === 'cron' && count) ? parseInt(count) : undefined,
-    args: args ? args.split(',').map(a => a.trim()).filter(a => a) : [],
-    env: env ? JSON.parse(env) : {},
-  };
 
-  if (cwd && cwd.trim()) {
-    config.scripts[scriptIndex].cwd = cwd.trim();
+  const previousScript = config.scripts[scriptIndex];
+  const updatedScript = buildScriptFromRequest(req.body);
+
+  if (updatedScript.type === 'forever' && previousScript.stopped) {
+    updatedScript.stopped = true;
   }
-  
-  // Use either command or path
-  if (command && command.trim()) {
-    config.scripts[scriptIndex].command = command;
-  } else {
-    config.scripts[scriptIndex].path = scriptPath;
+  if (updatedScript.type === 'cron' && previousScript.suspended) {
+    updatedScript.suspended = true;
   }
-  
+
+  if (updatedScript.type === 'cron' && !validateCronSchedule(updatedScript.schedule)) {
+    return res.status(400).send('Invalid cron schedule');
+  }
+
+  config.scripts[scriptIndex] = updatedScript;
   configHandler.writeConfig(config);
+
+  if (req.app.locals.cronManager) {
+    req.app.locals.cronManager.upsertScript(updatedScript, previousScript.name);
+  }
+
+  if (previousScript.type === 'forever' && (updatedScript.type !== 'forever' || previousScript.name !== updatedScript.name)) {
+    pm2.connect(() => {
+      pm2.delete(previousScript.name, () => {
+        pm2.disconnect();
+      });
+    });
+  }
+
   res.redirect('/scripts');
 });
 
@@ -268,9 +304,9 @@ router.post('/delete-script/:scriptName', (req, res) => {
     });
   }
   
-  // If it's a cron job, mark it in suspended state (it will be removed on next restart)
-  if (script.type === 'cron' && req.app.locals.cronSuspended) {
-    req.app.locals.cronSuspended[req.params.scriptName] = true;
+  // If it's a cron job, remove it from the live scheduler too
+  if (script.type === 'cron' && req.app.locals.cronManager) {
+    req.app.locals.cronManager.unregisterScript(req.params.scriptName);
   }
   
   // Remove from config
@@ -365,8 +401,8 @@ router.post('/restart-script/:scriptName', (req, res) => {
 
 // Suspend a cron job
 router.post('/suspend-cron/:scriptName', (req, res) => {
-  if (req.app.locals.cronSuspended) {
-    req.app.locals.cronSuspended[req.params.scriptName] = true;
+  if (req.app.locals.cronManager) {
+    req.app.locals.cronManager.setSuspended(req.params.scriptName, true);
   }
   
   // Save suspended status to config
@@ -382,8 +418,8 @@ router.post('/suspend-cron/:scriptName', (req, res) => {
 
 // Resume a cron job
 router.post('/resume-cron/:scriptName', (req, res) => {
-  if (req.app.locals.cronSuspended) {
-    req.app.locals.cronSuspended[req.params.scriptName] = false;
+  if (req.app.locals.cronManager) {
+    req.app.locals.cronManager.setSuspended(req.params.scriptName, false);
   }
   
   // Clear suspended status from config
@@ -395,6 +431,25 @@ router.post('/resume-cron/:scriptName', (req, res) => {
   }
   
   res.redirect('/scripts');
+});
+
+router.post('/run-cron-now/:scriptName', async (req, res) => {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'cron');
+
+  if (!script) {
+    return res.status(404).send('Cron script not found');
+  }
+
+  try {
+    if (req.app.locals.cronManager) {
+      await req.app.locals.cronManager.runNow(req.params.scriptName);
+    }
+    res.redirect('/scripts');
+  } catch (error) {
+    console.error(`Failed to run cron ${req.params.scriptName} manually:`, error);
+    res.status(500).send(`Failed to run cron job: ${error.message}`);
+  }
 });
 
 // Settings page
@@ -624,7 +679,7 @@ router.get('/api/scripts', apiAuth, (req, res) => {
 // Add a new script (JSON API)
 router.post('/api/add-script', apiAuth, (req, res) => {
   const config = configHandler.loadConfig();
-  const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = req.body;
+  const { name, path: scriptPath, command, type, schedule } = req.body;
   
   // Validate required fields
   if (!name) {
@@ -639,6 +694,9 @@ router.post('/api/add-script', apiAuth, (req, res) => {
   if (type === 'cron' && !schedule) {
     return res.status(400).json({ success: false, error: 'Schedule is required for cron scripts' });
   }
+  if (type === 'cron' && !validateCronSchedule(schedule)) {
+    return res.status(400).json({ success: false, error: 'Invalid cron schedule' });
+  }
   
   // Check if script already exists
   const existingScript = config.scripts.find(s => s.name === name);
@@ -646,30 +704,15 @@ router.post('/api/add-script', apiAuth, (req, res) => {
     return res.status(409).json({ success: false, error: `Script '${name}' already exists` });
   }
   
-  // Build the new script config
-  const newScript = {
-    name,
-    type,
-    schedule: type === 'cron' ? schedule : undefined,
-    count: (type === 'cron' && count) ? parseInt(count) : undefined,
-    args: Array.isArray(args) ? args : (args ? args.split(',').map(a => a.trim()).filter(a => a) : []),
-    env: typeof env === 'object' ? env : (env ? JSON.parse(env) : {}),
-  };
-
-  if (cwd && String(cwd).trim()) {
-    newScript.cwd = String(cwd).trim();
-  }
-  
-  // Use either command or path
-  if (command && command.trim()) {
-    newScript.command = command;
-  } else {
-    newScript.path = scriptPath;
-  }
+  const newScript = buildScriptFromRequest(req.body);
   
   // Add to config and save
   config.scripts.push(newScript);
   configHandler.writeConfig(config);
+
+  if (type === 'cron' && req.app.locals.cronManager) {
+    req.app.locals.cronManager.upsertScript(newScript);
+  }
   
   // If it's a forever script, optionally start it immediately
   if (type === 'forever' && req.body.autoStart !== false) {

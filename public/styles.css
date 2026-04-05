@@ -64,6 +64,8 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
 .btn-start:hover { background: #218838; }
 .btn-restart { background: #ffc107; color: #000; }
 .btn-restart:hover { background: #e0a800; }
+.btn-run-now { background: #6f42c1; color: white; }
+.btn-run-now:hover { background: #59359c; }
 .btn-edit { background: #17a2b8; color: white; }
 .btn-edit:hover { background: #138496; }
 .btn-delete { background: #6c757d; color: white; }
@@ -258,12 +260,16 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
   font-weight: 600; 
   color: #495057; 
 }
+.cron-field input,
 .cron-field select { 
   width: 100%; 
   padding: 0.5em; 
   border: 1px solid #ced4da; 
   border-radius: 4px; 
   font-size: 13px; 
+}
+.cron-field small {
+  margin-top: 0.45em;
 }
 
 .cron-preview { 
@@ -288,9 +294,21 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
   font-weight: 600; 
   font-size: 14px; 
 }
+.cron-note {
+  display: block;
+  margin-top: 0.9em;
+  color: #495057;
+}
 
 .cron-custom { margin-top: 1.5em; padding-top: 1.5em; border-top: 1px solid #dee2e6; }
 .cron-custom label { font-size: 0.9em; margin-bottom: 0.5em; display: block; font-weight: 600; }
+.scheduler-info {
+  margin-top: 1em;
+  margin-bottom: 1.5em;
+}
+.scheduler-info p {
+  margin: 0.35em 0;
+}
 
 /* Form Actions */
 .form-actions { 
