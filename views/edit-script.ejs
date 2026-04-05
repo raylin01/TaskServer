@@ -45,8 +45,8 @@
 
       <div class="form-group">
         <label for="cwd">Working Directory (optional)</label>
-        <input type="text" id="cwd" name="cwd" value="<%= script.cwd || '' %>" placeholder="e.g., C:/Users/x/test or ./scripts">
-        <small>Recommended for commands like <code>bun start</code> so you do not need <code>cd ... &&</code></small>
+        <input type="text" id="cwd" name="cwd" value="<%= script.cwd || '' %>" placeholder="e.g., ~/Documents/test or ./scripts">
+        <small>Recommended for commands like <code>bun start</code> so you do not need <code>cd ... &&</code>. Supports <code>~</code> home paths.</small>
       </div>
 
       <div class="form-group">

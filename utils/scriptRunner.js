@@ -1,7 +1,20 @@
+const os = require('os');
 const path = require('path');
 
 function isAbsolutePath(value) {
   return path.isAbsolute(value) || path.win32.isAbsolute(value);
+}
+
+function expandHomeDirectory(value) {
+  if (value === '~') {
+    return os.homedir();
+  }
+
+  if (value.startsWith('~/') || value.startsWith('~\\')) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+
+  return value;
 }
 
 function resolveScriptCwd(script) {
@@ -9,7 +22,7 @@ function resolveScriptCwd(script) {
     return process.cwd();
   }
 
-  const cwd = String(script.cwd).trim();
+  const cwd = expandHomeDirectory(String(script.cwd).trim());
   return isAbsolutePath(cwd) ? cwd : path.resolve(process.cwd(), cwd);
 }
 

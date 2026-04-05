@@ -233,10 +233,10 @@ scripts:
   - name: myBunApp
     command: bun start
     type: forever
-    cwd: C:/Users/x/test
+    cwd: ~/Documents/test
 ```
 
-This is the recommended way to run commands on Windows. It avoids shell-specific `cd ... && ...` wrappers and works for both file-based scripts and command-based scripts.
+This avoids shell-specific `cd ... && ...` wrappers and works for both file-based scripts and command-based scripts. Relative paths are resolved from the TaskServer process directory, and `~` expands to your home directory.
 
 ### Crash Restart Delay
 
