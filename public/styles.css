@@ -58,6 +58,12 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
   font-weight: normal;
   font-style: normal;
 }
+.btn-action .icon svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+  fill: currentColor;
+}
 .btn-stop { background: #dc3545; color: white; }
 .btn-stop:hover { background: #c82333; }
 .btn-start { background: #28a745; color: white; }
@@ -302,14 +308,6 @@ button:hover { opacity: 0.9; transform: translateY(-1px); }
 
 .cron-custom { margin-top: 1.5em; padding-top: 1.5em; border-top: 1px solid #dee2e6; }
 .cron-custom label { font-size: 0.9em; margin-bottom: 0.5em; display: block; font-weight: 600; }
-.scheduler-info {
-  margin-top: 1em;
-  margin-bottom: 1.5em;
-}
-.scheduler-info p {
-  margin: 0.35em 0;
-}
-
 /* Form Actions */
 .form-actions { 
   margin-top: 2em; 

@@ -93,8 +93,6 @@ router.get('/scripts', (req, res) => {
         pm2list: list || [],
         cronRunHistory: req.app.locals.cronRunHistory || {},
         cronSuspended: req.app.locals.cronSuspended || {},
-        serverTimeZone: req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone,
-        serverNow: new Date(),
       });
       pm2.disconnect();
     });

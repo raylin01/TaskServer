@@ -78,6 +78,7 @@ app.locals.serverTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 app.use((req, res, next) => {
   res.locals.serverTimeZone = req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  res.locals.serverNow = new Date();
   next();
 });
 
