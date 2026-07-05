@@ -124,7 +124,7 @@ server:
 pm2:
   maxRestarts: 10000           # Max restarts before giving up (default: 10000)
   autoRestart: true            # Auto restart on crash (default: true)
-  restartDelay: 1000           # Wait 1 second before restarting a crashed forever script
+  restartDelay: 1000           # Start with a 1 second exponential backoff for crashed forever scripts
 
 # Cloudflare Tunnel Settings (Optional)
 cloudflare:
@@ -238,9 +238,9 @@ scripts:
 
 This avoids shell-specific `cd ... && ...` wrappers and works for both file-based scripts and command-based scripts. Relative paths are resolved from the TaskServer process directory, and `~` expands to your home directory.
 
-### Crash Restart Delay
+### Crash Restart Backoff
 
-Forever scripts now wait `1000ms` before PM2 restarts them after a crash. This avoids tight crash loops that can spike CPU usage when a command exits immediately.
+Forever scripts use PM2 exponential backoff when restarting after a crash. The default starts at `1000ms`, then increases after repeated failures so immediate-exit commands do not create tight crash loops.
 
 You can override it in `config.yaml`:
 

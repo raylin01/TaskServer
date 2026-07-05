@@ -23,7 +23,7 @@ function buildPm2Config(script, pm2Settings) {
     env: script.env || {},
     autorestart: pm2Settings.autoRestart !== undefined ? pm2Settings.autoRestart : true,
     max_restarts: pm2Settings.maxRestarts || 10000,
-    restart_delay: pm2Settings.restartDelay !== undefined ? pm2Settings.restartDelay : 1000,
+    exp_backoff_restart_delay: pm2Settings.restartDelay !== undefined ? pm2Settings.restartDelay : 1000,
     out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
     error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
   };
@@ -610,7 +610,8 @@ router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
     }
     
     pm2.list((listErr, list) => {
-      const isRunning = list && list.some(p => p.name === script.name && p.pm2_env.status === 'online');
+      const existingProcess = list && list.find(p => p.name === script.name);
+      const isRunning = existingProcess && existingProcess.pm2_env.status === 'online';
       
       if (isRunning) {
         pm2.disconnect();
@@ -622,7 +623,7 @@ router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
 
       const pm2Config = buildPm2Config(script, config.pm2);
 
-      pm2.start(pm2Config, (startErr) => {
+      const startFreshProcess = () => pm2.start(pm2Config, (startErr) => {
         // Clear stopped status
         script.stopped = false;
         configHandler.writeConfig(config);
@@ -640,6 +641,15 @@ router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
           logFile: path.basename(pm2Config.out_file)
         });
       });
+
+      if (existingProcess) {
+        pm2.delete(script.name, (deleteErr) => {
+          if (deleteErr) console.error(`Failed to delete ${script.name}:`, deleteErr);
+          startFreshProcess();
+        });
+      } else {
+        startFreshProcess();
+      }
     });
   });
 });

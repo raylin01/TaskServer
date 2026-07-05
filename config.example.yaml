@@ -20,11 +20,11 @@ api:
   apiKey: ""                   # Your secret API key (generate a secure random string)
 
 # PM2 Settings (Optional)
-# restartDelay adds a gap between crash/restart cycles for forever scripts
+# restartDelay is the initial exponential backoff delay between crash/restart cycles
 pm2:
   maxRestarts: 10000
   autoRestart: true
-  restartDelay: 1000            # Wait 1 second before restarting a crashed forever script
+  restartDelay: 1000            # Start with a 1 second backoff for crashed forever scripts
 
 # Scripts Configuration
 # PM2 automatically detects script types based on file extension:
