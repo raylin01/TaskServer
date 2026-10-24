@@ -31,7 +31,7 @@ function startTunnel(tunnelToken, port = 3000) {
       '--token',
       tunnelToken,
       '--url',
-      `http://localhost:${port}`
+      `http://127.0.0.1:${port}`
     ], {
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -40,7 +40,7 @@ function startTunnel(tunnelToken, port = 3000) {
     let urlFound = false;
 
     tunnelProcess.stdout.on('data', (data) => {
-      const str = data.toString();
+      const str = data.toString().split(tunnelToken).join('[redacted]');
       output += str;
       console.log(`[Cloudflare Tunnel] ${str.trim()}`);
       
@@ -56,7 +56,7 @@ function startTunnel(tunnelToken, port = 3000) {
     });
 
     tunnelProcess.stderr.on('data', (data) => {
-      const str = data.toString();
+      const str = data.toString().split(tunnelToken).join('[redacted]');
       console.error(`[Cloudflare Tunnel Error] ${str.trim()}`);
       
       // Also check stderr for URL (cloudflared sometimes outputs here)
@@ -70,7 +70,7 @@ function startTunnel(tunnelToken, port = 3000) {
     });
 
     tunnelProcess.on('error', (error) => {
-      console.error('Failed to start Cloudflare Tunnel:', error);
+      console.error('Failed to start Cloudflare Tunnel:', error.message.split(tunnelToken).join('[redacted]'));
       reject(error);
     });
 

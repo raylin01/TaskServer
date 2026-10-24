@@ -65,8 +65,11 @@ pm2.connect(function(err) {
 
 // Setup cron jobs with last run tracking
 const cronManager = createCronManager();
-config.scripts.forEach((script) => {
-  cronManager.upsertScript(script);
+// Sweep old stopped runs before scheduling new runs; retry scans on failure.
+cronManager.start().catch(() => {
+  console.error('[Run Cleanup] Startup scan failed; will retry');
+}).then(() => {
+  config.scripts.forEach((script) => cronManager.upsertScript(script));
 });
 
 // Make cron history and jobs available to routes
@@ -87,8 +90,11 @@ app.use('/', scriptsRouter);
 
 // Start server
 const PORT = config.server.port || 3000;
-app.listen(PORT, async () => {
-  console.log(`TaskServer running at http://localhost:${PORT}`);
+const HOST = config.server.host;
+const server = app.listen(PORT, HOST, async () => {
+  const address = server.address();
+  const host = address.family === 'IPv6' ? `[${address.address}]` : address.address;
+  console.log(`TaskServer running at http://${host}:${address.port}`);
   
   // Start Cloudflare Tunnel if configured
   if (config.cloudflare && config.cloudflare.enabled && config.cloudflare.tunnelToken) {

@@ -13,6 +13,7 @@ const DEFAULT_CONFIG = {
   },
   server: {
     port: 3000,
+    host: '127.0.0.1',
     logsDir: './logs'
   },
   pm2: {
@@ -32,6 +33,7 @@ function loadConfig() {
     const config = { ...DEFAULT_CONFIG, ...userConfig };
     config.logManagement = { ...DEFAULT_CONFIG.logManagement, ...(userConfig.logManagement || {}) };
     config.server = { ...DEFAULT_CONFIG.server, ...(userConfig.server || {}) };
+    config.server.host = config.server.host || DEFAULT_CONFIG.server.host;
     config.pm2 = { ...DEFAULT_CONFIG.pm2, ...(userConfig.pm2 || {}) };
     
     // Ensure scripts exists
