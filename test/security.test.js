@@ -315,6 +315,41 @@ test('the sign-in page only sends you on to a path of this site', async t => {
   assert.equal(crossSite.headers['set-cookie'], undefined);
 });
 
+test('Origin: null (a same-origin form post under the no-referrer policy) works only with Sec-Fetch-Site same-origin', async t => {
+  const { base, saved } = await boot(t, { scripts: forever(), extra: AUTH });
+  const same = { origin: 'null', 'sec-fetch-site': 'same-origin' };
+  const refused = headers => [{ ...headers }, { ...headers, 'sec-fetch-site': 'cross-site' }, { ...headers, 'sec-fetch-site': 'same-site' }, { ...headers, 'sec-fetch-site': 'none' }];
+
+  // Sign in. A wrong key is a 401 (the request got as far as the key check).
+  assert.equal((await request(base, 'POST', '/login', { headers: same, form: { apiKey: 'wrong' } })).status, 401);
+  for (const headers of refused({ origin: 'null' })) {
+    const res = await request(base, 'POST', '/login', { headers, form: { apiKey: KEY } });
+    assert.equal(res.status, 403, JSON.stringify(headers));
+    assert.equal(res.headers['set-cookie'], undefined);
+  }
+  const login = await request(base, 'POST', '/login', { headers: same, form: { apiKey: KEY, next: '/scripts' } });
+  assert.equal(login.status, 302);
+  const cookie = login.headers['set-cookie'][0].split(';')[0];
+
+  // A dashboard form with the session and the page's token.
+  const token = await pageToken(base, { cookie });
+  const form = { _csrf: token, name: 'Added', type: 'forever', command: 'echo hi', sourceType: 'command' };
+  for (const headers of refused({ cookie, origin: 'null' })) {
+    assert.equal((await request(base, 'POST', '/add-script', { headers, form })).status, 403, JSON.stringify(headers));
+  }
+  assert.equal((await request(base, 'POST', '/add-script', { headers: { cookie, ...same }, form: { ...form, _csrf: 'forged' } })).status, 403, 'still needs the token');
+  assert.equal(saved().scripts.length, 1);
+  assert.equal((await request(base, 'POST', '/add-script', { headers: { cookie, ...same }, form })).status, 302);
+  assert.equal(saved().scripts.length, 2);
+});
+
+test('pages are sent with Referrer-Policy: same-origin', async t => {
+  const { base } = await boot(t, { extra: AUTH });
+  for (const url of ['/login', '/styles.css', '/api/scripts']) {
+    assert.equal((await request(base, 'GET', url)).headers['referrer-policy'], 'same-origin', url);
+  }
+});
+
 test('the secure flag is set on the session cookie when the request came over https', async t => {
   const { base } = await boot(t, { extra: AUTH });
   const res = await request(base, 'POST', '/login', { headers: { 'x-forwarded-proto': 'https' }, form: { apiKey: KEY } });

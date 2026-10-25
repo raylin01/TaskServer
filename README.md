@@ -261,6 +261,10 @@ TaskServer do anything:
   (its `Origin` is this server's own `Host`, or is listed in `server.publicOrigins`;
   `X-Forwarded-Host` is not used) and carry the CSRF token the dashboard pages embed
   (a hidden `_csrf` form field, or the `X-CSRF-Token` header).
+  An `Origin: null` (which some browsers send for same-origin form posts, and
+  sandboxed frames and local files always send) counts as no `Origin`: it is only
+  accepted when the browser also says `Sec-Fetch-Site: same-origin`. Pages are sent
+  with `Referrer-Policy: same-origin`.
 - A request with a valid `X-API-Key` header is exempt: a web page cannot add that
   header, and scripts such as GitSync send no `Origin`. A program that sends no
   `Origin` and no cookie is treated as a script and is only let through when
