@@ -20,6 +20,12 @@
 //    key header is exempt: a web page cannot add that header to a cross-site
 //    request. Programs that send neither an Origin nor a cookie are not
 //    browsers and are only let through when authentication is off.
+//  - Optionally (`api.dashboardAuth: false`, with auth on) the dashboard pages
+//    need no key or session when the request is unmistakably local: the socket,
+//    the Host header and the absence of proxy headers all say loopback, and
+//    `server.publicOrigins` is empty. Anything else is asked for the key as
+//    usual. `/api/*` is never part of this: it always needs the key. Browser
+//    posts to the pages still need this site's Origin and a CSRF token.
 //  - With authentication off, only loopback host names (and `server.allowedHosts`)
 //    are served, so a page cannot reach TaskServer through DNS rebinding.
 //  - Once settings have been read, a config.yaml that later goes missing, is
@@ -56,6 +62,22 @@ const MAX_CLIENTS = 10000;
 const SWEEP_MS = 60 * 1000;
 const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip'];
 
+// The dashboard's own pages, forms and data routes: the only paths that may be
+// served without a key when `api.dashboardAuth` is false. A list of what is
+// allowed (not a test for "/api") so a path that is spelled oddly, or a route
+// added later, asks for the key until it is put here on purpose.
+const DASHBOARD_PATHS = [
+  /^\/$/,
+  /^\/scripts$/,
+  /^\/add-script$/,
+  /^\/settings$/,
+  /^\/logout$/,
+  /^\/(?:edit-script|delete-script|stop-script|start-script|restart-script|suspend-cron|resume-cron|run-cron-now)\/[^/]+$/,
+  /^\/logs\/[^/]+$/,
+  /^\/logs\/[^/]+\/data(?:\/(?:stats|chunk|download|delete))?$/,
+];
+const isDashboardPath = path => DASHBOARD_PATHS.some(pattern => pattern.test(path));
+
 // Scripts and styles only from this site, nothing inline. Inline styles stay
 // allowed because the pages use style attributes.
 const CONTENT_SECURITY_POLICY = [
@@ -81,6 +103,13 @@ function safeEqual(a, b) {
 function isLoopbackHost(host) {
   const name = String(host || '').trim().replace(/^\[|\]$/g, '').toLowerCase();
   return LOOPBACK_NAMES.has(name) || /^127(\.\d{1,3}){3}$/.test(name);
+}
+
+// The host name in a Host header, without port or brackets, lower case.
+function hostNameOf(header) {
+  const text = String(header || '');
+  return (text.startsWith('[') ? text.slice(0, text.indexOf(']') + 1) : text.replace(/:\d*$/, ''))
+    .replace(/^\[|\]$/g, '').toLowerCase();
 }
 
 const isMapping = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -110,6 +139,9 @@ function parseSettings(config, previous = null) {
   if (api.apiKey !== undefined && typeof api.apiKey !== 'string') {
     return { problem: 'api.apiKey in config.yaml must be a string' };
   }
+  if (api.dashboardAuth !== undefined && typeof api.dashboardAuth !== 'boolean') {
+    return { problem: 'api.dashboardAuth in config.yaml must be true or false' };
+  }
   const enabled = api.authEnabled === true;
   const apiKey = api.apiKey ?? '';
   if (enabled && apiKey.trim().length < MIN_KEY_LENGTH) {
@@ -135,13 +167,39 @@ function parseSettings(config, previous = null) {
       return { problem: 'server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com' };
     }
   }
-  return { settings: { ...settingsOf(api, server, hasApi), enabled, apiKey, publicOrigins } };
+  // Keyless dashboard pages are only honoured while nothing contradicts them
+  // (start-up refuses such a config; a file edited while running just goes back
+  // to asking for the key).
+  const dashboardAuth = api.dashboardAuth !== false || dashboardAuthConflicts(config).length > 0;
+  return { settings: { ...settingsOf(api, server, hasApi), enabled, apiKey, publicOrigins, dashboardAuth } };
+}
+
+// Reasons `api.dashboardAuth: false` cannot be used with this config, each
+// naming the key. Empty when it is not asked for, or is safe.
+function dashboardAuthConflicts(config) {
+  if (!isMapping(config) || !isMapping(config.api) || config.api.dashboardAuth !== false) return [];
+  const conflicts = [];
+  const host = config.server?.host;
+  if (host && !isLoopbackHost(host)) {
+    conflicts.push(`api.dashboardAuth is false but server.host is ${host}, not a loopback address, `
+      + 'so other machines could open the dashboard without a key: set server.host to 127.0.0.1 or remove api.dashboardAuth');
+  }
+  if (config.cloudflare?.enabled) {
+    conflicts.push('api.dashboardAuth is false but cloudflare.enabled is true, '
+      + 'so visitors through the tunnel could open the dashboard without a key: turn the tunnel off or remove api.dashboardAuth');
+  }
+  if (Array.isArray(config.server?.publicOrigins) && config.server.publicOrigins.length) {
+    conflicts.push('api.dashboardAuth is false but server.publicOrigins is not empty, '
+      + 'so the dashboard is reached through a proxy and anyone behind it could open it without a key: empty server.publicOrigins or remove api.dashboardAuth');
+  }
+  return conflicts;
 }
 
 function settingsOf(api, server, hasApi) {
   return {
     enabled: false,
     apiKey: '',
+    dashboardAuth: true,
     hasApi,
     host: typeof server.host === 'string' ? server.host : undefined,
     allowedHosts: server.allowedHosts || [],
@@ -150,7 +208,7 @@ function settingsOf(api, server, hasApi) {
 }
 
 // Settings that refuse everything: used when config.yaml was never usable.
-const REFUSE_ALL = { enabled: true, apiKey: '', hasApi: true, host: undefined, allowedHosts: [], publicOrigins: [] };
+const REFUSE_ALL = { enabled: true, apiKey: '', dashboardAuth: true, hasApi: true, host: undefined, allowedHosts: [], publicOrigins: [] };
 
 // Reads the settings from config.yaml on each call (the file can change while
 // running). Settings that cannot be used never switch protection off: the last
@@ -197,6 +255,7 @@ function listenProblems(config) {
     problems.push(`${exposure.join(' and ')}, so the dashboard is reachable from other machines: `
       + `set api.authEnabled: true and an api.apiKey of at least ${MIN_KEY_LENGTH} characters in config.yaml`);
   }
+  problems.push(...dashboardAuthConflicts(config));
   return problems;
 }
 
@@ -313,6 +372,11 @@ function createSecurity({
   };
 
   const csrfFor = session => hmac(csrfSecret, `csrf|${session || ''}`);
+  // The CSRF token of the keyless local dashboard (see isLocalDashboard). With no
+  // session to bind it to, it is bound to this process: made from the random
+  // per-process secret under its own label, so it differs from every session's
+  // token and from the one used when authentication is off, and changes on restart.
+  const localDashboardToken = hmac(csrfSecret, 'csrf-local-dashboard');
 
   const sessionCookie = (req, value, maxAgeMs) => {
     const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
@@ -333,15 +397,23 @@ function createSecurity({
   function hostGuard(req, res, next) {
     const auth = settingsFor(req);
     if (auth.enabled) return next();
-    const header = String(req.headers.host || '');
-    const name = (header.startsWith('[') ? header.slice(0, header.indexOf(']') + 1) : header.replace(/:\d*$/, ''))
-      .replace(/^\[|\]$/g, '').toLowerCase();
+    const name = hostNameOf(req.headers.host);
     const allowed = isLoopbackHost(name)
       || auth.allowedHosts.some(entry => entry.toLowerCase() === name)
       || (auth.host && !['0.0.0.0', '::'].includes(auth.host) && auth.host.toLowerCase() === name);
     if (!allowed) return res.status(403).type('text/plain').send('Host not allowed');
     next();
   }
+
+  // May this request use the dashboard without a key (`api.dashboardAuth: false`)?
+  // Only when everything says it comes from this machine: the socket, the Host
+  // header, and no proxy headers, and no proxy configured. Any doubt means the
+  // usual key or session. `/api` is never open this way (see DASHBOARD_PATHS).
+  const isLocalDashboard = (req, auth) => auth.enabled && auth.dashboardAuth === false
+    && auth.publicOrigins.length === 0
+    && isLoopbackAddress(clientOf(req))
+    && isLoopbackHost(hostNameOf(req.headers.host))
+    && !PROXY_HEADERS.some(name => req.headers[name] !== undefined);
 
   const wantsPage = req => req.method === 'GET' && !req.path.startsWith('/api/')
     && String(req.headers.accept || '').includes('text/html');
@@ -357,6 +429,13 @@ function createSecurity({
     if (!auth.enabled) return next();
 
     const given = req.headers['x-api-key'];
+    if (given === undefined && isDashboardPath(req.path) && isLocalDashboard(req, auth)) {
+      req.authMode = 'local';
+      req.csrfToken = localDashboardToken;
+      res.locals.csrfToken = localDashboardToken;
+      res.locals.authEnabled = false; // nothing to sign in to or out of
+      return next();
+    }
     if (given !== undefined) {
       const seconds = throttle.wait(clientOf(req));
       if (seconds) return tooMany(res, seconds);
@@ -397,14 +476,16 @@ function createSecurity({
 
   function csrfGuard(req, res, next) {
     if (SAFE_METHODS.has(req.method) || req.authMode === 'key') return next();
+    // Without a key or a session in the way, every state change counts as a
+    // browser's, even one that sends no Origin: it must prove it came from the page.
     const browser = req.headers.origin !== undefined || req.headers['sec-fetch-site'] !== undefined
-      || req.authMode === 'session';
+      || req.authMode === 'session' || req.authMode === 'local';
     if (!browser) return next();
     if (!fromThisSite(req, settingsFor(req))) {
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }
     const token = req.body?._csrf ?? req.headers['x-csrf-token'];
-    const expected = req.authMode === 'session' ? req.csrfToken : csrfFor('');
+    const expected = req.csrfToken ?? csrfFor('');
     if (typeof token !== 'string' || !safeEqual(token, expected)) {
       return res.status(403).type('text/plain').send('Missing or invalid CSRF token. Reload the page and try again.');
     }
@@ -417,13 +498,14 @@ function createSecurity({
   loginRouter.get('/login', (req, res) => {
     const auth = settingsFor(req);
     const next = localPath(req.query.next);
-    if (!auth.enabled || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
+    if (!auth.enabled || isLocalDashboard(req, auth)
+      || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
     res.render('login', { next, error: null });
   });
   loginRouter.post('/login', (req, res) => {
     const auth = settingsFor(req);
     const next = localPath(req.body?.next);
-    if (!auth.enabled) return res.redirect(next);
+    if (!auth.enabled || isLocalDashboard(req, auth)) return res.redirect(next);
     if (req.headers.origin !== undefined && !fromThisSite(req, auth)) {
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }
@@ -445,6 +527,7 @@ function createSecurity({
   // copy of the cookie stops working too.
   const sessionRouter = express.Router();
   sessionRouter.post('/logout', (req, res) => {
+    if (req.authMode === 'local') return res.redirect('/scripts'); // no session to end
     if (req.sessionId) sessions.delete(req.sessionId);
     res.set('Set-Cookie', sessionCookie(req, '', 0));
     res.redirect('/login');

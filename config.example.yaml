@@ -31,6 +31,10 @@ cloudflare:
 api:
   authEnabled: false            # Must be true or false. true requires the API key everywhere
   apiKey: ""                   # A string of 16+ characters, e.g. from: openssl rand -base64 24
+  # dashboardAuth: true         # Must be true or false (default true). false, with authEnabled on, serves the
+                                # dashboard pages without a key to this machine only; /api/* still needs the key.
+                                # Refused at start-up with a non-loopback server.host, cloudflare.enabled or
+                                # server.publicOrigins. See "Dashboard without a key" in the README.
 
 # PM2 Settings (Optional)
 # restartDelay is the initial exponential backoff delay between crash/restart cycles

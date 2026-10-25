@@ -19,11 +19,11 @@
 
   var logViewer = document.getElementById('logContent');
 
-  function apiUrl(suffix, params) {
+  function dataUrl(suffix, params) {
     var query = Object.keys(params || {}).map(function (key) {
       return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]);
     }).join('&');
-    return '/api/logs/' + encodeURIComponent(scriptName) + suffix + (query ? '?' + query : '');
+    return '/logs/' + encodeURIComponent(scriptName) + '/data' + suffix + (query ? '?' + query : '');
   }
 
   // Parsed JSON, or an Error carrying the server's message and status.
@@ -49,7 +49,7 @@
   function loadInitialLogs() {
     if (!currentFile) return;
 
-    getJson(apiUrl('/chunk', { file: currentFile, offset: 0, limit: 500, fromEnd: true }))
+    getJson(dataUrl('/chunk', { file: currentFile, offset: 0, limit: 500, fromEnd: true }))
       .then(function (data) {
         logViewer.textContent = data.content;
         loadedOffset = data.loadedLines;
@@ -70,7 +70,7 @@
     logViewer.classList.add('loading');
     var previousHeight = logViewer.scrollHeight;
 
-    getJson(apiUrl('/chunk', { file: currentFile, offset: loadedOffset, limit: 500, fromEnd: true }))
+    getJson(dataUrl('/chunk', { file: currentFile, offset: loadedOffset, limit: 500, fromEnd: true }))
       .then(function (data) {
         if (data.content) {
           // Prepend content
@@ -126,7 +126,7 @@
 
   function refreshLogs() {
     // First, check for new logs
-    getJson(apiUrl('/stats'))
+    getJson(dataUrl('/stats'))
       .then(function (stats) {
         // Update Stats UI
         document.querySelector('.stat-card:nth-child(1) .stat-value').textContent = stats.count;
@@ -168,7 +168,7 @@
 
         if (tailMode && file && !forceFullRefresh) {
           // In tail mode, just append new content
-          getJson(apiUrl('/chunk', { file: file, offset: 0, limit: 500, fromEnd: true }))
+          getJson(dataUrl('/chunk', { file: file, offset: 0, limit: 500, fromEnd: true }))
             .then(function (data) {
               var wasAtBottom = isScrolledToBottom();
               logViewer.textContent = data.content;
@@ -180,7 +180,7 @@
             .catch(showError);
         } else {
           // Full refresh (updates list and content)
-          getJson(apiUrl('', file ? { file: file } : {}))
+          getJson(dataUrl('', file ? { file: file } : {}))
             .then(function (data) {
               logViewer.textContent = data.logContent;
               document.getElementById('currentLog').textContent = data.selectedLog;
@@ -235,7 +235,7 @@
     }
     // Create a download link
     var link = document.createElement('a');
-    link.href = apiUrl('/download', { file: currentFile });
+    link.href = dataUrl('/download', { file: currentFile });
     link.download = currentFile;
     document.body.appendChild(link);
     link.click();
@@ -252,7 +252,7 @@
       return;
     }
 
-    getJson(apiUrl('/delete', { file: currentFile }), { method: 'DELETE', headers: { 'X-CSRF-Token': csrfToken } })
+    getJson(dataUrl('/delete', { file: currentFile }), { method: 'DELETE', headers: { 'X-CSRF-Token': csrfToken } })
       .then(function () {
         alert('Log file deleted successfully');
         window.location.reload();
