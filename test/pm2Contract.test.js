@@ -41,7 +41,7 @@ test('package.json pins pm2 exactly, and the installed version is that one', () 
 
 test('against a real PM2 core: the service calls work and the stored fields match what reconcile compares', async () => {
   const probe = path.join(__dirname, '../test-support/pm2ContractProbe.js');
-  const env = { ...process.env };
+  const env = { ...process.env, SHELL: '/bin/sh' };
   delete env.PM2_HOME;
   const stdout = await new Promise((resolve, reject) => {
     execFile(process.execPath, [probe], { env, timeout: 90000 }, (error, out, err) => {
@@ -58,6 +58,17 @@ test('against a real PM2 core: the service calls work and the stored fields matc
   assert.deepEqual(result.changedCommandDiff, ['args']);
   assert.deepEqual(result.changedEnvDiff, ['env.CONTRACT_N']);
   assert.equal(result.killTimeoutStored, 12345);
+  // PM2 rewrites some shapes (a script with a space runs as `bash -c`, a bare
+  // command is looked up on PATH): they must still compare equal to their config,
+  // or every deploy would restart them.
+  for (const [name, shape] of Object.entries(result.shapes)) {
+    assert.equal(shape.status, 'online', name);
+    assert.deepEqual(shape.diff, [], `${name} compares equal to its own config`);
+    assert.equal(shape.changedDiff, true, `${name} still notices a real change`);
+  }
+  assert.equal(result.shapes['contract-spaced'].storedArgs, 2, 'PM2 stored bash -c <script>, not the configured args');
+  assert.equal(result.cronCwdExpanded, true);
+  assert.equal(result.cronRanInCwd, true, 'a cron run with a ~ cwd containing spaces ran in that directory');
   assert.equal(result.afterStop, 'stopped');
   assert.equal(result.afterRestart, 'online');
   assert.equal(result.afterDeleteById, 0);

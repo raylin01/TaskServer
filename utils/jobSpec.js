@@ -68,24 +68,44 @@ function envText(value) {
   return String(value);
 }
 
-function isExecutableFile(file) {
+// PM2's own `which` (lib/tools/which.js) for unix: a bare name is searched in
+// $PATH, anything with a slash is taken as a path. Mirrored here so that the
+// executable PM2 stored can be predicted exactly.
+function isExecutable(file) {
   try {
-    return fs.statSync(file).isFile();
+    fs.accessSync(file, fs.constants.X_OK);
+    return fs.existsSync(file) && !fs.statSync(file).isDirectory();
   } catch (error) {
     return false;
   }
 }
 
-// What PM2 resolves `script` to: relative to the cwd, else found in $PATH.
+function which(command) {
+  if (command.includes('/')) return isExecutable(command) ? path.resolve(command) : null;
+  for (const dir of String(process.env.PATH || '').split(path.delimiter).filter(Boolean)) {
+    const attempt = path.resolve(dir, command);
+    if (isExecutable(attempt)) return attempt;
+  }
+  return null;
+}
+
+// What PM2 does to the script before it starts a process (Common.verifyConfs):
+// on unix a script with a space in it is a command line, so PM2 runs it as
+// `bash -c "<script>"` (or `sh -c`), replacing the configured args. A `path:`
+// job like "sudo -n python3 helper.py" ends up stored that way.
+function pm2CommandForm(script, args) {
+  if (process.platform !== 'win32' && script.includes(' ')) {
+    if (which('bash')) return { script: 'bash', args: ['-c', script] };
+    if (which('sh')) return { script: 'sh', args: ['-c', script] };
+  }
+  return { script, args };
+}
+
+// What PM2 stores as the executable (Common.prepareAppConf): the script
+// relative to the cwd if that exists, else found in $PATH.
 function resolveExecPath(script, cwd) {
   const direct = path.resolve(cwd, script);
-  if (fs.existsSync(direct)) return direct;
-  const dirs = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
-  for (const dir of dirs) {
-    const candidate = path.join(dir, script);
-    if (isExecutableFile(candidate)) return candidate;
-  }
-  return direct;
+  return fs.existsSync(direct) ? direct : (which(script) || direct);
 }
 
 function sameList(a, b) {
@@ -108,8 +128,10 @@ function diffJob(desired, proc) {
   const wantCwd = desired.cwd;
 
   if (!env.pm_cwd || path.resolve(env.pm_cwd) !== path.resolve(wantCwd)) changed.push('cwd');
-  if (env.pm_exec_path !== resolveExecPath(desired.script, wantCwd)) changed.push('exec path');
-  if (!sameList(Array.isArray(env.args) ? env.args : [], desired.args || [])) changed.push('args');
+  // Compare with what PM2 will have made of the config, not the config itself.
+  const form = pm2CommandForm(desired.script, desired.args || []);
+  if (env.pm_exec_path !== resolveExecPath(form.script, wantCwd)) changed.push('exec path');
+  if (!sameList(Array.isArray(env.args) ? env.args : [], form.args)) changed.push('args');
   if (!sameBoolean(env.autorestart, desired.autorestart)) changed.push('autorestart');
   if (Number(env.max_restarts) !== Number(desired.max_restarts)) changed.push('max_restarts');
   if (Number(env.exp_backoff_restart_delay) !== Number(desired.exp_backoff_restart_delay)) {
@@ -132,6 +154,8 @@ function runningKillTimeout(proc) {
 
 module.exports = {
   buildPm2Config,
+  pm2CommandForm,
+  resolveExecPath,
   diffJob,
   killTimeoutFor,
   runningKillTimeout,

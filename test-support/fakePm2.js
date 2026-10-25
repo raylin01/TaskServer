@@ -7,6 +7,7 @@
 
 const path = require('path');
 const { applyScriptExecution } = require('../utils/scriptRunner');
+const { pm2CommandForm, resolveExecPath } = require('../utils/jobSpec');
 
 // What the launching process (TaskServer) had in its environment.
 const LAUNCHER_ENV = { PATH: '/usr/bin:/bin', HOME: '/home/test', SHELL: '/bin/sh', LAUNCHER_ONLY: 'x' };
@@ -36,6 +37,10 @@ function createFakePm2({ launcherEnv = LAUNCHER_ENV, version = '6.0.14' } = {}) 
 
   function toProcess(config) {
     const cwd = path.resolve(config.cwd || '/');
+    // PM2 (Common.verifyConfs) turns a script that contains a space into
+    // `bash -c <script>` and drops the configured args; test/pm2Contract checks
+    // this against a real PM2.
+    const form = pm2CommandForm(config.script, config.args || []);
     return {
       name: config.name,
       pid: nextPid += 1,
@@ -44,9 +49,9 @@ function createFakePm2({ launcherEnv = LAUNCHER_ENV, version = '6.0.14' } = {}) 
         name: config.name,
         status: 'online',
         restart_time: 0,
-        pm_exec_path: path.resolve(cwd, config.script),
+        pm_exec_path: resolveExecPath(form.script, cwd),
         pm_cwd: cwd,
-        args: config.args || [],
+        args: form.args,
         exec_interpreter: 'none',
         autorestart: config.autorestart,
         max_restarts: config.max_restarts,
