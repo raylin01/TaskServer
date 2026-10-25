@@ -36,6 +36,8 @@ pm2:
   restartDelay: 1000            # Start with a 1 second backoff for crashed forever scripts
   killTimeoutMs: 5000           # How long a job may take to exit when stopped, before PM2 force-kills it
                                 # (a script can set its own killTimeoutMs, and an optional stopCommand)
+  reconcileMaxRestartFraction: 0.5  # At boot, if more than this share of running jobs look changed (and more
+                                # than 2), none are restarted. 1 turns the check off.
 
 # Scripts Configuration
 # PM2 automatically detects script types based on file extension:
