@@ -337,8 +337,10 @@ cloudflare:
 ```
 
 Configure the named tunnel's origin service in Cloudflare as
-`http://127.0.0.1:3000` (use your configured port). The built-in local origin also
-uses `127.0.0.1`, so the default loopback bind works without LAN exposure.
+`http://127.0.0.1:3000` (use your configured port). The built-in local origin follows
+the address TaskServer actually bound to: `127.0.0.1` by default, `[::1]` for
+`host: "::1"`, loopback for wildcard binds (`0.0.0.0`, `::`), and the configured
+address otherwise. The default loopback bind works without LAN exposure.
 Protect public access with Cloudflare Access; a tunnel alone does not add a
 TaskServer dashboard login.
 
@@ -418,20 +420,31 @@ Logs are stored in the `logs/` directory with the following naming convention:
 
 ### Finished run cleanup
 
-Cron and manual run processes are removed from PM2 within a few seconds after
-stopping. Running processes and forever jobs are retained. On the first start
-after this update, TaskServer also removes old stopped entries whose names match
-an exact configured job name followed by `-cron-` or `-manual-` and a 13-digit
-timestamp. The cleanup log reports only the number removed.
+Cron and manual run processes are removed from PM2 within about a minute after
+stopping (the scan interval is 30 seconds). Running processes and forever jobs
+are retained. On the first start after this update, TaskServer also removes old
+stopped entries whose names match an exact configured job name followed by
+`-cron-` or `-manual-` and a 13-digit timestamp. The cleanup log reports only the
+number removed, and scan failures log the error message.
 
-The latest run time, trigger, status, exit code, and log paths are saved atomically
-in `.taskserver-run-history.json` next to `config.yaml` before deletion. Keep that
-file writable and retain it across restarts for the dashboard's last-run time.
-It contains no job commands or environment variables. Overlapping runs keep
-separate log files, and an older run finishing cannot replace the latest run.
-Log files remain subject to the existing retention settings (7 days by default
-when automatic cleanup is enabled). Cleanup scans reconnect and retry after PM2
-errors, including runs that exit while TaskServer is down.
+The sweep runs in the background and never delays scheduling or launches: cron
+jobs are registered at boot, and the sweep works in chunks of 200 entries (at
+most 1000 deletions per scan, with follow-up scans about a second apart while a
+backlog remains). Each chunk is a separate PM2 operation, so a launch waits for
+at most one chunk. Every PM2 call has a timeout, so a lost reply cannot block
+launches.
+
+The latest run time and trigger of each job (plus the launch id that identifies the
+newest run) are saved atomically in `.taskserver-run-history.json` next to
+`config.yaml` before deletion. Keep that file writable and retain it across
+restarts for the dashboard's last-run time. It contains no job commands or
+environment variables. If the file is empty, truncated or not a JSON object,
+TaskServer logs one warning, renames it to `.taskserver-run-history.json.corrupt-<time>`
+and starts with empty history. Overlapping runs keep separate log files, and an
+older run finishing cannot replace the latest run. Log files remain subject to the
+existing retention settings (7 days by default when automatic cleanup is enabled).
+Cleanup scans reconnect and retry after PM2 errors, including runs that exit while
+TaskServer is down.
 
 ### Viewing Logs
 
