@@ -15,7 +15,8 @@
 //    from random per-process secrets, never from the API key.
 //  - A state-changing request from a browser must come from this site: its
 //    Origin has to be this server's own host or one of `server.publicOrigins`
-//    (or, with no Origin, Sec-Fetch-Site has to say same-origin), and it has to
+//    (or, with no Origin or with `Origin: null`, Sec-Fetch-Site has to say
+//    same-origin), and it has to
 //    carry the CSRF token the dashboard pages embed. A request with a valid API
 //    key header is exempt: a web page cannot add that header to a cross-site
 //    request. Programs that send neither an Origin nor a cookie are not
@@ -324,7 +325,7 @@ function createSecurity({
       'Content-Security-Policy': CONTENT_SECURITY_POLICY,
       'X-Content-Type-Options': 'nosniff',
       'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'no-referrer',
+      'Referrer-Policy': 'same-origin',
     });
     next();
   }
@@ -382,9 +383,14 @@ function createSecurity({
 
   // Does the request come from a page of this site? Sec-Fetch-Site "none" (the
   // user typing the address) is not accepted: nobody types in a POST.
+  //
+  // `Origin: null` is no usable Origin. Browsers send it on a same-origin form
+  // post when the Referrer-Policy is no-referrer, but also from sandboxed frames
+  // and file:// pages. So it counts only when Sec-Fetch-Site says same-origin,
+  // exactly as when there is no Origin at all.
   function fromThisSite(req, auth) {
     const origin = req.headers.origin;
-    if (origin !== undefined) {
+    if (origin !== undefined && origin !== 'null') {
       try {
         const url = new URL(origin);
         return url.host === req.headers.host || auth.publicOrigins.includes(url.origin);
