@@ -55,9 +55,9 @@ function createRunCleanup({
   chunkSize = 200,
   maxDeletesPerScan = 1000,
   chunkPauseMs = 100,
-  rpcTimeoutMs = 30000,
-  operationTimeoutMs = 60000,
-  chunkTimeoutMs = 120000,
+  rpcTimeoutMs = 60000,
+  operationTimeoutMs = 120000,
+  chunkTimeoutMs = 180000,
   disconnectTimeoutMs = 5000,
   logger = console,
 } = {}) {
