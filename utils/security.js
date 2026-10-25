@@ -60,7 +60,15 @@ const FORGET_MS = 10 * 60 * 1000;
 const REMEMBERED_WRONG_KEYS = 8;
 const MAX_CLIENTS = 10000;
 const SWEEP_MS = 60 * 1000;
-const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip'];
+// Headers a proxy or tunnel adds. Any one of them means the request did not come
+// straight from a local client: it gets the long pause for wrong keys, and is
+// never served the dashboard without a key. (A proxy or port forward that adds
+// none of them cannot be told apart from a local client; see the README.)
+const PROXY_HEADERS = [
+  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-forwarded-server',
+  'x-real-ip', 'forwarded', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-client-ip', 'x-original-url',
+];
+const hasProxyHeader = req => PROXY_HEADERS.some(name => req.headers[name] !== undefined);
 
 // The dashboard's own pages, forms and data routes: the only paths that may be
 // served without a key when `api.dashboardAuth` is false. A list of what is
@@ -167,6 +175,7 @@ function parseSettings(config, previous = null) {
       return { problem: 'server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com' };
     }
   }
+  // (dashboardAuthConflicts relies on configHandler defaulting server.host to loopback.)
   // Keyless dashboard pages are only honoured while nothing contradicts them
   // (start-up refuses such a config; a file edited while running just goes back
   // to asking for the key).
@@ -335,7 +344,7 @@ function createSecurity({
   const throttle = createThrottle(now, freeFailures);
   const clientOf = req => req.socket?.remoteAddress || 'unknown';
   const pauseCapFor = (req, auth) => (isLoopbackAddress(clientOf(req)) && auth.publicOrigins.length === 0
-    && !PROXY_HEADERS.some(name => req.headers[name] !== undefined) ? LOOPBACK_PAUSE_MS : MAX_PAUSE_MS);
+    && !hasProxyHeader(req) ? LOOPBACK_PAUSE_MS : MAX_PAUSE_MS);
 
   // One read of config.yaml per request, shared by every check.
   const settingsFor = req => {
@@ -413,7 +422,13 @@ function createSecurity({
     && auth.publicOrigins.length === 0
     && isLoopbackAddress(clientOf(req))
     && isLoopbackHost(hostNameOf(req.headers.host))
-    && !PROXY_HEADERS.some(name => req.headers[name] !== undefined);
+    && !hasProxyHeader(req);
+
+  // Where /login sends a keyless visitor: the page asked for, if it is one the
+  // keyless dashboard serves. Otherwise (a spelling such as /Scripts or /scripts/
+  // that asked for the key) /scripts, so /login and the page cannot send each
+  // other round in a loop.
+  const keylessTarget = next => (isDashboardPath(next.split(/[?#]/)[0]) ? next : '/scripts');
 
   const wantsPage = req => req.method === 'GET' && !req.path.startsWith('/api/')
     && String(req.headers.accept || '').includes('text/html');
@@ -498,14 +513,15 @@ function createSecurity({
   loginRouter.get('/login', (req, res) => {
     const auth = settingsFor(req);
     const next = localPath(req.query.next);
-    if (!auth.enabled || isLocalDashboard(req, auth)
-      || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
+    if (!auth.enabled || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
+    if (isLocalDashboard(req, auth)) return res.redirect(keylessTarget(next));
     res.render('login', { next, error: null });
   });
   loginRouter.post('/login', (req, res) => {
     const auth = settingsFor(req);
     const next = localPath(req.body?.next);
-    if (!auth.enabled || isLocalDashboard(req, auth)) return res.redirect(next);
+    if (!auth.enabled) return res.redirect(next);
+    if (isLocalDashboard(req, auth)) return res.redirect(keylessTarget(next));
     if (req.headers.origin !== undefined && !fromThisSite(req, auth)) {
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }

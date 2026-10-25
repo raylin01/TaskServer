@@ -319,8 +319,9 @@ With `api.authEnabled: true` and `api.dashboardAuth: false`:
 - A request only gets this when it looks unmistakably local: the connection comes
   from a loopback address, the `Host` header is `localhost`, `127.0.0.1` or `[::1]`
   (so a page cannot reach it through DNS rebinding), and it carries none of the
-  proxy headers `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`, `Forwarded` or
-  `CF-Connecting-IP`. Any other request is asked for the key as usual.
+  proxy headers (`X-Forwarded-For`, `-Host`, `-Proto`, `-Port` and `-Server`,
+  `X-Real-IP`, `Forwarded`, `Via`, `CF-Connecting-IP`, `True-Client-IP`,
+  `X-Client-IP`, `X-Original-URL`). Any other request is asked for the key as usual.
 - A state-changing request still needs this site's `Origin` (or `Sec-Fetch-Site:
   same-origin`) and the CSRF token embedded in the page, even when it sends no
   `Origin` at all. With no session to bind the token to, it is bound to the running
@@ -331,6 +332,13 @@ With `api.authEnabled: true` and `api.dashboardAuth: false`:
   `cloudflare.enabled` is true, or `server.publicOrigins` is not empty. Each
   message names the key and the reason. If such a setting is added to a running
   server's `config.yaml`, the dashboard goes back to asking for the key.
+
+**Only use this when nothing forwards to TaskServer's port.** TaskServer cannot tell
+a forwarded connection from a local one unless it carries one of the headers above.
+Any reverse proxy or port forward that reaches the port over loopback without such
+headers (nginx with default settings, `ssh -L`, `socat` and the like) bypasses the
+key in this mode and exposes the dashboard, including adding, editing and running
+jobs, to whoever can reach that proxy or forward.
 
 **The trade-off.** The key no longer protects the dashboard from other programs on
 the same machine. Any local program can fetch a page to get the CSRF token and then

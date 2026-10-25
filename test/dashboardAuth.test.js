@@ -17,7 +17,11 @@ const EVIL = 'http://evil.example';
 const DASH = { api: { authEnabled: true, apiKey: KEY, dashboardAuth: false } };
 const withKey = (extra = {}) => ({ 'x-api-key': KEY, ...extra });
 const HTML = { accept: 'text/html' };
-const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip'];
+// Every header a proxy or tunnel may add, one test run each.
+const PROXY_HEADERS = [
+  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-forwarded-server',
+  'x-real-ip', 'forwarded', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-client-ip', 'x-original-url',
+];
 const forever = () => [job('Example Worker')];
 
 async function pageToken(base, headers = {}) {
@@ -212,7 +216,7 @@ test('a proxy header on the request falls back to the key (pages redirect to sig
   const { base, saved } = await boot(t, { scripts: forever(), extra: DASH });
   const token = await pageToken(base);
   for (const name of PROXY_HEADERS) {
-    const headers = { [name]: name === 'forwarded' ? 'for=203.0.113.9' : '203.0.113.9' };
+    const headers = { [name]: name === 'forwarded' ? 'for=203.0.113.9' : '1.1 proxy' };
     const page = await request(base, 'GET', '/scripts', { headers: { ...headers, ...HTML } });
     assert.equal(page.status, 302, name);
     assert.match(page.headers.location, /^\/login\?next=/, name);
@@ -225,6 +229,41 @@ test('a proxy header on the request falls back to the key (pages redirect to sig
   assert.equal(saved().scripts.length, 1);
   // With the key the same request works, as it always did.
   assert.equal((await request(base, 'GET', '/scripts', { headers: withKey({ 'x-forwarded-for': '203.0.113.9' }) })).status, 200);
+});
+
+test('a bare reverse proxy that adds only one of the usual headers is not mistaken for a local client', async t => {
+  const { base } = await boot(t, { scripts: forever(), extra: DASH });
+  assert.equal(PROXY_HEADERS.length, 12);
+  for (const name of PROXY_HEADERS) {
+    const res = await request(base, 'GET', '/scripts', { headers: { [name]: 'x', ...HTML } });
+    assert.equal(res.status, 302, name);
+    assert.match(res.headers.location, /^\/login\?next=/, name);
+  }
+});
+
+test('HEAD works on a dashboard page without a key, and not on /api', async t => {
+  const { base } = await boot(t, { scripts: forever(), extra: DASH });
+  assert.equal((await request(base, 'HEAD', '/scripts', { headers: HTML })).status, 200);
+  assert.equal((await request(base, 'HEAD', '/api/scripts')).status, 401);
+});
+
+test('spellings the keyless dashboard does not serve ask for the key, and /login does not loop back to them', async t => {
+  const { base } = await boot(t, { scripts: forever(), extra: DASH });
+  for (const url of ['/scripts/', '/Scripts', '/SCRIPTS', '/add-script/', '/settings/', '/logs/Example%20Worker/']) {
+    const page = await request(base, 'GET', url, { headers: HTML });
+    assert.equal(page.status, 302, url);
+    const login = new URL(page.headers.location, base);
+    assert.equal(login.pathname, '/login', url);
+    // /login must end on a page that answers, not on the same redirect again.
+    const back = await request(base, 'GET', login.pathname + login.search);
+    assert.equal(back.status, 302, url);
+    assert.equal(back.headers.location, '/scripts', url);
+    assert.equal((await request(base, 'GET', back.headers.location, { headers: HTML })).status, 200, url);
+    const post = await request(base, 'POST', '/login', { form: { apiKey: 'x', next: url } });
+    assert.equal(post.headers.location, '/scripts', url);
+  }
+  // A page it does serve keeps its query.
+  assert.equal((await request(base, 'GET', '/login?next=%2Flogs%2FExample%2520Worker%3Ffile%3Dx')).headers.location, '/logs/Example%20Worker?file=x');
 });
 
 test('a Host header that is not loopback (DNS rebinding) falls back to the key', async t => {
