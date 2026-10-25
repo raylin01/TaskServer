@@ -6,18 +6,35 @@ let tunnelProcess = null;
 let tunnelUrl = null;
 
 /**
+ * Local origin the tunnel should forward to, from `server.address()`.
+ * Wildcard binds (0.0.0.0, ::) are reached through loopback, and IPv6 hosts
+ * are bracketed.
+ * @param {{address: string, port: number}} address - Result of server.address()
+ * @returns {string} - e.g. http://127.0.0.1:3000 or http://[::1]:3000
+ */
+function localOrigin({ address, port }) {
+  let host = address;
+  if (host === '0.0.0.0') host = '127.0.0.1';
+  else if (host === '::') host = '::1';
+  if (host.includes(':')) host = `[${host.replace('%', '%25')}]`;
+  return `http://${host}:${port}`;
+}
+
+/**
  * Start a Cloudflare Tunnel with the provided token
  * @param {string} tunnelToken - The Cloudflare Tunnel token
- * @param {number} port - The local port to expose (default: 3000)
+ * @param {string|number} origin - Local origin URL to expose, e.g. from
+ *   localOrigin(server.address()); a bare port means 127.0.0.1 (default: 3000)
  * @returns {Promise<string>} - Resolves with the tunnel URL
  */
-function startTunnel(tunnelToken, port = 3000) {
+function startTunnel(tunnelToken, origin = 3000) {
   return new Promise((resolve, reject) => {
     if (!tunnelToken || tunnelToken.trim() === '') {
       return reject(new Error('Cloudflare tunnel token is required'));
     }
 
     console.log('Starting Cloudflare Tunnel...');
+    const originUrl = typeof origin === 'number' ? `http://127.0.0.1:${origin}` : origin;
     
     // Use cloudflared from node_modules
     const binaryName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
@@ -31,7 +48,7 @@ function startTunnel(tunnelToken, port = 3000) {
       '--token',
       tunnelToken,
       '--url',
-      `http://127.0.0.1:${port}`
+      originUrl
     ], {
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -119,6 +136,7 @@ function isTunnelRunning() {
 }
 
 module.exports = {
+  localOrigin,
   startTunnel,
   stopTunnel,
   getTunnelUrl,
