@@ -176,10 +176,10 @@ function parseSettings(config, previous = null) {
       return { problem: 'server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com' };
     }
   }
-  // (dashboardAuthConflicts relies on configHandler defaulting server.host to loopback.)
   // Keyless dashboard pages are only honoured while nothing contradicts them
   // (start-up refuses such a config; a file edited while running just goes back
-  // to asking for the key).
+  // to asking for the key). dashboardAuthConflicts relies on configHandler
+  // defaulting server.host to loopback when it is left out.
   const dashboardAuth = api.dashboardAuth !== false || dashboardAuthConflicts(config).length > 0;
   return { settings: { ...settingsOf(api, server, hasApi), enabled, apiKey, publicOrigins, dashboardAuth } };
 }
@@ -566,6 +566,7 @@ module.exports = {
   listenProblems,
   isLoopbackHost,
   localPath,
+  PROXY_HEADERS,
   CONTENT_SECURITY_POLICY,
   SESSION_COOKIE,
   MIN_KEY_LENGTH,

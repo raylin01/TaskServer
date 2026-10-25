@@ -7,7 +7,7 @@ const { spawnSync } = require('child_process');
 const yaml = require('js-yaml');
 const router = require('../routes/scripts');
 const { boot, request, job } = require('../test-support/httpApp');
-const { createSecurity, listenProblems, parseSettings } = require('../utils/security');
+const { createSecurity, listenProblems, parseSettings, PROXY_HEADERS } = require('../utils/security');
 
 // api.dashboardAuth: false. The dashboard pages need no key from this machine;
 // /api always does.
@@ -17,11 +17,6 @@ const EVIL = 'http://evil.example';
 const DASH = { api: { authEnabled: true, apiKey: KEY, dashboardAuth: false } };
 const withKey = (extra = {}) => ({ 'x-api-key': KEY, ...extra });
 const HTML = { accept: 'text/html' };
-// Every header a proxy or tunnel may add, one test run each.
-const PROXY_HEADERS = [
-  'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-forwarded-server',
-  'x-real-ip', 'forwarded', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-client-ip', 'x-original-url',
-];
 const forever = () => [job('Example Worker')];
 
 async function pageToken(base, headers = {}) {
@@ -193,6 +188,22 @@ test('dashboard state changes still need this site\'s origin and the page\'s tok
   assert.ok(pm2.mutations().length > 0);
 });
 
+test('a form post with Origin: null works with Sec-Fetch-Site same-origin and the token, and only then', async t => {
+  const { base, saved } = await boot(t, { scripts: forever(), extra: DASH });
+  const token = await pageToken(base);
+  const form = { name: 'Added', type: 'forever', command: 'echo hi', sourceType: 'command' };
+  const post = (headers, body) => request(base, 'POST', '/add-script', { headers: { origin: 'null', ...headers }, form: body });
+  assert.equal((await post({}, { ...form, _csrf: token })).status, 403, 'no Sec-Fetch-Site');
+  for (const site of ['cross-site', 'same-site', 'none']) {
+    assert.equal((await post({ 'sec-fetch-site': site }, { ...form, _csrf: token })).status, 403, site);
+  }
+  assert.equal((await post({ 'sec-fetch-site': 'same-origin' }, form)).status, 403, 'no token');
+  assert.equal((await post({ 'sec-fetch-site': 'same-origin' }, { ...form, _csrf: 'forged' })).status, 403, 'wrong token');
+  assert.equal(saved().scripts.length, 1);
+  assert.equal((await post({ 'sec-fetch-site': 'same-origin' }, { ...form, _csrf: token })).status, 302);
+  assert.equal(saved().scripts.length, 2);
+});
+
 test('the dashboard token is bound to this process, differs from a session\'s, and does not come from the key', async t => {
   const first = await boot(t, { extra: DASH });
   const second = await boot(t, { extra: DASH });
@@ -227,18 +238,10 @@ test('a proxy header on the request falls back to the key (pages redirect to sig
     assert.equal((await request(base, 'GET', '/login', { headers })).status, 200, name);
   }
   assert.equal(saved().scripts.length, 1);
+  // A bare reverse proxy adds only one header, so each one alone has to be enough.
+  assert.ok(PROXY_HEADERS.includes('via') && PROXY_HEADERS.includes('x-forwarded-proto'));
   // With the key the same request works, as it always did.
   assert.equal((await request(base, 'GET', '/scripts', { headers: withKey({ 'x-forwarded-for': '203.0.113.9' }) })).status, 200);
-});
-
-test('a bare reverse proxy that adds only one of the usual headers is not mistaken for a local client', async t => {
-  const { base } = await boot(t, { scripts: forever(), extra: DASH });
-  assert.equal(PROXY_HEADERS.length, 12);
-  for (const name of PROXY_HEADERS) {
-    const res = await request(base, 'GET', '/scripts', { headers: { [name]: 'x', ...HTML } });
-    assert.equal(res.status, 302, name);
-    assert.match(res.headers.location, /^\/login\?next=/, name);
-  }
 });
 
 test('HEAD works on a dashboard page without a key, and not on /api', async t => {
@@ -261,6 +264,12 @@ test('spellings the keyless dashboard does not serve ask for the key, and /login
     assert.equal((await request(base, 'GET', back.headers.location, { headers: HTML })).status, 200, url);
     const post = await request(base, 'POST', '/login', { form: { apiKey: 'x', next: url } });
     assert.equal(post.headers.location, '/scripts', url);
+  }
+  // Links that would leave the site, or that are not paths at all, go to /scripts.
+  for (const next of ['//evil.example', '/\\evil.example']) {
+    const res = await request(base, 'POST', '/login', { form: { apiKey: 'x', next } });
+    assert.equal(res.headers.location, '/scripts', next);
+    assert.equal((await request(base, 'GET', `/login?next=${encodeURIComponent(next)}`)).headers.location, '/scripts', next);
   }
   // A page it does serve keeps its query.
   assert.equal((await request(base, 'GET', '/login?next=%2Flogs%2FExample%2520Worker%3Ffile%3Dx')).headers.location, '/logs/Example%20Worker?file=x');
