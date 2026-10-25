@@ -3,6 +3,7 @@ const path = require('path');
 const configHandler = require('./configHandler');
 const { createRunCleanup } = require('./runCleanup');
 const { applyScriptExecution } = require('./scriptRunner');
+const { killTimeoutFor } = require('./jobSpec');
 
 let lastRunId = 0;
 
@@ -15,6 +16,7 @@ function buildRunConfig(script, trigger) {
     args: script.args || [],
     env: script.env || {},
     autorestart: false,
+    kill_timeout: killTimeoutFor(script, configHandler.loadConfig().pm2),
     out_file: path.join(logsDir, `${script.name}-out-${runId}.log`),
     error_file: path.join(logsDir, `${script.name}-error-${runId}.log`),
   };
@@ -22,6 +24,7 @@ function buildRunConfig(script, trigger) {
   return applyScriptExecution(pm2Config, script);
 }
 
+// `options.service` is the shared PM2 client (utils/processService.js).
 function createCronManager(options = {}) {
   const jobs = new Map();
   const runCleanup = createRunCleanup({ getScripts: () => configHandler.loadConfig().scripts, ...options });

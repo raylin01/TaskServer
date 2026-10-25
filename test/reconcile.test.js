@@ -1,0 +1,208 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { createFakePm2, legacyPm2Config } = require('../test-support/fakePm2');
+const { createJobControl } = require('../utils/jobControl');
+const { planJob, reconcileJobs, reconcileWithRetry, checkPm2Versions } = require('../utils/reconcile');
+const { buildPm2Config, diffJob } = require('../utils/jobSpec');
+
+const LOGS = '/logs';
+const PM2 = { maxRestarts: 10000, autoRestart: true, restartDelay: 1000, killTimeoutMs: 5000 };
+
+// A set of jobs shaped like a real config: commands (some with env), a script
+// path, and a sudo-wrapped runner.
+function scripts() {
+  return [
+    { name: 'DNS', type: 'forever', command: 'python3 dns.py --serve', cwd: '/srv/dns', env: { DNS_PORT: 53, SECRET_TOKEN: 'hunter2' } },
+    { name: 'DDNS', type: 'forever', command: 'node ddns.js', cwd: '/srv/ddns' },
+    { name: 'WireGuard Helper', type: 'forever', command: 'sudo -n python3 helper.py', cwd: '/srv/wg', killTimeoutMs: 30000 },
+    { name: 'Worker', type: 'forever', path: './worker.js', args: ['--fast', 7], cwd: '/srv/worker', env: { DEBUG: true, EMPTY: '', NOTHING: null, NESTED: { a: [1, 2] } } },
+    { name: 'Nightly', type: 'cron', command: 'node nightly.js', schedule: '0 3 * * *' },
+  ];
+}
+
+function setup(t, { legacy = true, extra = {} } = {}) {
+  const pm2 = createFakePm2();
+  const logger = { logs: [], warns: [], errors: [], log(m) { this.logs.push(m); }, warn(m) { this.warns.push(m); }, error(m) { this.errors.push(m); } };
+  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false });
+  const config = { pm2: PM2, scripts: scripts(), ...extra };
+  if (legacy) {
+    // Processes exactly as the previous TaskServer started them: no kill_timeout.
+    for (const script of config.scripts.filter(s => s.type === 'forever')) pm2.add(legacyPm2Config(script, PM2, LOGS));
+  }
+  const run = () => reconcileJobs({ service: pm2, jobControl, config, logsDir: LOGS, logger });
+  return { pm2, logger, jobControl, config, run };
+}
+
+test('deploy: jobs started by the previous TaskServer are all adopted and nothing is restarted', async t => {
+  const { pm2, logger, run } = setup(t);
+  const summary = await run();
+  assert.deepEqual(pm2.mutations(), [], 'no start, stop, delete or restart call at all');
+  assert.deepEqual(summary.adopted.sort(), ['DDNS', 'DNS', 'WireGuard Helper', 'Worker']);
+  assert.equal(summary.restarted.length + summary.started.length, 0);
+  assert.match(logger.logs.at(-1), /4 adopted, 0 started, 0 restarted/);
+});
+
+test('adoption also holds when the log timestamps and the kill timeout differ', async t => {
+  const { pm2, run } = setup(t, { legacy: false });
+  const config = scripts().filter(s => s.type === 'forever');
+  config.forEach((script, i) => {
+    // Started by this version: has kill_timeout, and its own log paths.
+    pm2.add(buildPm2Config(script, PM2, '/old/logs', `stamp-${i}`));
+  });
+  await run();
+  assert.deepEqual(pm2.mutations(), []);
+});
+
+test('a changed command restarts only that job, and the log names the field but no values', async t => {
+  const { pm2, logger, config, run } = setup(t);
+  config.scripts[1].command = 'node ddns.js --verbose';
+  const before = pm2.procs.map(p => `${p.name}:${p.pid}`);
+  const summary = await run();
+  assert.deepEqual(summary.restarted, ['DDNS']);
+  assert.deepEqual(pm2.mutations().map(([m, name]) => `${m}:${name}`), ['delete:DDNS', 'start:DDNS']);
+  const after = pm2.procs.map(p => `${p.name}:${p.pid}`);
+  assert.deepEqual(after.filter(x => !x.startsWith('DDNS:')).sort(), before.filter(x => !x.startsWith('DDNS:')).sort());
+  const line = logger.logs.find(l => l.includes('Restarted DDNS'));
+  assert.match(line, /changed args/);
+  assert.doesNotMatch(logger.logs.join('\n'), /--verbose/);
+});
+
+test('env changes are detected by key and never logged by value', async t => {
+  const { logger, config, run } = setup(t);
+  config.scripts[0].env = { DNS_PORT: 53, SECRET_TOKEN: 'rotated-secret-value' };
+  const summary = await run();
+  assert.deepEqual(summary.restarted, ['DNS']);
+  const text = [...logger.logs, ...logger.warns, ...logger.errors].join('\n');
+  assert.match(text, /env\.SECRET_TOKEN/);
+  assert.doesNotMatch(text, /rotated-secret-value|hunter2/);
+});
+
+test('an added env key, a new cwd and a new exec path each count as a change', async t => {
+  const { pm2, config } = setup(t);
+  const [dns, , , worker] = config.scripts;
+  const spec = script => buildPm2Config(script, PM2, LOGS);
+  const running = name => pm2.procs.find(p => p.name === name);
+  assert.deepEqual(diffJob(spec({ ...dns, env: { ...dns.env, NEW_KEY: '1' } }), running('DNS')), ['env.NEW_KEY']);
+  assert.deepEqual(diffJob(spec({ ...dns, cwd: '/srv/elsewhere' }), running('DNS')), ['cwd']);
+  assert.deepEqual(diffJob(spec({ ...worker, path: './other.js' }), running('Worker')), ['exec path']);
+});
+
+test('settings that change how PM2 supervises count; log paths and kill timeout do not', async t => {
+  const { pm2, config } = setup(t);
+  const dns = config.scripts[0];
+  const proc = pm2.procs.find(p => p.name === 'DNS');
+  const withSettings = settings => buildPm2Config(dns, { ...PM2, ...settings }, LOGS);
+  assert.deepEqual(diffJob(withSettings({ restartDelay: 2000 }), proc), ['exp_backoff_restart_delay']);
+  assert.deepEqual(diffJob(withSettings({ maxRestarts: 5 }), proc), ['max_restarts']);
+  assert.deepEqual(diffJob(withSettings({ autoRestart: false }), proc), ['autorestart']);
+  assert.deepEqual(diffJob(withSettings({ killTimeoutMs: 99999 }), proc), []);
+  assert.deepEqual(diffJob(buildPm2Config({ ...dns, killTimeoutMs: 1 }, PM2, '/elsewhere', 'other-stamp'), proc), []);
+});
+
+test('env values compare the way PM2 stores them (numbers, booleans, null, objects)', async t => {
+  const { pm2, config } = setup(t);
+  const worker = config.scripts[3];
+  assert.deepEqual(diffJob(buildPm2Config(worker, PM2, LOGS), pm2.procs.find(p => p.name === 'Worker')), []);
+});
+
+test('missing, stopped and errored jobs are started; a job marked stopped is not', async t => {
+  const { pm2, config, run } = setup(t);
+  pm2.procs.splice(pm2.procs.findIndex(p => p.name === 'DNS'), 1);
+  pm2.procs.find(p => p.name === 'DDNS').pm2_env.status = 'stopped';
+  pm2.procs.find(p => p.name === 'WireGuard Helper').pm2_env.status = 'errored';
+  config.scripts[3].stopped = true;
+  pm2.procs.find(p => p.name === 'Worker').pm2_env.status = 'stopped';
+  const summary = await run();
+  assert.deepEqual(summary.started.sort(), ['DDNS', 'DNS', 'WireGuard Helper']);
+  assert.deepEqual(summary.skipped, ['Worker']);
+  assert.equal(pm2.procs.find(p => p.name === 'Worker').pm2_env.status, 'stopped');
+});
+
+test('jobs PM2 is already restarting are left alone', async t => {
+  const { pm2, run } = setup(t);
+  for (const [name, status] of [['DNS', 'waiting restart'], ['DDNS', 'launching'], ['Worker', 'stopping']]) {
+    pm2.procs.find(p => p.name === name).pm2_env.status = status;
+  }
+  const summary = await run();
+  assert.deepEqual(summary.left.sort(), ['DDNS', 'DNS', 'Worker']);
+  assert.deepEqual(pm2.mutations(), []);
+});
+
+test('a job that is online although the config says stopped keeps running, with a warning', async t => {
+  const { pm2, logger, config, run } = setup(t);
+  config.scripts[1].stopped = true;
+  await run();
+  assert.deepEqual(pm2.mutations(), []);
+  assert.equal(pm2.procs.find(p => p.name === 'DDNS').pm2_env.status, 'online');
+  assert.ok(logger.warns.some(w => w.includes('DDNS') && w.includes('marked stopped')));
+});
+
+test('processes that are not in the config, and cron runs, are never touched', async t => {
+  const { pm2, run } = setup(t);
+  pm2.add({ name: 'taskserver', script: 'server.js', cwd: '/srv/ts' });
+  pm2.add({ name: 'Nightly-cron-1792800000000', script: '/bin/sh', cwd: '/srv' });
+  await run();
+  assert.deepEqual(pm2.mutations(), []);
+});
+
+test('one job failing does not stop the others; PM2 going away aborts the pass', async t => {
+  const { pm2, logger, config, run } = setup(t);
+  config.scripts[0].command = 'changed';
+  config.scripts[1].command = 'changed too';
+  pm2.state.startError = new Error('spawn failed');
+  const summary = await run();
+  assert.deepEqual(summary.failed.sort(), ['DDNS', 'DNS']);
+  assert.ok(logger.errors.some(e => e.includes('spawn failed')));
+  pm2.state.startError = Object.assign(new Error('PM2 is not reachable: x'), { code: 'PM2_UNAVAILABLE' });
+  await assert.rejects(run(), /not reachable/);
+});
+
+test('boot retries until PM2 answers, then reconciles once', async t => {
+  const { pm2, logger, jobControl, config } = setup(t);
+  let attempts = 0;
+  const list = pm2.list.bind(pm2);
+  pm2.list = async () => {
+    attempts += 1;
+    if (attempts < 3) throw Object.assign(new Error('PM2 is not reachable: connect'), { code: 'PM2_UNAVAILABLE' });
+    return list();
+  };
+  const waits = [];
+  const summary = await reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger,
+    sleep: async ms => { waits.push(ms); }, initialDelayMs: 10, maxDelayMs: 25 });
+  assert.equal(summary.adopted.length, 4);
+  assert.deepEqual(waits, [10, 20]);
+  assert.deepEqual(pm2.mutations(), []);
+});
+
+test('retry stops when TaskServer is shutting down', async t => {
+  const { pm2, logger, jobControl, config } = setup(t);
+  pm2.state.listError = new Error('down');
+  let closed = false;
+  const result = await reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger,
+    isClosed: () => closed, sleep: async () => { closed = true; } });
+  assert.equal(result, null);
+});
+
+test('planJob table', () => {
+  const spec = buildPm2Config({ name: 'X', type: 'forever', command: 'x', cwd: '/srv' }, PM2, LOGS);
+  const proc = status => ({ name: 'X', pm2_env: { status } });
+  assert.equal(planJob({ name: 'X' }, spec, null).action, 'start');
+  assert.equal(planJob({ name: 'X', stopped: true }, spec, null).action, 'skip');
+  assert.equal(planJob({ name: 'X' }, spec, proc('errored')).action, 'start');
+  assert.equal(planJob({ name: 'X' }, spec, proc('waiting restart')).action, 'leave');
+  assert.equal(planJob({ name: 'X', stopped: true }, spec, proc('online')).action, 'adopt');
+});
+
+test('version check warns on a mismatch and stays quiet on a match', async () => {
+  const warns = [];
+  const logger = { warn: m => warns.push(m) };
+  const service = version => ({ daemonVersion: async () => version });
+  assert.deepEqual(await checkPm2Versions({ service: service('6.0.14'), libraryVersion: '6.0.14', logger }),
+    { library: '6.0.14', daemon: '6.0.14', match: true });
+  assert.equal(warns.length, 0);
+  const result = await checkPm2Versions({ service: service('6.0.14'), libraryVersion: '5.4.3', logger });
+  assert.equal(result.match, false);
+  assert.match(warns[0], /5\.4\.3.*6\.0\.14/);
+  const failing = await checkPm2Versions({ service: { daemonVersion: async () => { throw new Error('nope'); } }, libraryVersion: '6.0.14', logger });
+  assert.equal(failing.match, null);
+});

@@ -3,7 +3,11 @@ const fs = require('fs');
 const yaml = require('js-yaml');
 const path = require('path');
 
-const configPath = path.join(__dirname, '../config.yaml');
+// TASKSERVER_CONFIG points at another file (tests, trial runs). Read on every
+// call so it can be set after this module is loaded.
+function getConfigPath() {
+  return process.env.TASKSERVER_CONFIG || path.join(__dirname, '../config.yaml');
+}
 
 const DEFAULT_CONFIG = {
   logManagement: {
@@ -14,19 +18,24 @@ const DEFAULT_CONFIG = {
   server: {
     port: 3000,
     host: '127.0.0.1',
-    logsDir: './logs'
+    logsDir: './logs',
+    // The PM2 name TaskServer runs under, for restarting itself.
+    selfName: 'taskserver'
   },
   pm2: {
     maxRestarts: 10000,
     autoRestart: true,
-    restartDelay: 1000
+    restartDelay: 1000,
+    // How long a job may take to exit after being asked to, before PM2
+    // force-kills it. A job can set its own `killTimeoutMs`.
+    killTimeoutMs: 5000
   },
   scripts: []
 };
 
 function loadConfig() {
   try {
-    const file = fs.readFileSync(configPath, 'utf8');
+    const file = fs.readFileSync(getConfigPath(), 'utf8');
     const userConfig = yaml.load(file) || {};
     
     // Deep merge with defaults (simple version for this depth)
@@ -60,7 +69,7 @@ function getLogsDir() {
 
 function writeConfig(config) {
   try {
-    fs.writeFileSync(configPath, yaml.dump(config));
+    fs.writeFileSync(getConfigPath(), yaml.dump(config));
   } catch (e) {
     console.error('Failed to write config.yaml:', e);
   }

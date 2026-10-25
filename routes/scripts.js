@@ -1,38 +1,38 @@
 // Express router for script management
 const express = require('express');
 const router = express.Router();
-const pm2 = require('pm2');
 const cron = require('node-cron');
 const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
 const path = require('path');
-const { applyScriptExecution } = require('../utils/scriptRunner');
+const { asyncHandler: wrap } = require('../utils/httpErrors');
+const { describeJob, findProcess, LIVE } = require('../utils/jobControl');
+const { errorText } = require('../utils/processService');
 
-/**
- * Build PM2 config for a script (reduces code duplication)
- * @param {Object} script - Script config object
- * @param {Object} pm2Settings - PM2 settings from config
- * @returns {Object} PM2 config object
- */
-function buildPm2Config(script, pm2Settings) {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const logsDir = configHandler.getLogsDir();
-  const pm2Config = {
-    name: script.name,
-    args: script.args || [],
-    env: script.env || {},
-    autorestart: pm2Settings.autoRestart !== undefined ? pm2Settings.autoRestart : true,
-    max_restarts: pm2Settings.maxRestarts || 10000,
-    exp_backoff_restart_delay: pm2Settings.restartDelay !== undefined ? pm2Settings.restartDelay : 1000,
-    out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
-    error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
-  };
-
-  return applyScriptExecution(pm2Config, script);
-}
+// The PM2 client, job control and cron manager are created once, by
+// createApp() in server.js, and shared through app.locals.
+const processService = req => req.app.locals.processService;
+const jobControl = req => req.app.locals.jobControl;
 
 function validateCronSchedule(schedule) {
   return typeof schedule === 'string' && cron.validate(schedule.trim());
+}
+
+// Record that a forever job is, or is no longer, marked as stopped. The config
+// is loaded right before the write with nothing awaited in between, so a slow
+// PM2 call earlier in the request cannot overwrite another change with a
+// stale copy.
+function setStopped(name, stopped) {
+  const config = configHandler.loadConfig();
+  const script = config.scripts.find(s => s.name === name && s.type === 'forever');
+  if (script) {
+    script.stopped = stopped;
+    configHandler.writeConfig(config);
+  }
+}
+
+function selfName(config) {
+  return config.server?.selfName || 'taskserver';
 }
 
 function buildScriptFromRequest(body) {
@@ -84,20 +84,32 @@ router.get('/', (req, res) => {
 });
 
 // List all scripts and status
-router.get('/scripts', (req, res) => {
-  pm2.connect(() => {
-    pm2.list((err, list) => {
-      const config = configHandler.loadConfig();
-      res.render('scripts', {
-        scripts: config.scripts,
-        pm2list: list || [],
-        cronRunHistory: req.app.locals.cronRunHistory || {},
-        cronSuspended: req.app.locals.cronSuspended || {},
-      });
-      pm2.disconnect();
-    });
+router.get('/scripts', wrap(async (req, res) => {
+  let pm2list = [];
+  let pm2Available = true;
+  try {
+    pm2list = await processService(req).list();
+  } catch (error) {
+    // Still show the scripts, but say the state is unknown instead of "Stopped".
+    pm2Available = false;
+    console.error(`[HTTP] Could not read PM2 state for the dashboard: ${errorText(error)}`);
+  }
+  const config = configHandler.loadConfig();
+  const jobStates = {};
+  for (const script of config.scripts) {
+    if (script.type === 'forever') {
+      jobStates[script.name] = describeJob(script, findProcess(pm2list, script.name), { pm2Available });
+    }
+  }
+  res.render('scripts', {
+    scripts: config.scripts,
+    pm2list,
+    pm2Available,
+    jobStates,
+    cronRunHistory: req.app.locals.cronRunHistory || {},
+    cronSuspended: req.app.locals.cronSuspended || {},
   });
-});
+}));
 
 // View logs for a script
 router.get('/logs/:scriptName', (req, res) => {
@@ -242,7 +254,7 @@ router.get('/edit-script/:scriptName', (req, res) => {
 });
 
 // Edit a script (POST)
-router.post('/edit-script/:scriptName', (req, res) => {
+router.post('/edit-script/:scriptName', wrap(async (req, res) => {
   const config = configHandler.loadConfig();
   const scriptIndex = config.scripts.findIndex(s => s.name === req.params.scriptName);
   if (scriptIndex === -1) {
@@ -271,131 +283,82 @@ router.post('/edit-script/:scriptName', (req, res) => {
   }
 
   if (previousScript.type === 'forever' && (updatedScript.type !== 'forever' || previousScript.name !== updatedScript.name)) {
-    pm2.connect(() => {
-      pm2.delete(previousScript.name, () => {
-        pm2.disconnect();
-      });
-    });
+    try {
+      await jobControl(req).removeJob(previousScript.name, previousScript);
+    } catch (error) {
+      console.error(`Failed to remove ${previousScript.name} from PM2: ${errorText(error)}`);
+    }
   }
 
   res.redirect('/scripts');
-});
+}));
 
 // Delete a script
-router.post('/delete-script/:scriptName', (req, res) => {
-  const config = configHandler.loadConfig();
-  const scriptIndex = config.scripts.findIndex(s => s.name === req.params.scriptName);
-  
-  if (scriptIndex === -1) {
+router.post('/delete-script/:scriptName', wrap(async (req, res) => {
+  const name = req.params.scriptName;
+  const found = configHandler.loadConfig().scripts.find(s => s.name === name);
+  if (!found) {
     return res.status(404).send('Script not found');
   }
-  
-  const script = config.scripts[scriptIndex];
-  
-  // If it's a forever script, stop it from PM2 first
-  if (script.type === 'forever') {
-    pm2.connect(() => {
-      pm2.delete(req.params.scriptName, (err) => {
-        if (err) console.error(`Failed to delete ${req.params.scriptName} from PM2:`, err);
-        pm2.disconnect();
-      });
-    });
+
+  // A forever job is stopped and removed from PM2 first. If that fails the
+  // script stays in the config, so it is not left running with nothing in
+  // charge of it.
+  if (found.type === 'forever') {
+    await jobControl(req).removeJob(name, found);
   }
-  
+
   // If it's a cron job, remove it from the live scheduler too
-  if (script.type === 'cron' && req.app.locals.cronManager) {
-    req.app.locals.cronManager.unregisterScript(req.params.scriptName);
+  if (found.type === 'cron' && req.app.locals.cronManager) {
+    req.app.locals.cronManager.unregisterScript(name);
   }
-  
-  // Remove from config
-  config.scripts.splice(scriptIndex, 1);
-  configHandler.writeConfig(config);
-  
+
+  // Remove from config (loaded fresh: the PM2 call above can take a while)
+  const config = configHandler.loadConfig();
+  const index = config.scripts.findIndex(s => s.name === name);
+  if (index !== -1) {
+    config.scripts.splice(index, 1);
+    configHandler.writeConfig(config);
+  }
+
   res.redirect('/scripts');
-});
+}));
+
+function findForever(name) {
+  return configHandler.loadConfig().scripts.find(s => s.name === name && s.type === 'forever');
+}
 
 // Stop a running script (forever tasks only)
-router.post('/stop-script/:scriptName', (req, res) => {
-  pm2.connect(() => {
-    pm2.stop(req.params.scriptName, () => {
-      // Save stopped status to config
-      const config = configHandler.loadConfig();
-      const script = config.scripts.find(s => s.name === req.params.scriptName);
-      if (script && script.type === 'forever') {
-        script.stopped = true;
-        configHandler.writeConfig(config);
-      }
-      pm2.disconnect();
-      res.redirect('/scripts');
-    });
-  });
-});
+router.post('/stop-script/:scriptName', wrap(async (req, res) => {
+  const script = findForever(req.params.scriptName);
+  if (!script) {
+    return res.status(404).send('Script not found or not a forever task');
+  }
+  await jobControl(req).stopJob(script.name, script);
+  setStopped(script.name, true);
+  res.redirect('/scripts');
+}));
 
 // Start a stopped script (forever tasks only)
-router.post('/start-script/:scriptName', (req, res) => {
-  const config = configHandler.loadConfig();
-  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
-  
+router.post('/start-script/:scriptName', wrap(async (req, res) => {
+  const script = findForever(req.params.scriptName);
   if (!script) {
     return res.status(404).send('Script not found or not a forever task');
   }
-  
-  pm2.connect(() => {
-    // Check if already running
-    pm2.list((err, list) => {
-      const isRunning = list.some(p => p.name === script.name);
-      
-      const startFreshProcess = () => {
-        const pm2Config = buildPm2Config(script, config.pm2);
-
-        pm2.start(pm2Config, (err) => {
-          if (err) console.error(`Failed to start ${script.name}:`, err);
-          // Clear stopped status in config
-          script.stopped = false;
-          configHandler.writeConfig(config);
-          pm2.disconnect();
-          res.redirect('/scripts');
-        });
-      };
-      
-      if (isRunning) {
-        // Delete existing process first, then start fresh with new logs
-        pm2.delete(script.name, (err) => {
-          if (err) console.error(`Failed to delete ${script.name}:`, err);
-          startFreshProcess();
-        });
-      } else {
-        // Start fresh
-        startFreshProcess();
-      }
-    });
-  });
-});
+  await jobControl(req).startFresh(script);
+  setStopped(script.name, false);
+  res.redirect('/scripts');
+}));
 
 // Restart a script (creates new log files)
-router.post('/restart-script/:scriptName', (req, res) => {
-  const config = configHandler.loadConfig();
-  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
-
+router.post('/restart-script/:scriptName', wrap(async (req, res) => {
+  const script = findForever(req.params.scriptName);
   if (!script) {
     return res.status(404).send('Script not found or not a forever task');
   }
-
-  pm2.connect(() => {
-    // Delete the existing process
-    pm2.delete(req.params.scriptName, (err) => {
-      if (err) console.error(`Failed to delete ${req.params.scriptName}:`, err);
-
-      const pm2Config = buildPm2Config(script, config.pm2);
-
-      pm2.start(pm2Config, (err) => {
-        if (err) console.error(`Failed to restart ${script.name}:`, err);
-        pm2.disconnect();
-        res.redirect('/scripts');
-      });
-    });
-  });
-});
+  await jobControl(req).startFresh(script);
+  res.redirect('/scripts');
+}));
 
 // Suspend a cron job
 router.post('/suspend-cron/:scriptName', (req, res) => {
@@ -445,7 +408,7 @@ router.post('/run-cron-now/:scriptName', async (req, res) => {
     }
     res.redirect('/scripts');
   } catch (error) {
-    console.error(`Failed to run cron ${req.params.scriptName} manually:`, error);
+    console.error(`Failed to run cron ${req.params.scriptName} manually:`, errorText(error));
     res.status(500).send(`Failed to run cron job: ${error.message}`);
   }
 });
@@ -479,213 +442,124 @@ router.post('/settings', (req, res) => {
 // =============================================================================
 
 // Restart a script (JSON API)
-router.post('/api/restart-script/:scriptName', apiAuth, (req, res) => {
+router.post('/api/restart-script/:scriptName', apiAuth, wrap(async (req, res) => {
   const config = configHandler.loadConfig();
-  // Find script (either in config or just in PM2 if we want to allow restarting unmanaged scripts, but config is safer)
-  // For self-restart (taskserver), it might not be in config.scripts if we decided not to add it there. 
-  // But standard practice: only manage what's in config.
-  // HOWEVER: User plan said "No Self-Config", so we might need to allow it if name matches.
-  
   const scriptName = req.params.scriptName;
-  const script = config.scripts.find(s => s.name === scriptName && s.type === 'forever');
-  
-  // Special handling for TaskServer self-restart
-  // Check if we are restarting OURSELVES (the current process)
-  const isSelf = (process.env.name === scriptName) || (scriptName === 'taskserver');
 
-  if (!script && !isSelf) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Script not found or not a forever task' 
+  // TaskServer restarting itself (GitSync does this on every deploy). The name
+  // it runs under in PM2 comes from `server.selfName` (default "taskserver").
+  if (scriptName === selfName(config)) {
+    const running = findProcess(await processService(req).list(), scriptName);
+    if (!running) {
+      return res.status(404).json({
+        success: false,
+        error: `TaskServer is not running under PM2 as '${scriptName}'; set server.selfName`,
+      });
+    }
+    // Answer first. The restart kills this process, so it is only asked for
+    // once the reply has been written, and the caller never sees a reset.
+    res.set('Connection', 'close');
+    res.on('finish', () => {
+      setTimeout(() => {
+        processService(req).restart(scriptName).catch(error => {
+          console.error(`Failed to restart self (${scriptName}): ${errorText(error)}`);
+        });
+      }, 100);
+    });
+    return res.json({
+      success: true,
+      message: `TaskServer (${scriptName}) restarting...`,
     });
   }
-  
-  pm2.connect((err) => {
-    if (err) {
-      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
-    }
-    
-    // IF SELF: Use pm2.restart (preserves process identity, doesn't wait for completion in same way)
-    if (isSelf) {
-        pm2.restart(scriptName, (restartErr) => {
-            pm2.disconnect();
-            if (restartErr) {
-                console.error(`Failed to restart self (${scriptName}):`, restartErr);
-                return res.status(500).json({ 
-                    success: false, 
-                    error: `Failed to restart self: ${restartErr.message}` 
-                });
-            }
-            // We might technically die before sending this, but usually restart has a small delay
-            res.json({ 
-                success: true, 
-                message: `TaskServer (${scriptName}) restarting...`,
-                logFile: 'pending...' 
-            });
-        });
-        return;
-    }
 
-    // IF OTHER: Delete and Start Fresh (for new log files)
-    pm2.delete(req.params.scriptName, (deleteErr) => {
-      if (deleteErr) console.error(`Failed to delete ${req.params.scriptName}:`, deleteErr);
-
-      const pm2Config = buildPm2Config(script, config.pm2);
-
-      pm2.start(pm2Config, (startErr) => {
-        // Clear stopped status (important: ensures UI shows correct status after restart)
-        script.stopped = false;
-        configHandler.writeConfig(config);
-        pm2.disconnect();
-
-        if (startErr) {
-          console.error(`Failed to restart ${script.name}:`, startErr);
-          return res.status(500).json({
-            success: false,
-            error: `Failed to restart: ${startErr.message}`
-          });
-        }
-        res.json({
-          success: true,
-          message: `Script '${script.name}' restarted successfully`,
-          logFile: path.basename(pm2Config.out_file)
-        });
-      });
+  const script = config.scripts.find(s => s.name === scriptName && s.type === 'forever');
+  if (!script) {
+    return res.status(404).json({
+      success: false,
+      error: 'Script not found or not a forever task'
     });
+  }
+
+  // Replace the process: new log files, current config.
+  const spec = await jobControl(req).startFresh(script);
+  setStopped(script.name, false);
+  res.json({
+    success: true,
+    message: `Script '${script.name}' restarted successfully`,
+    logFile: path.basename(spec.out_file)
   });
-});
+}));
 
 // Stop a script (JSON API)
-router.post('/api/stop-script/:scriptName', apiAuth, (req, res) => {
-  const config = configHandler.loadConfig();
-  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
-  
+router.post('/api/stop-script/:scriptName', apiAuth, wrap(async (req, res) => {
+  const script = findForever(req.params.scriptName);
   if (!script) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Script not found or not a forever task' 
+    return res.status(404).json({
+      success: false,
+      error: 'Script not found or not a forever task'
     });
   }
-  
-  pm2.connect((err) => {
-    if (err) {
-      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
-    }
-    
-    pm2.stop(req.params.scriptName, (stopErr) => {
-      // Save stopped status to config
-      script.stopped = true;
-      configHandler.writeConfig(config);
-      pm2.disconnect();
-      
-      if (stopErr) {
-        return res.status(500).json({ 
-          success: false, 
-          error: `Failed to stop: ${stopErr.message}` 
-        });
-      }
-      res.json({ 
-        success: true, 
-        message: `Script '${script.name}' stopped successfully` 
-      });
-    });
+
+  await jobControl(req).stopJob(script.name, script);
+  setStopped(script.name, true);
+  res.json({
+    success: true,
+    message: `Script '${script.name}' stopped successfully`
   });
-});
+}));
 
 // Start a script (JSON API)
-router.post('/api/start-script/:scriptName', apiAuth, (req, res) => {
-  const config = configHandler.loadConfig();
-  const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'forever');
-  
+router.post('/api/start-script/:scriptName', apiAuth, wrap(async (req, res) => {
+  const script = findForever(req.params.scriptName);
   if (!script) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Script not found or not a forever task' 
+    return res.status(404).json({
+      success: false,
+      error: 'Script not found or not a forever task'
     });
   }
-  
-  pm2.connect((err) => {
-    if (err) {
-      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
-    }
-    
-    pm2.list((listErr, list) => {
-      const existingProcess = list && list.find(p => p.name === script.name);
-      const isRunning = existingProcess && existingProcess.pm2_env.status === 'online';
-      
-      if (isRunning) {
-        pm2.disconnect();
-        return res.status(400).json({
-          success: false,
-          error: 'Script is already running'
-        });
-      }
 
-      const pm2Config = buildPm2Config(script, config.pm2);
-
-      const startFreshProcess = () => pm2.start(pm2Config, (startErr) => {
-        // Clear stopped status
-        script.stopped = false;
-        configHandler.writeConfig(config);
-        pm2.disconnect();
-
-        if (startErr) {
-          return res.status(500).json({
-            success: false,
-            error: `Failed to start: ${startErr.message}`
-          });
-        }
-        res.json({
-          success: true,
-          message: `Script '${script.name}' started successfully`,
-          logFile: path.basename(pm2Config.out_file)
-        });
-      });
-
-      if (existingProcess) {
-        pm2.delete(script.name, (deleteErr) => {
-          if (deleteErr) console.error(`Failed to delete ${script.name}:`, deleteErr);
-          startFreshProcess();
-        });
-      } else {
-        startFreshProcess();
-      }
+  const existing = findProcess(await processService(req).list(), script.name);
+  if (existing && LIVE.has(existing.pm2_env.status)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Script is already running'
     });
+  }
+
+  const spec = await jobControl(req).startFresh(script);
+  setStopped(script.name, false);
+  res.json({
+    success: true,
+    message: `Script '${script.name}' started successfully`,
+    logFile: path.basename(spec.out_file)
   });
-});
+}));
 
 // List all scripts (JSON API)
-router.get('/api/scripts', apiAuth, (req, res) => {
-  pm2.connect((err) => {
-    if (err) {
-      return res.status(500).json({ success: false, error: 'PM2 connection failed' });
-    }
-    
-    pm2.list((listErr, list) => {
-      const config = configHandler.loadConfig();
-      
-      const scripts = config.scripts.map(script => {
-        const pm2Process = list && list.find(p => p.name === script.name);
-        return {
-          name: script.name,
-          type: script.type,
-          status: pm2Process ? pm2Process.pm2_env.status : (script.type === 'cron' ? 'scheduled' : 'stopped'),
-          path: script.path || null,
-          command: script.command || null,
-          cwd: script.cwd || null,
-          schedule: script.schedule || null,
-          suspended: script.suspended || false,
-        };
-      });
-      
-      pm2.disconnect();
-      res.json({ success: true, scripts });
-    });
+router.get('/api/scripts', apiAuth, wrap(async (req, res) => {
+  const list = await processService(req).list();
+  const config = configHandler.loadConfig();
+
+  const scripts = config.scripts.map(script => {
+    const pm2Process = findProcess(list, script.name);
+    return {
+      name: script.name,
+      type: script.type,
+      status: pm2Process ? pm2Process.pm2_env.status : (script.type === 'cron' ? 'scheduled' : 'stopped'),
+      path: script.path || null,
+      command: script.command || null,
+      cwd: script.cwd || null,
+      schedule: script.schedule || null,
+      suspended: script.suspended || false,
+      markedStopped: script.type === 'forever' ? Boolean(script.stopped) : false,
+    };
   });
-});
+
+  res.json({ success: true, scripts });
+}));
 
 // Add a new script (JSON API)
-router.post('/api/add-script', apiAuth, (req, res) => {
+router.post('/api/add-script', apiAuth, wrap(async (req, res) => {
   const config = configHandler.loadConfig();
   const { name, path: scriptPath, command, type, schedule } = req.body;
   
@@ -724,33 +598,28 @@ router.post('/api/add-script', apiAuth, (req, res) => {
   
   // If it's a forever script, optionally start it immediately
   if (type === 'forever' && req.body.autoStart !== false) {
-    const pm2Config = buildPm2Config(newScript, config.pm2);
-
-    pm2.connect((err) => {
-      if (err) {
-        return res.json({
-          success: true,
-          message: `Script '${name}' added but failed to auto-start: ${err.message}`,
-          autoStarted: false
-        });
-      }
-
-      pm2.start(pm2Config, (startErr) => {
-        pm2.disconnect();
-        res.json({
-          success: true,
-          message: `Script '${name}' added${startErr ? ' (auto-start failed)' : ' and started'}`,
-          autoStarted: !startErr
-        });
+    try {
+      await jobControl(req).startFresh(newScript);
+    } catch (error) {
+      console.error(`Failed to auto-start ${name}: ${errorText(error)}`);
+      return res.json({
+        success: true,
+        message: `Script '${name}' added but failed to auto-start`,
+        autoStarted: false
       });
-    });
-  } else {
-    res.json({
+    }
+    return res.json({
       success: true,
-      message: `Script '${name}' added`,
-      autoStarted: false
+      message: `Script '${name}' added and started`,
+      autoStarted: true
     });
   }
-});
+
+  res.json({
+    success: true,
+    message: `Script '${name}' added`,
+    autoStarted: false
+  });
+}));
 
 module.exports = router;

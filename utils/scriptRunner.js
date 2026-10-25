@@ -60,5 +60,7 @@ function applyScriptExecution(pm2Config, script) {
 
 module.exports = {
   applyScriptExecution,
+  getShellArgs,
+  getShellExecutable,
   resolveScriptCwd,
 };

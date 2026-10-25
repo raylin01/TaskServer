@@ -15,6 +15,9 @@
   </header>
   <main>
     <h2>Scripts</h2>
+    <% if (!pm2Available) { %>
+      <p class="status status-stopped">PM2 is not reachable, so job states are unknown. Try again in a moment.</p>
+    <% } %>
     <table>
       <thead>
         <tr>
@@ -52,11 +55,14 @@
                   <span class="status status-pending">Last run: None</span>
                 <% } %>
               <% } else { %>
-                <% const pm2proc = pm2list.find(p => p.name === script.name); %>
-                <% if (script.stopped || !pm2proc) { %>
+                <% const state = jobStates[script.name]; %>
+                <% if (state.status === 'stopped') { %>
                   <span class="status status-stopped">Stopped</span>
-                <% } else if (pm2proc) { %>
-                  <span class="status status-<%= pm2proc.pm2_env.status %>"><%= pm2proc.pm2_env.status %></span>
+                <% } else { %>
+                  <span class="status status-<%= state.status.replace(/\s+/g, '-') %>"><%= state.status %></span>
+                  <% if (state.drift) { %>
+                    <br><small title="The config says this job is stopped, but PM2 has it running. Press Stop to stop it for good.">marked stopped in config</small>
+                  <% } %>
                 <% } %>
               <% } %>
             </td>
@@ -86,8 +92,7 @@
                   </button>
                 </form>
               <% } else { %>
-                <% const pm2proc = pm2list.find(p => p.name === script.name); %>
-                <% const isStopped = script.stopped || !pm2proc || pm2proc.pm2_env.status === 'stopped'; %>
+                <% const isStopped = !jobStates[script.name].running; %>
                 <% if (isStopped) { %>
                   <form method="post" action="/start-script/<%= script.name %>" style="display:inline">
                     <button type="submit" class="btn-action btn-start" title="Start">
