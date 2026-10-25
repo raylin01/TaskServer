@@ -78,15 +78,27 @@ async function reconcileJobs({
           logger.log?.(`[Reconcile] Skipping ${script.name} (${plan.reason})`);
           break;
         case 'start':
-          await jobControl.startFresh(script, spec);
-          summary.started.push(script.name);
-          logger.log?.(`[Reconcile] Started ${script.name}${plan.reason ? ` (${plan.reason})` : ''}`);
+        case 'restart': {
+          // Look again under the job's lock: a restart from GitSync or the
+          // dashboard may have run since the list above was taken.
+          const outcome = await jobControl.inLock(script.name, async ops => {
+            const current = planJob(script, spec, findProcess(await service.list(), script.name));
+            if (current.action !== 'start' && current.action !== 'restart') return current;
+            await ops.startFresh(script, spec);
+            return current;
+          });
+          if (outcome.action === 'start') {
+            summary.started.push(script.name);
+            logger.log?.(`[Reconcile] Started ${script.name}${outcome.reason ? ` (${outcome.reason})` : ''}`);
+          } else if (outcome.action === 'restart') {
+            summary.restarted.push(script.name);
+            logger.log?.(`[Reconcile] Restarted ${script.name}: changed ${outcome.changed.join(', ')}`);
+          } else {
+            summary.left.push(script.name);
+            logger.log?.(`[Reconcile] ${script.name} changed while reconciling (${outcome.action}); left as is`);
+          }
           break;
-        case 'restart':
-          await jobControl.startFresh(script, spec);
-          summary.restarted.push(script.name);
-          logger.log?.(`[Reconcile] Restarted ${script.name}: changed ${plan.changed.join(', ')}`);
-          break;
+        }
         default:
           break;
       }

@@ -174,8 +174,23 @@ function createJobControl({
     return { proc, timeoutMs: Math.max(wanted, runningKillTimeout(proc)) + 10000 };
   }
 
+  // One job at a time. A restart from GitSync, a click in the dashboard and the
+  // boot reconcile can all target the same job; without this one of them can
+  // delete the process another just started, or leave two with one name. The
+  // wait for a slow job to exit happens inside the lock but outside the shared
+  // PM2 queue, so other jobs and the dashboard are not held up.
+  const tails = new Map();
+  function lock(name, work) {
+    const previous = tails.get(name) || Promise.resolve();
+    const run = previous.then(work);
+    const tail = run.catch(() => {});
+    tails.set(name, tail);
+    tail.then(() => { if (tails.get(name) === tail) tails.delete(name); });
+    return run;
+  }
+
   // Stop a job and keep its entry in PM2. Resolves false if PM2 has no such job.
-  async function stopJob(name, script) {
+  async function stopUnlocked(name, script) {
     const { proc, timeoutMs } = await prepareStop(name, script);
     if (!proc) return false;
     await service.stop(name, { timeoutMs });
@@ -183,7 +198,7 @@ function createJobControl({
   }
 
   // Remove a job from PM2, stopping it first. Resolves false if there was none.
-  async function removeJob(name, script) {
+  async function removeUnlocked(name, script) {
     const { proc, timeoutMs } = await prepareStop(name, script);
     if (!proc) return false;
     await service.delete(name, { timeoutMs });
@@ -193,14 +208,30 @@ function createJobControl({
   // Replace whatever PM2 has under this name with a fresh process from the
   // config (new log files, current settings). Used for start and restart.
   // `spec` may be given when the caller already built it.
-  async function startFresh(script, spec) {
+  async function startUnlocked(script, spec) {
     const config = spec || buildPm2Config(script, getPm2Settings(), getLogsDir());
-    await removeJob(script.name, script);
-    await service.start(config);
+    const removed = await removeUnlocked(script.name, script);
+    try {
+      await service.start(config);
+    } catch (error) {
+      if (removed) {
+        logger.error?.(`[Job ${script.name}] was removed from PM2 but could not be started again: ${errorText(error)}`);
+      }
+      throw error;
+    }
     return config;
   }
 
-  return { stopJob, removeJob, startFresh };
+  // `inLock` runs `work` with the unlocked operations while holding the job's
+  // lock, for callers that must look at PM2 and act on it as one step.
+  const unlocked = { stopJob: stopUnlocked, removeJob: removeUnlocked, startFresh: startUnlocked };
+  return {
+    stopJob: (name, script) => lock(name, () => stopUnlocked(name, script)),
+    removeJob: (name, script) => lock(name, () => removeUnlocked(name, script)),
+    startFresh: (script, spec) => lock(script.name, () => startUnlocked(script, spec)),
+    inLock: (name, work) => lock(name, () => work(unlocked)),
+  };
+
 }
 
-module.exports = { createJobControl, describeJob, findProcess, statusOf, LIVE, PENDING };
+module.exports = { createJobControl, describeJob, findProcess, statusOf, defaultSignalTree, defaultIsAlive, LIVE, PENDING };

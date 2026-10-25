@@ -16,7 +16,7 @@ function fakeClock() {
 function setup(t, { legacy = true, script = sudoJob, alive = () => false, signalTree, runStopCommand, killSignal } = {}) {
   const pm2 = createFakePm2();
   const clock = fakeClock();
-  const logger = { warns: [], warn(m) { this.warns.push(m); }, log() {}, error() {} };
+  const logger = { warns: [], errors: [], warn(m) { this.warns.push(m); }, log() {}, error(m) { this.errors.push(m); } };
   const signals = [];
   const proc = pm2.add(legacy ? legacyPm2Config(script, PM2, '/logs') : buildPm2Config(script, PM2, '/logs'));
   const control = createJobControl({
@@ -148,4 +148,51 @@ test('the dashboard state is what PM2 says, with the config flag shown as a mism
   assert.equal(describeJob({}, undefined, { pm2Available: false }).status, 'unknown');
   assert.equal(describeJob({}, { pm2_env: { status: 'waiting restart' } }).running, true);
   assert.equal(describeJob({}, { pm2_env: { status: 'errored' } }).running, false);
+});
+
+test('two restarts of the same job at once are serialised: one process, no error, no duplicate', async t => {
+  const { pm2, control } = setup(t, { alive: () => false });
+  const results = await Promise.allSettled([control.startFresh(sudoJob), control.startFresh(sudoJob), control.startFresh(sudoJob)]);
+  assert.deepEqual(results.map(r => r.status), ['fulfilled', 'fulfilled', 'fulfilled']);
+  assert.equal(pm2.procs.filter(p => p.name === sudoJob.name).length, 1);
+  assert.deepEqual(pm2.mutations().map(c => c[0]), ['delete', 'start', 'delete', 'start', 'delete', 'start']);
+});
+
+test('a stop and a restart of the same job do not interleave, and other jobs are not held up', async t => {
+  const { pm2, control } = setup(t, { alive: () => false });
+  const other = { name: 'Other', type: 'forever', command: 'node o.js', cwd: '/srv' };
+  pm2.add(buildPm2Config(other, PM2, '/logs'));
+  const order = [];
+  await Promise.all([
+    control.stopJob(sudoJob.name, sudoJob).then(() => order.push('stop')),
+    control.startFresh(sudoJob).then(() => order.push('restart')),
+    control.stopJob(other.name, other).then(() => order.push('other')),
+  ]);
+  assert.deepEqual(order.filter(x => x !== 'other'), ['stop', 'restart']);
+  assert.deepEqual(pm2.procs.map(p => p.name).sort(), [other.name, sudoJob.name].sort());
+  assert.equal(pm2.procs.find(p => p.name === sudoJob.name).pm2_env.status, 'online');
+});
+
+test('a failed job does not block the next one on the same name', async t => {
+  const { pm2, control } = setup(t, { alive: () => false });
+  pm2.state.stopError = new Error('boom');
+  await assert.rejects(control.stopJob(sudoJob.name, sudoJob), /boom/);
+  pm2.state.stopError = null;
+  assert.equal(await control.stopJob(sudoJob.name, sudoJob), true);
+});
+
+test('when the start fails after the old process was removed, the log says so', async t => {
+  const { pm2, control, logger } = setup(t, { alive: () => false });
+  pm2.state.startError = new Error('spawn failed');
+  await assert.rejects(control.startFresh(sudoJob), /spawn failed/);
+  assert.equal(pm2.procs.length, 0);
+  assert.equal(logger.errors.length, 1);
+  assert.match(logger.errors[0], /WireGuard Helper.*removed from PM2 but could not be started again: spawn failed/);
+});
+
+test('no "removed" message when there was nothing to remove', async t => {
+  const { pm2, control, logger } = setup(t);
+  pm2.state.startError = new Error('spawn failed');
+  await assert.rejects(control.startFresh({ name: 'New', type: 'forever', command: 'x', cwd: '/srv' }), /spawn failed/);
+  assert.deepEqual(logger.errors, []);
 });

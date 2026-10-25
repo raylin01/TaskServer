@@ -206,3 +206,68 @@ test('version check warns on a mismatch and stays quiet on a match', async () =>
   const failing = await checkPm2Versions({ service: { daemonVersion: async () => { throw new Error('nope'); } }, libraryVersion: '6.0.14', logger });
   assert.equal(failing.match, null);
 });
+
+// Shapes that exist in a real config: the exec path and args PM2 stores differ
+// from what TaskServer asked for in some of them, and none may count as a change.
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
+
+function adoptionCase(t, jobs) {
+  const pm2 = createFakePm2();
+  const logger = { logs: [], warns: [], errors: [], log(m) { this.logs.push(m); }, warn(m) { this.warns.push(m); }, error(m) { this.errors.push(m); } };
+  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false });
+  const config = { pm2: PM2, scripts: jobs };
+  for (const script of jobs) pm2.add(legacyPm2Config(script, PM2, LOGS));
+  return { pm2, logger, run: () => reconcileJobs({ service: pm2, jobControl, config, logsDir: LOGS, logger }) };
+}
+
+test('adopts, with zero mutations: a spaced path, a command with no cwd, a command with a ~ cwd containing spaces, and a path with no cwd', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'taskserver-home-'));
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  t.after(() => { process.env.HOME = savedHome; fs.rmSync(home, { recursive: true, force: true }); });
+  const jobs = [
+    { name: 'Spaced Path', type: 'forever', path: '/Applications/My Tool/run it', args: ['--keep'], cwd: '/srv/spaced' },
+    { name: 'Spaced Relative', type: 'forever', path: './my tool/run.sh', cwd: '/srv/spaced' },
+    { name: 'Command No Cwd', type: 'forever', command: 'node ddns.js --serve' },
+    { name: 'Command Tilde Cwd', type: 'forever', command: 'bash ./update.sh', cwd: '~/Library/Application Support/Aeros DDNS' },
+    { name: 'Path No Cwd', type: 'forever', path: 'worker.js', args: ['--fast'] },
+    { name: 'Path On PATH', type: 'forever', path: 'sleep', args: ['60'] },
+  ];
+  const { pm2, run } = adoptionCase(t, jobs);
+  const summary = await run();
+  assert.deepEqual(pm2.mutations(), []);
+  assert.deepEqual(summary.adopted.sort(), jobs.map(j => j.name).sort());
+  assert.equal(pm2.procs.find(p => p.name === 'Command Tilde Cwd').pm2_env.pm_cwd, path.join(home, 'Library/Application Support/Aeros DDNS'));
+  // PM2's own rewrite of the spaced path is what is stored, and it still matches.
+  assert.deepEqual(pm2.procs.find(p => p.name === 'Spaced Path').pm2_env.args, ['-c', '/Applications/My Tool/run it']);
+});
+
+test('a changed spaced path is still noticed and restarts only that job', async t => {
+  const jobs = [
+    { name: 'Spaced Path', type: 'forever', path: '/Applications/My Tool/run it', cwd: '/srv/spaced' },
+    { name: 'Steady', type: 'forever', command: 'node steady.js', cwd: '/srv/steady' },
+  ];
+  const { pm2, run, logger } = adoptionCase(t, jobs);
+  jobs[0].path = '/Applications/My Tool/run it v2';
+  const summary = await run();
+  assert.deepEqual(summary.restarted, ['Spaced Path']);
+  assert.deepEqual(pm2.mutations().map(([m, name]) => `${m}:${name}`), ['delete:Spaced Path', 'start:Spaced Path']);
+  assert.doesNotMatch(logger.logs.join('\n'), /v2/);
+});
+
+test('a restart that lands while reconcile waits for the job lock is not undone: reconcile re-checks and leaves it', async t => {
+  const jobs = [{ name: 'DDNS', type: 'forever', command: 'node ddns.js', cwd: '/srv/ddns' }];
+  const { pm2, run, logger } = adoptionCase(t, jobs);
+  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false });
+  jobs[0].command = 'node ddns.js --v2';
+  // GitSync's restart takes the lock first; reconcile has already planned a restart from its stale list.
+  const config = { pm2: PM2, scripts: jobs };
+  const route = jobControl.startFresh(jobs[0]);
+  const summary = await Promise.all([route, reconcileJobs({ service: pm2, jobControl, config, logsDir: LOGS, logger })]).then(r => r[1]);
+  assert.deepEqual(pm2.mutations().map(([m]) => m), ['delete', 'start'], 'one replacement, not two');
+  assert.equal(pm2.procs.length, 1);
+  assert.deepEqual(summary.restarted, []);
+  assert.deepEqual(summary.left, ['DDNS']);
+});
