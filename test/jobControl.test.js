@@ -5,7 +5,7 @@ const { createJobControl, describeJob } = require('../utils/jobControl');
 const { buildPm2Config, killTimeoutFor } = require('../utils/jobSpec');
 
 const PM2 = { maxRestarts: 10000, autoRestart: true, restartDelay: 1000, killTimeoutMs: 5000 };
-const sudoJob = { name: 'WireGuard Helper', type: 'forever', command: 'sudo -n python3 helper.py', cwd: '/srv/wg', killTimeoutMs: 20000 };
+const sudoJob = { name: 'Example Helper', type: 'forever', command: 'sudo -n python3 helper.py', cwd: '/srv/example-helper', killTimeoutMs: 20000 };
 
 // Time that only moves when something sleeps, so waits cost nothing.
 function fakeClock() {
@@ -132,7 +132,7 @@ test('startFresh replaces the entry: graceful removal, then a start with the job
   assert.equal(pm2.procs.length, 1);
   assert.equal(pm2.procs[0].pm2_env.kill_timeout, 20000);
   assert.equal(spec.kill_timeout, 20000);
-  assert.match(spec.out_file, /WireGuard Helper-out-/);
+  assert.match(spec.out_file, /Example Helper-out-/);
 });
 
 test('startFresh on a job PM2 does not have just starts it', async t => {
@@ -188,7 +188,7 @@ test('when the start fails after the old process was removed, the log says so', 
   await assert.rejects(control.startFresh(sudoJob), /spawn failed/);
   assert.equal(pm2.procs.length, 0);
   assert.equal(logger.errors.length, 1);
-  assert.match(logger.errors[0], /WireGuard Helper.*removed from PM2 but could not be started again: spawn failed/);
+  assert.match(logger.errors[0], /Example Helper.*removed from PM2 but could not be started again: spawn failed/);
 });
 
 test('no "removed" message when there was nothing to remove', async t => {
