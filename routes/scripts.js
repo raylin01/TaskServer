@@ -8,6 +8,7 @@ const path = require('path');
 const { asyncHandler: wrap } = require('../utils/httpErrors');
 const { describeJob, findProcess, LIVE } = require('../utils/jobControl');
 const { errorText } = require('../utils/processService');
+const { afterReply } = require('../utils/afterReply');
 
 // The PM2 client, job control and cron manager are created once, by
 // createApp() in server.js, and shared through app.locals.
@@ -457,18 +458,19 @@ router.post('/api/restart-script/:scriptName', apiAuth, wrap(async (req, res) =>
       });
     }
     // Answer first. The restart kills this process, so it is only asked for
-    // once the reply has been written, and the caller never sees a reset.
+    // once the reply has been written, and the caller never sees a reset. The
+    // reply says "requested": whether PM2 carries it out is only known later,
+    // so a failure is logged loudly here instead.
     res.set('Connection', 'close');
-    res.on('finish', () => {
-      setTimeout(() => {
-        processService(req).restart(scriptName).catch(error => {
-          console.error(`Failed to restart self (${scriptName}): ${errorText(error)}`);
-        });
-      }, 100);
+    afterReply(res, () => {
+      processService(req).restart(scriptName).catch(error => {
+        console.error(`[Self-restart] FAILED to restart '${scriptName}': ${errorText(error)}. `
+          + 'TaskServer is still running the old code; restart it by hand.');
+      });
     });
     return res.json({
       success: true,
-      message: `TaskServer (${scriptName}) restarting...`,
+      message: `Restart of TaskServer (${scriptName}) requested`,
     });
   }
 
