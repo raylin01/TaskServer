@@ -230,3 +230,30 @@ test('form routes: delete keeps the script when PM2 cannot stop it; stop and res
   assert.equal(saved().scripts.length, 0);
   assert.deepEqual(pm2.procs, []);
 });
+
+test('TaskServer itself in the config cannot be stopped, restarted or deleted from the dashboard or API (400, PM2 untouched)', async t => {
+  const { base, pm2, saved } = await boot(t, {
+    scripts: [job('taskserver', { command: 'node server.js' })],
+    setupPm2: (pm2, config) => pm2.add(legacyPm2Config(config.scripts[0], PM2_SETTINGS, '/logs')),
+  });
+  t.mock.method(console, 'error', () => {});
+  for (const url of ['/stop-script/taskserver', '/start-script/taskserver', '/restart-script/taskserver', '/delete-script/taskserver',
+    '/api/stop-script/taskserver']) {
+    const res = await request(base, 'POST', url);
+    assert.equal(res.status, 400, url);
+    assert.match(res.text, /TaskServer itself/);
+  }
+  assert.deepEqual(pm2.mutations(), []);
+  assert.equal(saved().scripts.length, 1, 'delete did not drop the config entry either');
+});
+
+test('two quick API starts of a stopped job: one starts it, the other is told it is already running', async t => {
+  const { base, pm2 } = await boot(t, { scripts: [job('Alpha', { stopped: true })] });
+  const [a, b] = await Promise.all([
+    request(base, 'POST', '/api/start-script/Alpha'),
+    request(base, 'POST', '/api/start-script/Alpha'),
+  ]);
+  assert.deepEqual([a.status, b.status].sort(), [200, 400]);
+  assert.equal(pm2.procs.filter(p => p.name === 'Alpha').length, 1);
+  assert.deepEqual(pm2.mutations().map(c => c[0]), ['start'], 'started once, never replaced');
+});

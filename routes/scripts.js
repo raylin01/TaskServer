@@ -32,9 +32,7 @@ function setStopped(name, stopped) {
   }
 }
 
-function selfName(config) {
-  return config.server?.selfName || 'taskserver';
-}
+const selfName = config => configHandler.getSelfName(config);
 
 function buildScriptFromRequest(body) {
   const { name, path: scriptPath, command, type, schedule, count, args, env, cwd } = body;
@@ -520,15 +518,19 @@ router.post('/api/start-script/:scriptName', apiAuth, wrap(async (req, res) => {
     });
   }
 
-  const existing = findProcess(await processService(req).list(), script.name);
-  if (existing && LIVE.has(existing.pm2_env.status)) {
+  // The check and the start are one step under the job's lock, so two quick
+  // clicks cannot both pass the check.
+  const spec = await jobControl(req).inLock(script.name, async ops => {
+    const existing = findProcess(await processService(req).list(), script.name);
+    if (existing && LIVE.has(existing.pm2_env.status)) return null;
+    return ops.startFresh(script);
+  });
+  if (!spec) {
     return res.status(400).json({
       success: false,
       error: 'Script is already running'
     });
   }
-
-  const spec = await jobControl(req).startFresh(script);
   setStopped(script.name, false);
   res.json({
     success: true,

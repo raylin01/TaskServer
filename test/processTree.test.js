@@ -39,12 +39,12 @@ test('real process tree: signalling the shell reaches its child, and liveness fo
   assert.equal(defaultIsAlive(shell.pid), true);
   assert.equal(defaultIsAlive(process.pid), true);
 
-  await defaultSignalTree(shell.pid, 'SIGINT');
+  assert.equal(await defaultSignalTree(shell.pid, 'SIGINT'), true, 'reports that a signal was delivered');
   await Promise.race([exited, sleep(15000)]);
 
   assert.equal(fs.readFileSync(marker, 'utf8'), 'got SIGINT', 'the child, not only the shell, got the signal');
   await until(() => !defaultIsAlive(shell.pid));
   assert.equal(defaultIsAlive(shell.pid), false);
   // Signalling a pid that is gone does nothing and does not throw.
-  await defaultSignalTree(shell.pid, 'SIGINT');
+  assert.equal(await defaultSignalTree(shell.pid, 'SIGINT'), false, 'reports that nothing was delivered');
 });

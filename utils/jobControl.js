@@ -57,7 +57,8 @@ function psTable() {
 }
 
 // Signal a process and everything below it, children first, like PM2 does.
-// Processes we may not signal (a root-owned child) are skipped.
+// Processes we may not signal (a root-owned child) are skipped. Resolves true if
+// at least one process received the signal, false if none did.
 async function defaultSignalTree(pid, signal) {
   if (process.platform === 'win32') return;
   const children = new Map();
@@ -78,13 +79,16 @@ async function defaultSignalTree(pid, signal) {
     }
   })(pid);
   order.push(pid);
+  let delivered = false;
   for (const target of order) {
     try {
       process.kill(target, signal);
+      delivered = true;
     } catch (error) {
       // Already gone, or not ours to signal.
     }
   }
+  return delivered;
 }
 
 // Run a job's `stopCommand`. Its output is discarded. Resolves with how it
@@ -132,6 +136,7 @@ function createJobControl({
   now = Date.now,
   pollMs = 100,
   killSignal = () => process.env.PM2_KILL_SIGNAL || 'SIGINT',
+  getSelfName = () => configHandler.getSelfName(),
 } = {}) {
   // Give a process up to `wanted` ms to exit on its own, signalling it the way
   // PM2 would. Gives up quietly: PM2's own stop follows either way.
@@ -143,7 +148,14 @@ function createJobControl({
       const pid = current.pid;
       // Every process gets the full time, including one PM2 just relaunched.
       const deadline = now() + wanted;
-      await signalTree(pid, killSignal());
+      const delivered = await signalTree(pid, killSignal());
+      if (delivered === false) {
+        // Nothing here may be signalled (for example every process is root-owned),
+        // so waiting would only burn the whole timeout. PM2 stops it as before.
+        logger.warn?.(`[Job ${name}] TaskServer could not signal any process of the job (not permitted); `
+          + 'leaving the stop to PM2. A job that runs as root, such as one wrapped in sudo, needs a stopCommand');
+        return;
+      }
       while (isAlive(pid) && now() < deadline) await sleep(pollMs);
       if (isAlive(pid)) {
         logger.warn?.(`[Job ${name}] still running after ${wanted} ms; PM2 will stop it now`);
@@ -189,8 +201,18 @@ function createJobControl({
     return run;
   }
 
+  // TaskServer must never stop, remove or restart itself through the job
+  // controls: that would delete the process running this code.
+  function refuseSelf(name) {
+    if (name !== getSelfName()) return;
+    const error = new Error(`'${name}' is TaskServer itself; it cannot be stopped or replaced as a job`);
+    error.status = 400;
+    throw error;
+  }
+
   // Stop a job and keep its entry in PM2. Resolves false if PM2 has no such job.
   async function stopUnlocked(name, script) {
+    refuseSelf(name);
     const { proc, timeoutMs } = await prepareStop(name, script);
     if (!proc) return false;
     await service.stop(name, { timeoutMs });
@@ -199,6 +221,7 @@ function createJobControl({
 
   // Remove a job from PM2, stopping it first. Resolves false if there was none.
   async function removeUnlocked(name, script) {
+    refuseSelf(name);
     const { proc, timeoutMs } = await prepareStop(name, script);
     if (!proc) return false;
     await service.delete(name, { timeoutMs });
@@ -209,6 +232,7 @@ function createJobControl({
   // config (new log files, current settings). Used for start and restart.
   // `spec` may be given when the caller already built it.
   async function startUnlocked(script, spec) {
+    refuseSelf(script.name);
     const config = spec || buildPm2Config(script, getPm2Settings(), getLogsDir());
     const removed = await removeUnlocked(script.name, script);
     try {

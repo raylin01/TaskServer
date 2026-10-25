@@ -25,6 +25,7 @@ function setup(t, { legacy = true, script = sudoJob, alive = () => false, signal
     signalTree: signalTree || (async (pid, signal) => { signals.push([pid, signal]); }),
     runStopCommand: runStopCommand || (async () => ({ code: 0 })),
     killSignal: killSignal || (() => 'SIGINT'),
+    getSelfName: () => 'taskserver',
   });
   return { pm2, control, proc, signals, clock, logger };
 }
@@ -195,4 +196,31 @@ test('no "removed" message when there was nothing to remove', async t => {
   pm2.state.startError = new Error('spawn failed');
   await assert.rejects(control.startFresh({ name: 'New', type: 'forever', command: 'x', cwd: '/srv' }), /spawn failed/);
   assert.deepEqual(logger.errors, []);
+});
+
+test('when no process of the job can be signalled, the stop does not wait out the timeout, and says so once', async t => {
+  // Every process is root-owned: EPERM on all of them.
+  const { pm2, control, clock, logger } = setup(t, { alive: () => true, signalTree: async () => false });
+  await control.stopJob(sudoJob.name, sudoJob);
+  assert.equal(clock.now(), 0, 'no polling');
+  assert.equal(logger.warns.filter(w => /could not signal any process/.test(w)).length, 1);
+  assert.match(logger.warns[0], /stopCommand/);
+  assert.deepEqual(pm2.mutations().map(c => c[0]), ['stop'], 'PM2 is still asked to stop it');
+});
+
+test('a signal that was delivered still gets the full wait', async t => {
+  const { control, clock, logger } = setup(t, { alive: () => true, signalTree: async () => true });
+  await control.stopJob(sudoJob.name, sudoJob);
+  assert.ok(clock.now() >= 20000);
+  assert.equal(logger.warns.filter(w => /could not signal any process/.test(w)).length, 0);
+});
+
+test('TaskServer itself is refused by stop, remove and startFresh with a 400, and PM2 is not touched', async t => {
+  const { pm2, control } = setup(t);
+  pm2.add({ name: 'taskserver', script: 'server.js', cwd: '/srv' });
+  const self = { name: 'taskserver', type: 'forever', command: 'node server.js' };
+  for (const call of [() => control.stopJob('taskserver', self), () => control.removeJob('taskserver', self), () => control.startFresh(self)]) {
+    await assert.rejects(call(), error => error.status === 400 && /TaskServer itself/.test(error.message));
+  }
+  assert.deepEqual(pm2.mutations(), []);
 });
