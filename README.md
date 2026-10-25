@@ -431,14 +431,20 @@ The sweep runs in the background and never delays scheduling or launches: cron
 jobs are registered at boot, and the sweep works in chunks of 200 entries (at
 most 1000 deletions per scan, with follow-up scans about a second apart while a
 backlog remains). Each chunk is a separate PM2 operation, so a launch waits for
-at most one chunk. Every PM2 call has a timeout, so a lost reply cannot block
-launches.
+at most one chunk. Inside a chunk the status of each entry is rechecked from a list
+that is at most 25 deletes old, so a run someone restarts meanwhile is not killed;
+an id that has already disappeared is skipped. Every PM2 call has a timeout, so a
+lost reply cannot block launches; after a timeout the PM2 client is replaced with a
+fresh one. If `pm2 start` times out, the run may still have started: the error says
+so, the launch is never retried automatically, and the run is not recorded until a
+later scan sees its process.
 
 The latest run time and trigger of each job (plus the launch id that identifies the
 newest run) are saved atomically in `.taskserver-run-history.json` next to
 `config.yaml` before deletion. Keep that file writable and retain it across
 restarts for the dashboard's last-run time. It contains no job commands or
-environment variables. If the file is empty, truncated or not a JSON object,
+environment variables. Entries for scripts that are no longer in `config.yaml` are
+dropped at the next scan. If the file is empty, truncated or not a JSON object,
 TaskServer logs one warning, renames it to `.taskserver-run-history.json.corrupt-<time>`
 and starts with empty history. Overlapping runs keep separate log files, and an
 older run finishing cannot replace the latest run. Log files remain subject to the

@@ -21,6 +21,14 @@ function localOrigin({ address, port }) {
 }
 
 /**
+ * Origin URL for startTunnel: a URL is used as given; a bare port (number or
+ * numeric string such as "3000") means the loopback address.
+ */
+function tunnelOrigin(origin) {
+  return /^\d+$/.test(String(origin)) ? `http://127.0.0.1:${origin}` : String(origin);
+}
+
+/**
  * Start a Cloudflare Tunnel with the provided token
  * @param {string} tunnelToken - The Cloudflare Tunnel token
  * @param {string|number} origin - Local origin URL to expose, e.g. from
@@ -34,7 +42,7 @@ function startTunnel(tunnelToken, origin = 3000) {
     }
 
     console.log('Starting Cloudflare Tunnel...');
-    const originUrl = typeof origin === 'number' ? `http://127.0.0.1:${origin}` : origin;
+    const originUrl = tunnelOrigin(origin);
     
     // Use cloudflared from node_modules
     const binaryName = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
@@ -137,6 +145,7 @@ function isTunnelRunning() {
 
 module.exports = {
   localOrigin,
+  tunnelOrigin,
   startTunnel,
   stopTunnel,
   getTunnelUrl,

@@ -44,8 +44,26 @@ function errorText(error) {
   return text.length > 200 ? `${text.slice(0, 200)}...` : text;
 }
 
+// Errors from a timeout carry `timeout: true`, so callers can tell "no reply"
+// apart from "the daemon said no".
+function timeoutError(message) {
+  return Object.assign(new Error(message), { timeout: true });
+}
+
+// The daemon says this for an id that is no longer in its table, for example
+// after a manual `pm2 delete`. The entry is already gone.
+function isUnknownId(error, id) {
+  return error?.message === `${id} : id unknown`;
+}
+
+// How many deletes may pass before the status recheck data is refreshed.
+const RECHECK_EVERY = 25;
+
 function createRunCleanup({
-  client = new pm2.custom(),
+  client: initialClient,
+  // Makes a fresh client after a timeout. It must reach the same default
+  // daemon (a plain `new pm2.custom()`; not the `independent` option).
+  createClient,
   getScripts,
   historyPath = path.join(__dirname, '../.taskserver-run-history.json'),
   // Steady state: exits are collected within about a minute.
@@ -61,6 +79,8 @@ function createRunCleanup({
   disconnectTimeoutMs = 5000,
   logger = console,
 } = {}) {
+  const newClient = createClient ?? (initialClient ? null : () => new pm2.custom());
+  let client = initialClient ?? newClient();
   const history = Object.create(null);
   const launchedNames = new Set();
   let lastSaved;
@@ -124,7 +144,7 @@ function createRunCleanup({
         clearTimeout(limit);
         fn(value);
       };
-      const limit = setTimeout(() => finish(reject, new Error(`PM2 ${method} timed out`)), rpcTimeoutMs);
+      const limit = setTimeout(() => finish(reject, timeoutError(`PM2 ${method} timed out`)), rpcTimeoutMs);
       const reply = (err, result) =>
         err ? finish(reject, err instanceof Error ? err : new Error(String(err))) : finish(resolve, result);
       try {
@@ -133,9 +153,9 @@ function createRunCleanup({
           // namespace (two more full-list RPCs, so ~1 s per delete with 1,200
           // entries), and would delete a process named like the number. The
           // daemon method deletes exactly this numeric pm_id.
-          client.Client.executeRemote('deleteProcessId', args[0], reply);
+          op.client.Client.executeRemote('deleteProcessId', args[0], reply);
         } else {
-          client[method](...args, reply);
+          op.client[method](...args, reply);
         }
       } catch (error) {
         finish(reject, error);
@@ -143,7 +163,7 @@ function createRunCleanup({
     });
   }
 
-  function disconnect() {
+  function disconnect(target) {
     return new Promise(resolve => {
       let done = false;
       const finish = () => {
@@ -154,7 +174,7 @@ function createRunCleanup({
       };
       const limit = setTimeout(finish, disconnectTimeoutMs);
       try {
-        client.disconnect(finish);
+        target.disconnect(finish);
       } catch (error) {
         finish();
       }
@@ -162,7 +182,10 @@ function createRunCleanup({
   }
 
   async function runOperation(work, timeoutMs) {
-    const op = { dead: false };
+    // The operation keeps its own client. After a timeout an abandoned call on
+    // it could still complete late or reconnect, so the next operation gets a
+    // new client instead.
+    const op = { dead: false, client, timedOut: false };
     let deadline;
     try {
       const body = (async () => {
@@ -171,15 +194,19 @@ function createRunCleanup({
       })();
       body.catch(() => {});
       const expired = new Promise((resolve, reject) => {
-        deadline = setTimeout(() => reject(new Error('PM2 operation timed out')), timeoutMs);
+        deadline = setTimeout(() => reject(timeoutError('PM2 operation timed out')), timeoutMs);
       });
       return await Promise.race([body, expired]);
+    } catch (error) {
+      if (error?.timeout) op.timedOut = true;
+      throw error;
     } finally {
       // Whatever happened, stop further calls from this operation, drop the
       // connection and let the next queued operation start.
       op.dead = true;
       clearTimeout(deadline);
-      await disconnect();
+      await disconnect(op.client);
+      if (op.timedOut && newClient && client === op.client) client = newClient();
     }
   }
 
@@ -226,13 +253,22 @@ function createRunCleanup({
 
   // Delete one chunk of the planned entries. The chunk takes its own fresh
   // list, and an entry is deleted only if that list still shows the same name,
-  // stopped, at the same numeric pm_id (ids are reused after a delete).
+  // stopped, at the same numeric pm_id (ids are reused after a delete). Deleting
+  // an online process would kill it, so the list is refreshed every
+  // RECHECK_EVERY deletes and the recheck data is never older than that.
   function deleteChunk(planned, matcher) {
     return connected(async call => {
-      const current = new Map();
-      for (const proc of await call('list')) current.set(proc.pm_id, proc);
+      let current;
+      let sinceList = 0;
+      const refresh = async () => {
+        current = new Map();
+        for (const proc of await call('list')) current.set(proc.pm_id, proc);
+        sinceList = 0;
+      };
+      await refresh();
       let count = 0;
       for (const { pm_id: id, name } of planned) {
+        if (sinceList >= RECHECK_EVERY) await refresh();
         const proc = current.get(id);
         if (!proc || proc.name !== name || proc.pm2_env?.status !== 'stopped') continue;
         const run = matchRun(proc, matcher);
@@ -240,7 +276,14 @@ function createRunCleanup({
         record(run);
         // Persist before deleting anything. A write failure leaves PM2 history intact.
         save();
-        await call('deleteById', id);
+        sinceList += 1;
+        try {
+          await call('deleteById', id);
+        } catch (error) {
+          // Already gone (for example a manual `pm2 delete`): nothing to do.
+          if (isUnknownId(error, id)) continue;
+          throw error;
+        }
         count += 1;
       }
       return count;
@@ -255,6 +298,12 @@ function createRunCleanup({
       for (const proc of list) {
         const run = matchRun(proc, matcher);
         if (run && ['online', 'stopped'].includes(proc.pm2_env?.status)) record(run);
+      }
+      // Forget scripts that are no longer configured. An unreadable config
+      // reads as no scripts, so an empty set never prunes.
+      const configured = new Set(getScripts().map(script => script.name));
+      if (configured.size) {
+        for (const name of Object.keys(history)) if (!configured.has(name)) delete history[name];
       }
       save();
       const stopped = selectStoppedRuns(list, matcher);
@@ -305,20 +354,33 @@ function createRunCleanup({
 
   async function launch(scriptName, config) {
     launchedNames.add(scriptName);
-    return connected(async call => {
-      const processes = await call('start', config);
-      // The run has started. A history write problem must not make the caller
-      // think it failed; the next scan retries the save before deleting anything.
-      try {
-        for (const proc of processes) {
-          const run = matchRun(proc, [scriptName]);
-          if (run) record(run);
+    let startSent = false;
+    try {
+      return await connected(async call => {
+        startSent = true;
+        const processes = await call('start', config);
+        // The run has started. A history write problem must not make the caller
+        // think it failed; the next scan retries the save before deleting anything.
+        try {
+          for (const proc of processes) {
+            const run = matchRun(proc, [scriptName]);
+            if (run) record(run);
+          }
+          save();
+        } catch (error) {
+          logger.error(`[Run Cleanup] Could not save run history after launch: ${errorText(error)}`);
         }
-        save();
-      } catch (error) {
-        logger.error(`[Run Cleanup] Could not save run history after launch: ${errorText(error)}`);
+      });
+    } catch (error) {
+      // No reply does not mean no run: the daemon may have started it. Never
+      // retried here and not recorded as a clean launch; a later scan picks the
+      // process up by name if it exists.
+      if (startSent && error?.timeout) {
+        throw Object.assign(new Error('PM2 start timed out; the run may still have started. '
+          + 'Check the log before running again.'), { timeout: true, maybeStarted: true });
       }
-    });
+      throw error;
+    }
   }
 
   function shutdown() {

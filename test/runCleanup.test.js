@@ -311,7 +311,7 @@ test('an operation that exceeds its overall deadline is abandoned and makes no f
   const { manager, state, client } = fixture(t, [], { operationTimeoutMs: 30, rpcTimeoutMs: 1000 });
   const start = client.start;
   client.start = (config, cb) => setTimeout(() => start(config, cb), 100);
-  await assert.rejects(manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' }), /operation timed out/);
+  await assert.rejects(manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' }), /may still have started/);
   assert.equal(state.events.at(-1), 'disconnect');
 });
 
@@ -405,4 +405,118 @@ test('the installed pm2 exposes the calls the cleanup relies on', () => {
   const client = new pm2.custom();
   for (const method of ['connect', 'disconnect', 'list', 'start']) assert.equal(typeof client[method], 'function', method);
   assert.equal(typeof client.Client.executeRemote, 'function');
+  // The cleanup calls the daemon's RPC method directly; a pm2 upgrade that
+  // drops it from the daemon must fail here.
+  const daemon = fs.readFileSync(require.resolve('pm2/lib/Daemon.js'), 'utf8');
+  assert.match(daemon, /deleteProcessId\s*:\s*God\.deleteProcessId/);
+  // Reading the source: loading God itself starts daemon timers that keep node alive.
+  const actions = fs.readFileSync(require.resolve('pm2/lib/God/ActionMethods.js'), 'utf8');
+  assert.match(actions, /God\.deleteProcessId\s*=\s*function\s*\(\s*id\s*,\s*cb\s*\)/);
+  assert.match(actions, /id \+ ' : id unknown'/);
+});
+
+test('an id the daemon no longer knows is skipped and the rest of the chunk is still deleted', async t => {
+  const { manager, state, client } = fixture(t, [1, 2, 3].map(i => processEntry(`Aeros DDNS-cron-${1792800000000 + i}`, i)));
+  const deleteById = client.deleteById;
+  client.deleteById = (id, cb) => id === 2 ? cb(new Error('2 : id unknown')) : deleteById(id, cb);
+  assert.equal(await manager.reconcile(), 2);
+  assert.deepEqual(state.deleted.map(d => d.id), [1, 3]);
+  assert.deepEqual(state.errors, []);
+});
+
+test('a real delete error or timeout still rejects the scan and stops deleting', async t => {
+  for (const failure of [cb => cb(new Error('daemon exploded')), () => {}]) {
+    const { manager, state, client } = fixture(t, [1, 2, 3].map(i => processEntry(`Aeros DDNS-cron-${1792800000000 + i}`, i)),
+      { rpcTimeoutMs: 30 });
+    const deleteById = client.deleteById;
+    client.deleteById = (id, cb) => id === 2 ? failure(cb) : deleteById(id, cb);
+    await assert.rejects(manager.reconcile(), /daemon exploded|timed out/);
+    assert.deepEqual(state.deleted.map(d => d.id), [1]);
+  }
+});
+
+test('a start timeout says the run may have started, is never retried and is not recorded', async t => {
+  const { manager, state, client } = fixture(t, [], { rpcTimeoutMs: 30 });
+  let calls = 0;
+  client.start = () => { calls += 1; };
+  await assert.rejects(manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' }),
+    /PM2 start timed out; the run may still have started\. Check the log before running again\./);
+  assert.equal(calls, 1);
+  assert.equal(manager.history['Aeros DDNS'], undefined);
+  assert.equal(fs.existsSync(state.historyPath ?? ''), false);
+});
+
+test('run-now surfaces the start-timeout message without suggesting a retry', async t => {
+  const { options, client } = fixture(t, [], { rpcTimeoutMs: 30 });
+  client.start = () => {};
+  const manager = require('../utils/cronManager')(options);
+  t.after(() => manager.shutdown());
+  manager.upsertScript({ name: 'Aeros DDNS', path: '/synthetic/tick.js', type: 'cron', schedule: '* * * * *', suspended: true });
+  await assert.rejects(manager.runNow('Aeros DDNS'), /may still have started.*Check the log before running again/);
+  assert.match(manager.cronRunHistory['Aeros DDNS'].lastError, /may still have started/);
+  assert.doesNotMatch(manager.cronRunHistory['Aeros DDNS'].lastError, /try again|retry/i);
+});
+
+test('after a timeout the abandoned client is never used again; a fresh one reaches the same daemon', async t => {
+  const { options, state, client } = fixture(t, []);
+  const made = [];
+  const createClient = () => {
+    const id = made.length;
+    const calls = [];
+    const wrapped = {};
+    for (const method of ['connect', 'disconnect', 'list', 'start']) {
+      wrapped[method] = (...args) => { calls.push(method); return client[method](...args); };
+    }
+    wrapped.Client = client.Client;
+    made.push({ id, calls, wrapped });
+    return wrapped;
+  };
+  const manager = createRunCleanup({ ...options, client: undefined, createClient, rpcTimeoutMs: 30 });
+  t.after(() => manager.shutdown());
+  assert.equal(made.length, 1);
+  const hung = made[0].wrapped;
+  const originalStart = client.start;
+  let late;
+  client.start = (config, cb) => { late = () => originalStart(config, cb); };
+  await assert.rejects(manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' }), /may still have started/);
+  assert.equal(made.length, 2, 'a new client replaced the one that timed out');
+  const callsAfterTimeout = made[0].calls.slice();
+  client.start = originalStart;
+  late();
+  await manager.reconcile();
+  await manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000001' });
+  assert.deepEqual(made[0].calls, callsAfterTimeout);
+  assert.ok(made[1].calls.includes('list') && made[1].calls.includes('start'));
+  assert.equal(made.length, 2, 'no further replacement without a timeout');
+  assert.notEqual(made[1].wrapped, hung);
+});
+
+test('the delete recheck data is refreshed every 25 deletes, so a restarted run is not killed', async t => {
+  const entries = Array.from({ length: 60 }, (_, i) => processEntry(`Aeros DDNS-cron-${1792800000000 + i}`, i + 1));
+  const { manager, state } = fixture(t, entries);
+  state.captureSaved = false;
+  state.onDelete = () => {
+    // Someone restarts the run at pm_id 56 (index 55) while the chunk is deleting.
+    if (state.deleted.length === 30) state.entries.find(p => p.pm_id === 56).pm2_env.status = 'online';
+  };
+  assert.equal(await manager.reconcile(), 59);
+  assert.equal(state.deleted.some(d => d.id === 56), false);
+  assert.equal(state.entries.length, 1);
+  // plan + chunk start + refresh before the 26th and 51st delete
+  assert.equal(state.events.filter(e => e === 'list').length, 4);
+});
+
+test('history of scripts that are no longer configured is dropped, but an unreadable config prunes nothing', async t => {
+  const { manager, state, historyPath, options } = fixture(t, []);
+  fs.writeFileSync(historyPath, JSON.stringify({
+    'Aeros DDNS': { runId: 1792800000000, lastRun: '2026-10-24T00:00:00.000Z', lastTrigger: 'cron' },
+    'Deleted Script': { runId: 1792800000001, lastRun: '2026-10-24T00:00:00.001Z', lastTrigger: 'cron' } }));
+  let scripts = [];
+  const reloaded = createRunCleanup({ ...options, getScripts: () => scripts });
+  await reloaded.reconcile();
+  assert.deepEqual(Object.keys(reloaded.history).sort(), ['Aeros DDNS', 'Deleted Script']);
+  scripts = [{ name: 'Aeros DDNS' }];
+  await reloaded.reconcile();
+  assert.deepEqual(Object.keys(reloaded.history), ['Aeros DDNS']);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(historyPath, 'utf8'))), ['Aeros DDNS']);
 });

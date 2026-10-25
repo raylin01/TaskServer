@@ -2,7 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
 const os = require('os');
-const { localOrigin } = require('../utils/cloudflareTunnel');
+const { localOrigin, tunnelOrigin } = require('../utils/cloudflareTunnel');
 
 test('tunnel origin maps wildcard binds to loopback and brackets IPv6', () => {
   for (const [address, expected] of [
@@ -50,4 +50,10 @@ test('the derived origin reaches a server bound to a specific interface address'
   const external = Object.values(os.networkInterfaces()).flat().find(i => i.family === 'IPv4' && !i.internal);
   if (!external) return t.skip('no non-loopback IPv4 address');
   await reachable(t, external.address);
+});
+
+test('a bare port, as a number or numeric string, means loopback; a URL is kept', () => {
+  assert.equal(tunnelOrigin(3000), 'http://127.0.0.1:3000');
+  assert.equal(tunnelOrigin('3000'), 'http://127.0.0.1:3000');
+  assert.equal(tunnelOrigin('http://[::1]:3000'), 'http://[::1]:3000');
 });
