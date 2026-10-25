@@ -6,19 +6,26 @@
 // files in public/ are open):
 //
 //  - With `api.authEnabled: true` a request must carry the API key in the
-//    `X-API-Key` header (scripts and other programs) or a signed session
-//    cookie (the dashboard, after signing in at /login with the same key).
-//    The key is never accepted in a URL, and is compared in constant time.
+//    `X-API-Key` header (scripts and other programs) or a session cookie (the
+//    dashboard, after signing in at /login with the same key). The key is never
+//    accepted in a URL, and is compared in constant time. Repeated wrong keys
+//    from one address are slowed down.
+//  - A session is a random id kept in memory. Signing out removes it, and so does
+//    a restart (everyone signs in again). The cookie and the CSRF token are made
+//    from random per-process secrets, never from the API key.
 //  - A state-changing request from a browser must come from this site: its
-//    Origin (or Sec-Fetch-Site) has to say so, and it has to carry the CSRF
-//    token the dashboard pages embed. A request with a valid API key header
-//    is exempt: a web page cannot add that header to a cross-site request.
-//    Programs that send neither an Origin nor a cookie are not browsers and
-//    are only let through when authentication is off.
+//    Origin has to be this server's own host or one of `server.publicOrigins`
+//    (or, with no Origin, Sec-Fetch-Site has to say same-origin), and it has to
+//    carry the CSRF token the dashboard pages embed. A request with a valid API
+//    key header is exempt: a web page cannot add that header to a cross-site
+//    request. Programs that send neither an Origin nor a cookie are not
+//    browsers and are only let through when authentication is off.
 //  - With authentication off, only loopback host names (and `server.allowedHosts`)
 //    are served, so a page cannot reach TaskServer through DNS rebinding.
-//  - If config.yaml cannot be read, the last good settings stay in force, and
-//    with none, every request is refused.
+//  - Once settings have been read, a config.yaml that later goes missing, is
+//    empty, is cut off, or holds settings that make no sense never replaces
+//    them: the last good settings stay in force. With none, every request is
+//    refused.
 
 const crypto = require('crypto');
 const express = require('express');
@@ -26,8 +33,18 @@ const configHandler = require('./configHandler');
 
 const SESSION_COOKIE = 'taskserver_session';
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_SESSIONS = 200;
+const MIN_KEY_LENGTH = 16;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
+
+// Wrong keys: after FREE_FAILURES in a row from one address, further requests
+// from it are refused for a pause that doubles up to MAX_PAUSE_MS. Failures are
+// forgotten after FORGET_MS without a new one.
+const FREE_FAILURES = 5;
+const BASE_PAUSE_MS = 1000;
+const MAX_PAUSE_MS = 30000;
+const FORGET_MS = 10 * 60 * 1000;
 
 // Scripts and styles only from this site, nothing inline. Inline styles stay
 // allowed because the pages use style attributes.
@@ -56,52 +73,112 @@ function isLoopbackHost(host) {
   return LOOPBACK_NAMES.has(name) || /^127(\.\d{1,3}){3}$/.test(name);
 }
 
-function authSettings(config) {
+const isMapping = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+// The security settings in a config (as YAML gave it, or merged with defaults).
+// Returns { settings } or { problem } where the problem names the config key and
+// carries nothing from the file. `previous` is what was read last time, if
+// anything: settings may not quietly lose their `api` block.
+function parseSettings(config, previous = null) {
+  if (config === undefined || config === null) {
+    return previous
+      ? { problem: 'config.yaml is missing or empty' }
+      : { settings: settingsOf({}, {}, false) };
+  }
+  if (!isMapping(config)) return { problem: 'config.yaml must be a mapping of settings' };
+
+  const hasApi = config.api !== undefined;
+  if (previous?.hasApi && !hasApi) return { problem: 'config.yaml no longer has the api section' };
+  if (hasApi && !isMapping(config.api)) return { problem: 'api in config.yaml must be a mapping' };
+  const api = hasApi ? config.api : {};
+  if (api.authEnabled !== undefined && typeof api.authEnabled !== 'boolean') {
+    return { problem: 'api.authEnabled in config.yaml must be true or false' };
+  }
+  if (api.apiKey !== undefined && typeof api.apiKey !== 'string') {
+    return { problem: 'api.apiKey in config.yaml must be a string' };
+  }
+  const enabled = api.authEnabled === true;
+  const apiKey = api.apiKey ?? '';
+  if (enabled && apiKey.trim().length < MIN_KEY_LENGTH) {
+    return { problem: `api.apiKey in config.yaml must be at least ${MIN_KEY_LENGTH} characters when api.authEnabled is true` };
+  }
+
+  if (config.server !== undefined && config.server !== null && !isMapping(config.server)) {
+    return { problem: 'server in config.yaml must be a mapping' };
+  }
+  const server = config.server || {};
+  for (const key of ['allowedHosts', 'publicOrigins']) {
+    if (server[key] !== undefined && (!Array.isArray(server[key]) || server[key].some(item => typeof item !== 'string'))) {
+      return { problem: `server.${key} in config.yaml must be a list of strings` };
+    }
+  }
+  const publicOrigins = [];
+  for (const entry of server.publicOrigins || []) {
+    try {
+      const url = new URL(entry);
+      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('protocol');
+      publicOrigins.push(url.origin);
+    } catch (error) {
+      return { problem: 'server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com' };
+    }
+  }
+  return { settings: { ...settingsOf(api, server, hasApi), enabled, apiKey, publicOrigins } };
+}
+
+function settingsOf(api, server, hasApi) {
   return {
-    enabled: config.api?.authEnabled === true,
-    apiKey: typeof config.api?.apiKey === 'string' ? config.api.apiKey : '',
-    host: config.server?.host,
-    allowedHosts: Array.isArray(config.server?.allowedHosts) ? config.server.allowedHosts.map(String) : [],
+    enabled: false,
+    apiKey: '',
+    hasApi,
+    host: typeof server.host === 'string' ? server.host : undefined,
+    allowedHosts: server.allowedHosts || [],
+    publicOrigins: [],
   };
 }
 
-// Settings that refuse everything: used when config.yaml was never readable.
-const REFUSE_ALL = { enabled: true, apiKey: '', host: undefined, allowedHosts: [] };
+// Settings that refuse everything: used when config.yaml was never usable.
+const REFUSE_ALL = { enabled: true, apiKey: '', hasApi: true, host: undefined, allowedHosts: [], publicOrigins: [] };
 
 // Reads the settings from config.yaml on each call (the file can change while
-// running). A file that cannot be parsed does not switch protection off: the
-// last good settings are used instead.
-function createAuthSource({ load = configHandler.loadConfigStrict, logger = console } = {}) {
+// running). Settings that cannot be used never switch protection off: the last
+// good ones stay in force. Only the very first read may fall back to "no
+// authentication" (no config.yaml yet).
+function createAuthSource({ read = configHandler.readRawConfig, logger = console } = {}) {
   let lastGood = null;
-  let failing = false;
+  let lastProblem = null;
   return () => {
+    let outcome;
     try {
-      lastGood = authSettings(load());
-      failing = false;
+      outcome = parseSettings(read(), lastGood);
     } catch (error) {
-      if (!failing) {
-        failing = true;
-        logger.error?.(`[Security] ${error.message}; ${lastGood
-          ? 'keeping the last good security settings'
-          : 'refusing every request until it is fixed'}`);
-      }
+      outcome = { problem: error.message };
+    }
+    if (outcome.settings) {
+      lastGood = outcome.settings;
+      lastProblem = null;
+    } else if (outcome.problem !== lastProblem) {
+      lastProblem = outcome.problem;
+      logger.error?.(`[Security] ${outcome.problem}; ${lastGood
+        ? 'keeping the last good security settings'
+        : 'refusing every request until it is fixed'}`);
     }
     return lastGood || REFUSE_ALL;
   };
 }
 
-// Problems that must stop TaskServer from starting. Empty when it is safe.
+// Problems that must stop TaskServer from starting, each naming the config key
+// and why. Empty when it is safe.
 function listenProblems(config) {
-  const auth = authSettings(config);
+  const parsed = parseSettings(config);
   const problems = [];
-  const keyMissing = auth.enabled && auth.apiKey.trim() === '';
-  if (keyMissing) problems.push('api.authEnabled is true but api.apiKey is empty');
+  if (parsed.problem) problems.push(parsed.problem);
+  const enabled = Boolean(parsed.settings?.enabled);
   const exposure = [];
   if (!isLoopbackHost(config.server?.host)) exposure.push(`server.host is ${config.server?.host}, not a loopback address`);
-  if (config.cloudflare?.enabled) exposure.push('the Cloudflare Tunnel is enabled');
-  if (exposure.length && !(auth.enabled && !keyMissing)) {
+  if (config.cloudflare?.enabled) exposure.push('cloudflare.enabled is true');
+  if (exposure.length && !enabled) {
     problems.push(`${exposure.join(' and ')}, so the dashboard is reachable from other machines: `
-      + 'set api.authEnabled: true and an api.apiKey in config.yaml');
+      + `set api.authEnabled: true and an api.apiKey of at least ${MIN_KEY_LENGTH} characters in config.yaml`);
   }
   return problems;
 }
@@ -115,29 +192,77 @@ function parseCookies(header) {
   return cookies;
 }
 
-// Only a path on this site: no other host, no protocol-relative link.
+// Only a path on this site: no other host, no protocol-relative link, and not
+// the sign-in page itself.
 function localPath(value, fallback = '/scripts') {
   const text = typeof value === 'string' ? value : '';
-  return /^\/(?![/\\])/.test(text) && !/[\r\n]/.test(text) ? text : fallback;
+  return /^\/(?![/\\])/.test(text) && !/[\r\n]/.test(text) && !text.startsWith('/login') ? text : fallback;
+}
+
+// Failed-key bookkeeping per client address.
+function createThrottle(now, freeFailures) {
+  const failures = new Map();
+  return {
+    // Seconds to wait, or 0.
+    wait(client) {
+      const entry = failures.get(client);
+      return entry && entry.blockedUntil > now() ? Math.ceil((entry.blockedUntil - now()) / 1000) : 0;
+    },
+    fail(client) {
+      const time = now();
+      if (failures.size > 1000) {
+        for (const [key, entry] of failures) if (time - entry.last > FORGET_MS) failures.delete(key);
+      }
+      let entry = failures.get(client);
+      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, last: time, blockedUntil: 0 };
+      entry.count += 1;
+      entry.last = time;
+      if (entry.count >= freeFailures) {
+        entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** (entry.count - freeFailures), MAX_PAUSE_MS);
+      }
+      failures.set(client, entry);
+    },
+  };
 }
 
 function createSecurity({
   loadAuth = createAuthSource(),
   csrfSecret = crypto.randomBytes(32),
   now = Date.now,
+  freeFailures = FREE_FAILURES,
 } = {}) {
+  const throttle = createThrottle(now, freeFailures);
+  const clientOf = req => req.socket?.remoteAddress || 'unknown';
+
+  // One read of config.yaml per request, shared by every check.
+  const settingsFor = req => {
+    req.securitySettings = req.securitySettings || loadAuth();
+    return req.securitySettings;
+  };
+
   const keyMatches = (auth, given) => auth.apiKey !== '' && typeof given === 'string'
     && crypto.timingSafeEqual(sha256(given), sha256(auth.apiKey));
 
-  const sign = (auth, expires) => hmac(auth.apiKey, `session|${expires}`);
+  // Live sessions: id -> { expires, key }. `key` is a hash of the API key the
+  // session was made with, so changing the key ends every session.
+  const sessions = new Map();
+  const keyTag = auth => sha256(auth.apiKey).toString('hex');
   const newSession = auth => {
-    const expires = now() + SESSION_MS;
-    return `${expires}.${sign(auth, expires)}`;
+    const time = now();
+    for (const [id, session] of sessions) if (session.expires <= time) sessions.delete(id);
+    while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
+    const id = crypto.randomBytes(32).toString('base64url');
+    sessions.set(id, { expires: time + SESSION_MS, key: keyTag(auth) });
+    return id;
   };
-  const sessionValid = (auth, value) => {
-    if (auth.apiKey === '' || typeof value !== 'string') return false;
-    const [expires, signature = ''] = value.split('.');
-    return /^\d+$/.test(expires) && Number(expires) > now() && safeEqual(signature, sign(auth, expires));
+  const sessionValid = (auth, id) => {
+    const session = typeof id === 'string' ? sessions.get(id) : undefined;
+    if (!session) return false;
+    if (session.expires <= now()) {
+      sessions.delete(id);
+      return false;
+    }
+    return auth.apiKey !== '' && session.key === keyTag(auth);
   };
 
   const csrfFor = session => hmac(csrfSecret, `csrf|${session || ''}`);
@@ -159,7 +284,7 @@ function createSecurity({
 
   // With authentication off, only loopback names are served.
   function hostGuard(req, res, next) {
-    const auth = loadAuth();
+    const auth = settingsFor(req);
     if (auth.enabled) return next();
     const header = String(req.headers.host || '');
     const name = (header.startsWith('[') ? header.slice(0, header.indexOf(']') + 1) : header.replace(/:\d*$/, ''))
@@ -174,8 +299,11 @@ function createSecurity({
   const wantsPage = req => req.method === 'GET' && !req.path.startsWith('/api/')
     && String(req.headers.accept || '').includes('text/html');
 
+  const tooMany = (res, seconds) => res.set('Retry-After', String(seconds)).status(429)
+    .json({ error: 'Too Many Requests', message: 'Too many wrong keys; wait and try again' });
+
   function authenticate(req, res, next) {
-    const auth = loadAuth();
+    const auth = settingsFor(req);
     req.authMode = 'off';
     res.locals.authEnabled = auth.enabled;
     res.locals.csrfToken = csrfFor('');
@@ -183,15 +311,19 @@ function createSecurity({
 
     const given = req.headers['x-api-key'];
     if (given !== undefined) {
+      const seconds = throttle.wait(clientOf(req));
+      if (seconds) return tooMany(res, seconds);
       if (keyMatches(auth, given)) {
         req.authMode = 'key';
         return next();
       }
+      throttle.fail(clientOf(req));
     } else {
-      const session = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-      if (sessionValid(auth, session)) {
+      const id = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+      if (sessionValid(auth, id)) {
         req.authMode = 'session';
-        res.locals.csrfToken = csrfFor(session);
+        req.sessionId = id;
+        res.locals.csrfToken = csrfFor(id);
         req.csrfToken = res.locals.csrfToken;
         return next();
       }
@@ -200,18 +332,19 @@ function createSecurity({
     return res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required' });
   }
 
-  // Does the request come from a page of this site?
-  function fromThisSite(req) {
+  // Does the request come from a page of this site? Sec-Fetch-Site "none" (the
+  // user typing the address) is not accepted: nobody types in a POST.
+  function fromThisSite(req, auth) {
     const origin = req.headers.origin;
     if (origin !== undefined) {
       try {
-        return new URL(origin).host === req.headers.host;
+        const url = new URL(origin);
+        return url.host === req.headers.host || auth.publicOrigins.includes(url.origin);
       } catch (error) {
         return false;
       }
     }
-    const site = req.headers['sec-fetch-site'];
-    return site === 'same-origin' || site === 'none';
+    return req.headers['sec-fetch-site'] === 'same-origin';
   }
 
   function csrfGuard(req, res, next) {
@@ -219,7 +352,7 @@ function createSecurity({
     const browser = req.headers.origin !== undefined || req.headers['sec-fetch-site'] !== undefined
       || req.authMode === 'session';
     if (!browser) return next();
-    if (!fromThisSite(req)) {
+    if (!fromThisSite(req, settingsFor(req))) {
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }
     const token = req.body?._csrf ?? req.headers['x-csrf-token'];
@@ -234,28 +367,36 @@ function createSecurity({
   const loginRouter = express.Router();
   loginRouter.use('/login', express.urlencoded({ extended: false, limit: '4kb' }));
   loginRouter.get('/login', (req, res) => {
-    const auth = loadAuth();
+    const auth = settingsFor(req);
     const next = localPath(req.query.next);
     if (!auth.enabled || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
     res.render('login', { next, error: null });
   });
   loginRouter.post('/login', (req, res) => {
-    const auth = loadAuth();
+    const auth = settingsFor(req);
     const next = localPath(req.body?.next);
     if (!auth.enabled) return res.redirect(next);
-    if (req.headers.origin !== undefined && !fromThisSite(req)) {
+    if (req.headers.origin !== undefined && !fromThisSite(req, auth)) {
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }
+    const seconds = throttle.wait(clientOf(req));
+    if (seconds) {
+      return res.set('Retry-After', String(seconds)).status(429)
+        .render('login', { next, error: `Too many wrong keys. Wait ${seconds} s and try again.` });
+    }
     if (!keyMatches(auth, req.body?.apiKey)) {
+      throttle.fail(clientOf(req));
       return res.status(401).render('login', { next, error: 'That key is not correct.' });
     }
     res.set('Set-Cookie', sessionCookie(req, newSession(auth), SESSION_MS));
     res.redirect(next);
   });
 
-  // Mounted after csrfGuard.
+  // Mounted after csrfGuard. Signing out forgets the session on the server, so a
+  // copy of the cookie stops working too.
   const sessionRouter = express.Router();
   sessionRouter.post('/logout', (req, res) => {
+    if (req.sessionId) sessions.delete(req.sessionId);
     res.set('Set-Cookie', sessionCookie(req, '', 0));
     res.redirect('/login');
   });
@@ -266,9 +407,11 @@ function createSecurity({
 module.exports = {
   createSecurity,
   createAuthSource,
+  parseSettings,
   listenProblems,
   isLoopbackHost,
   localPath,
   CONTENT_SECURITY_POLICY,
   SESSION_COOKIE,
+  MIN_KEY_LENGTH,
 };

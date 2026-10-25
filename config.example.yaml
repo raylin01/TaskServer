@@ -13,9 +13,10 @@ server:
   logsDir: "./logs"
   selfName: "taskserver"        # The PM2 name TaskServer runs under, so it can restart itself
   # allowedHosts: []            # Extra Host names to serve while api.authEnabled is off (localhost is always served)
+  # publicOrigins: []           # Exact origins browsers post from when a proxy rewrites Host, e.g. ["https://dashboard.example.com"]
 # For LAN access, explicitly set host: "0.0.0.0" (all IPv4 interfaces).
 # TaskServer refuses to start on a non-loopback host, or with the Cloudflare Tunnel
-# enabled, unless api.authEnabled is true and api.apiKey is set.
+# enabled, unless api.authEnabled is true and api.apiKey (16+ characters) is set.
 
 # Cloudflare Tunnel Settings (Optional)
 # When tunnel token is provided, a Cloudflare Tunnel will be created
@@ -28,8 +29,8 @@ cloudflare:
 # Enable this to require the API key on every route. Programs send it in the
 # X-API-Key header (never in a URL); the dashboard signs in at /login with it.
 api:
-  authEnabled: false            # Set to true to require the API key everywhere
-  apiKey: ""                   # Your secret API key (generate a secure random string)
+  authEnabled: false            # Must be true or false. true requires the API key everywhere
+  apiKey: ""                   # A string of 16+ characters, e.g. from: openssl rand -base64 24
 
 # PM2 Settings (Optional)
 # restartDelay is the initial exponential backoff delay between crash/restart cycles

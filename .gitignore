@@ -44,3 +44,6 @@ yarn-error.log*
 
 # bun is the package manager (bun.lock is committed)
 package-lock.json
+
+# Temporary file while config.yaml is being replaced
+.config.yaml.*.tmp

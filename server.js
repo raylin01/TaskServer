@@ -92,6 +92,14 @@ function listenWithRetry(app, port, host, {
   });
 }
 
+// Say exactly why, and how to recover: PM2 keeps restarting a process that exits
+// like this, and then leaves it "errored".
+function refuseToStart(problems, selfName) {
+  for (const problem of problems) console.error(`Refusing to start: ${problem}`);
+  console.error(`Fix config.yaml, then run: pm2 restart ${selfName}   (see "Recovering from a startup refusal" in the README)`);
+  process.exit(1);
+}
+
 async function main() {
   // Do not start with settings that cannot be read, or that would expose the
   // dashboard without a key.
@@ -99,14 +107,10 @@ async function main() {
   try {
     config = configHandler.loadConfigStrict();
   } catch (error) {
-    console.error(`Refusing to start: ${error.message}`);
-    process.exit(1);
+    refuseToStart([error.message], configHandler.getSelfName({}));
   }
   const problems = listenProblems(config);
-  if (problems.length) {
-    for (const problem of problems) console.error(`Refusing to start: ${problem}`);
-    process.exit(1);
-  }
+  if (problems.length) refuseToStart(problems, configHandler.getSelfName(config));
   let closing = false;
 
   // Setup automatic log cleanup if enabled

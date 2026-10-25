@@ -4,6 +4,7 @@ const router = express.Router();
 const cron = require('node-cron');
 const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
+const fs = require('fs');
 const path = require('path');
 const { asyncHandler: wrap } = require('../utils/httpErrors');
 const { describeJob, findProcess, LIVE } = require('../utils/jobControl');
@@ -149,10 +150,20 @@ router.get('/api/logs/:scriptName/chunk', wrap(async (req, res) => {
   res.json(logViewer.readLogChunk(req.params.scriptName, req.query.file, { offset, limit, fromEnd }));
 }));
 
-// API endpoint to download log file
-router.get('/api/logs/:scriptName/download', wrap(async (req, res) => {
-  const filePath = logViewer.resolveLogFile(req.params.scriptName, req.query.file);
-  res.download(filePath, req.query.file);
+// API endpoint to download log file. It streams from the descriptor that was
+// checked (see logViewer.openLog), up to the size seen then: a log that is still
+// being written does not make the length wrong.
+router.get('/api/logs/:scriptName/download', wrap(async (req, res, next) => {
+  const { fd, size } = logViewer.openLog(req.params.scriptName, req.query.file);
+  res.attachment(req.query.file);
+  res.set('Content-Length', String(size));
+  const stream = fs.createReadStream(null, { fd, start: 0, end: Math.max(size - 1, 0), autoClose: true });
+  if (size === 0) {
+    stream.destroy();
+    return res.end();
+  }
+  stream.on('error', next);
+  stream.pipe(res);
 }));
 
 // API endpoint to delete log file

@@ -64,22 +64,33 @@ function describeParseError(error) {
   return `${error?.reason || 'invalid YAML'}${where}`;
 }
 
-// Like loadConfig, but a config file that cannot be read or parsed is an error
-// instead of an empty config. A missing file is still the defaults. The
-// security checks use this, so a typo can never switch authentication off.
-function loadConfigStrict() {
+// The config file as YAML gave it (nothing merged in). `undefined` when the
+// file does not exist. Anything else that goes wrong is an error whose message
+// is safe to log: it never carries text from the file. An empty file is `null`.
+function readRawConfig() {
   let file;
   try {
     file = fs.readFileSync(getConfigPath(), 'utf8');
   } catch (error) {
-    if (error.code === 'ENOENT') return DEFAULT_CONFIG;
+    if (error.code === 'ENOENT') return undefined;
     throw new Error(`Could not read config.yaml: ${error.code || 'read error'}`);
   }
   try {
-    return withDefaults(yaml.load(file) || {});
+    return yaml.load(file) ?? null;
   } catch (error) {
     throw new Error(`config.yaml is not valid YAML: ${describeParseError(error)}`);
   }
+}
+
+// Like loadConfig, but a config file that cannot be read or parsed is an error
+// instead of an empty config. A missing or empty file is still the defaults.
+// Start-up uses this, so a typo can never start TaskServer with settings it
+// did not read.
+function loadConfigStrict() {
+  const raw = readRawConfig();
+  if (raw === undefined || raw === null) return DEFAULT_CONFIG;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config.yaml must be a mapping of settings');
+  return withDefaults(raw);
 }
 
 function getLogsDir() {
@@ -94,11 +105,33 @@ function getLogsDir() {
   return path.resolve(process.cwd(), logsDir);
 }
 
+// Replace the file in one step: the new text goes to a temporary file in the
+// same folder, is flushed to disk, and is then renamed over the old file. A
+// reader (this process's auth check, or anything else) sees the whole old file
+// or the whole new one, never a half-written one.
 function writeConfig(config) {
+  const target = getConfigPath();
+  const temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`);
+  let fd;
   try {
-    fs.writeFileSync(getConfigPath(), yaml.dump(config));
+    let mode;
+    try {
+      mode = fs.statSync(target).mode & 0o777;
+    } catch (error) {
+      mode = undefined; // a new file gets the default mode
+    }
+    fd = fs.openSync(temp, 'wx', mode);
+    fs.writeSync(fd, yaml.dump(config));
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(temp, target);
   } catch (e) {
     console.error('Failed to write config.yaml:', e);
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch (closeError) { /* already closed */ }
+    }
+    try { fs.unlinkSync(temp); } catch (unlinkError) { /* never created */ }
   }
 }
 
@@ -114,4 +147,4 @@ function getSelfName(config = loadConfig()) {
   return config.server?.selfName || 'taskserver';
 }
 
-module.exports = { loadConfig, loadConfigStrict, writeConfig, ensureLogDir, getLogsDir, getSelfName };
+module.exports = { loadConfig, loadConfigStrict, readRawConfig, writeConfig, ensureLogDir, getLogsDir, getSelfName };

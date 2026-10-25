@@ -156,6 +156,7 @@ const routes = () => router.stack.filter(layer => layer.route).flatMap(layer =>
 
 test('with authentication on, every route refuses a request without the key, and changes nothing', async t => {
   const app = await boot(t, { scripts: [job('Example Worker'), job('Example Cron', { type: 'cron', schedule: '0 * * * *' })], extra: AUTH,
+    securityOptions: { freeFailures: Infinity },
     setupPm2: (p, c) => p.add({ name: c.scripts[0].name, script: 'x.js', cwd: os.tmpdir() }) });
   const { base, pm2, saved } = app;
   const before = fs.readFileSync(app.file, 'utf8');
@@ -258,19 +259,48 @@ test('the dashboard works behind the key: sign in, use a form with its token, si
   assert.match(out.headers['set-cookie'][0], /Max-Age=0/);
 });
 
-test('a session cookie from another key, or an altered one, is not accepted; the session is not an API key', async t => {
-  const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH });
+test('a made-up, expired or foreign session cookie is not accepted; the session is not an API key', async t => {
+  let clock = Date.now();
+  const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH, securityOptions: { now: () => clock } });
   const cookie = await signIn(base);
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 200);
   const [name, value] = cookie.split('=');
-  const [expires, sig] = value.split('.');
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${Number(expires) + 1}.${sig}` } })).status, 401, 'longer lifetime');
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${expires}.${sig.replace(/.$/, c => (c === '0' ? '1' : '0'))}` } })).status, 401, 'altered');
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${Date.now() - 1000}.${sig}` } })).status, 401, 'expired');
+  assert.equal(value.length, 43, 'a random 256-bit id');
+  assert.doesNotMatch(value, /\./, 'no expiry or signature to forge');
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${value.slice(0, -1)}${value.endsWith('A') ? 'B' : 'A'}` } })).status, 401, 'altered');
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${'A'.repeat(43)}` } })).status, 401, 'made up');
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': value } })).status, 401);
   // A new key ends every session.
   write({ ...config, api: { authEnabled: true, apiKey: 'a-different-key-9876' } });
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401);
+  write({ ...config, ...AUTH });
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 200, 'the old key again: the same session');
+  clock += 8 * 24 * 60 * 60 * 1000;
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401, 'expired after 7 days');
+});
+
+test('signing out ends the session on the server: a copy of the cookie stops working', async t => {
+  const { base } = await boot(t, { scripts: forever(), extra: AUTH });
+  const cookie = await signIn(base);
+  const copy = `${cookie}`;
+  const token = await pageToken(base, { cookie });
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: copy } })).status, 200);
+  assert.equal((await request(base, 'POST', '/logout', { headers: { cookie, origin: base }, form: { _csrf: token } })).status, 302);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: copy } })).status, 401);
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: copy, accept: 'text/html' } })).status, 302);
+  // Another sign-in is a different session.
+  const second = await signIn(base);
+  assert.notEqual(second, cookie);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: second } })).status, 200);
+});
+
+test('the cookie and the CSRF token are not derived from the API key', async t => {
+  const first = await boot(t, { extra: AUTH });
+  const second = await boot(t, { extra: AUTH });
+  const [a, b] = [await signIn(first.base), await signIn(second.base)];
+  assert.notEqual(a.split('=')[1], b.split('=')[1]);
+  assert.notEqual(await pageToken(first.base, { cookie: a }), await pageToken(second.base, { cookie: b }));
+  assert.doesNotMatch(a, /^[^=]+=[0-9]+\./, 'not an expiry plus a signature of the key');
 });
 
 test('the sign-in page only sends you on to a path of this site', async t => {
@@ -368,21 +398,36 @@ test('an empty api key never matches, even when authentication is on', async t =
 
 test('TaskServer refuses to start when it is reachable from other machines without a key', () => {
   const config = (server, extra = {}) => ({ server, ...extra });
+  const AUTH_ON = { api: { authEnabled: true, apiKey: KEY } };
   assert.deepEqual(listenProblems(config({ host: '127.0.0.1' })), []);
   assert.deepEqual(listenProblems(config({ host: 'localhost' })), []);
   assert.deepEqual(listenProblems(config({ host: '::1' })), []);
-  assert.deepEqual(listenProblems(config({ host: '127.0.0.1' }, { api: { authEnabled: true, apiKey: KEY } })), []);
+  assert.deepEqual(listenProblems(config({ host: '127.0.0.1' }, AUTH_ON)), []);
 
-  assert.match(listenProblems(config({ host: '0.0.0.0' }))[0], /not a loopback address.*api\.authEnabled/);
-  assert.match(listenProblems(config({ host: '192.168.1.20' }, { api: { authEnabled: false, apiKey: KEY } }))[0], /loopback/);
-  assert.match(listenProblems(config({ host: '127.0.0.1' }, { cloudflare: { enabled: true, tunnelToken: 'x' } }))[0], /Cloudflare Tunnel is enabled/);
+  assert.match(listenProblems(config({ host: '0.0.0.0' }))[0], /server\.host is 0\.0\.0\.0, not a loopback address.*api\.authEnabled/);
+  assert.match(listenProblems(config({ host: '192.168.1.20' }, { api: { authEnabled: false, apiKey: KEY } }))[0], /server\.host/);
+  assert.match(listenProblems(config({ host: '127.0.0.1' }, { cloudflare: { enabled: true, tunnelToken: 'x' } }))[0], /cloudflare\.enabled is true/);
   assert.equal(listenProblems(config({ host: '0.0.0.0' }, { cloudflare: { enabled: true } })).length, 1);
-  assert.deepEqual(listenProblems(config({ host: '0.0.0.0' }, { api: { authEnabled: true, apiKey: KEY }, cloudflare: { enabled: true } })), []);
+  assert.deepEqual(listenProblems(config({ host: '0.0.0.0' }, { ...AUTH_ON, cloudflare: { enabled: true } })), []);
+});
 
-  assert.match(listenProblems(config({ host: '127.0.0.1' }, { api: { authEnabled: true, apiKey: '' } }))[0], /apiKey is empty/);
-  assert.match(listenProblems(config({ host: '127.0.0.1' }, { api: { authEnabled: true, apiKey: '   ' } }))[0], /apiKey is empty/);
-  assert.equal(listenProblems(config({ host: '0.0.0.0' }, { api: { authEnabled: true } })).length, 2);
-  assert.equal(listenProblems(config({ host: '0.0.0.0' }, { api: { authEnabled: 'yes', apiKey: KEY } })).length, 1, 'only true turns it on');
+test('TaskServer refuses to start with auth settings it cannot trust, naming the key', () => {
+  const problems = api => listenProblems({ server: { host: '127.0.0.1' }, api });
+  assert.match(problems({ authEnabled: true, apiKey: '' })[0], /api\.apiKey .*at least 16 characters/);
+  assert.match(problems({ authEnabled: true })[0], /api\.apiKey .*at least 16 characters/);
+  assert.match(problems({ authEnabled: true, apiKey: '   ' })[0], /at least 16/);
+  assert.match(problems({ authEnabled: true, apiKey: 'fifteen-chars-x' })[0], /at least 16/);
+  assert.deepEqual(problems({ authEnabled: true, apiKey: 'sixteen-chars-xxx' }), []);
+  // Truthy words used to turn auth on; now they are an error, not "off".
+  for (const value of ['true', 'yes', 'on', 1, 'false', null, [], {}]) {
+    assert.match(problems({ authEnabled: value, apiKey: KEY })[0], /api\.authEnabled .*must be true or false/, JSON.stringify(value));
+  }
+  assert.match(problems({ authEnabled: true, apiKey: 1234567890123456 })[0], /api\.apiKey in config\.yaml must be a string/);
+  assert.match(problems({ authEnabled: false, apiKey: 12345 })[0], /must be a string/);
+  assert.match(problems('on')[0], /api in config\.yaml must be a mapping/);
+  assert.match(listenProblems({ server: { host: '127.0.0.1', publicOrigins: ['not an origin'] } })[0], /server\.publicOrigins/);
+  assert.match(listenProblems({ server: { host: '127.0.0.1', allowedHosts: 'dash' } })[0], /server\.allowedHosts .*list of strings/);
+  assert.doesNotMatch(JSON.stringify(problems({ authEnabled: true, apiKey: 'short' })), /short|\b5\b/, 'neither the key nor its length');
 });
 
 test('starting the server with an unsafe or unreadable config exits before it listens or touches PM2', t => {
@@ -399,15 +444,219 @@ test('starting the server with an unsafe or unreadable config exits before it li
   const exposed = start('server:\n  host: 0.0.0.0\n  port: 0\n');
   assert.equal(exposed.status, 1);
   assert.match(exposed.stderr, /Refusing to start: server\.host is 0\.0\.0\.0, not a loopback address/);
+  assert.match(exposed.stderr, /Fix config\.yaml, then run: pm2 restart taskserver/);
   assert.doesNotMatch(exposed.stdout, /TaskServer running/);
 
   const tunnel = start('cloudflare:\n  enabled: true\n  tunnelToken: tunnel-secret-value\n');
   assert.equal(tunnel.status, 1);
-  assert.match(tunnel.stderr, /Cloudflare Tunnel is enabled/);
+  assert.match(tunnel.stderr, /cloudflare\.enabled is true/);
   assert.doesNotMatch(tunnel.stderr + tunnel.stdout, /tunnel-secret-value/);
 
   const broken = start('api:\n  apiKey: super-secret-value\n  bad: [unclosed\n');
   assert.equal(broken.status, 1);
   assert.match(broken.stderr, /Refusing to start: config\.yaml is not valid YAML: .* at line \d+, column \d+/);
   assert.doesNotMatch(broken.stderr + broken.stdout, /super-secret-value|unclosed/);
+});
+
+// ---------------------------------------------------------------------------
+// Settings that go bad while running
+// ---------------------------------------------------------------------------
+
+test('config.yaml going missing, empty, cut off or odd while running never switches auth off', async t => {
+  const { base, file, config, write } = await boot(t, { scripts: forever(), extra: AUTH, securityOptions: { freeFailures: Infinity } });
+  const good = fs.readFileSync(file, 'utf8');
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  const logged = [];
+  const original = console.error;
+  console.error = (...args) => logged.push(args.join(' '));
+  t.after(() => { console.error = original; });
+
+  const bad = {
+    'missing': () => fs.unlinkSync(file),
+    'empty': () => fs.writeFileSync(file, ''),
+    'only a comment': () => fs.writeFileSync(file, '# nothing\n'),
+    'cut off before the api section': () => fs.writeFileSync(file, good.slice(0, good.indexOf('api:'))),
+    'cut off inside the api section': () => fs.writeFileSync(file, good.slice(0, good.indexOf('apiKey:') + 'apiKey: examp'.length)),
+    'cut off in the middle of a word': () => fs.writeFileSync(file, `${good.slice(0, good.indexOf('authEnabled:'))}authEnabled: tr`),
+    'a list': () => fs.writeFileSync(file, '- a\n- b\n'),
+    'a plain word': () => fs.writeFileSync(file, 'hello\n'),
+    'auth switched to a word': () => write({ ...config, api: { authEnabled: 'true', apiKey: KEY } }),
+    'auth switched to a number': () => write({ ...config, api: { authEnabled: 1, apiKey: KEY } }),
+    'a key that is a number': () => write({ ...config, api: { authEnabled: true, apiKey: 1234567890123456 } }),
+    'a key that is too short': () => write({ ...config, api: { authEnabled: true, apiKey: 'short' } }),
+    'api section not a mapping': () => write({ ...config, api: 'on' }),
+    'broken yaml': () => fs.writeFileSync(file, 'api: {{{'),
+  };
+  for (const [what, damage] of Object.entries(bad)) {
+    damage();
+    assert.equal((await request(base, 'GET', '/api/scripts')).status, 401, `${what}: no key`);
+    assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'wrong' } })).status, 401, `${what}: wrong key`);
+    assert.equal((await request(base, 'GET', '/scripts')).status, 401, `${what}: dashboard`);
+    assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200, `${what}: the key still works`);
+    fs.writeFileSync(file, good);
+  }
+  assert.ok(logged.some(l => l.includes('[Security]') && l.includes('keeping the last good')));
+  const text = logged.join('\n');
+  assert.doesNotMatch(text, new RegExp(KEY));
+  assert.doesNotMatch(text, /examp|short|hello/);
+});
+
+test('only the first read of settings may fall back to "no authentication" (no config.yaml yet)', async t => {
+  const { base, file } = await boot(t, { scripts: forever() });
+  fs.unlinkSync(file);
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 200, 'first read, nothing to keep');
+});
+
+test('a change that really turns auth on or rotates the key is still picked up', async t => {
+  const { base, write, config } = await boot(t, { scripts: forever() });
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 200);
+  write({ ...config, ...AUTH });
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
+  write({ ...config, api: { authEnabled: true, apiKey: 'rotated-key-0123456789' } });
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 401);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'rotated-key-0123456789' } })).status, 200);
+});
+
+test('config.yaml is replaced atomically: temp file in the same folder, flushed, then renamed', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'taskserver-write-'));
+  t.after(() => { delete process.env.TASKSERVER_CONFIG; fs.rmSync(dir, { recursive: true, force: true }); });
+  const target = path.join(dir, 'config.yaml');
+  fs.writeFileSync(target, 'scripts: []\n', { mode: 0o600 });
+  process.env.TASKSERVER_CONFIG = target;
+  const configHandler = require('../utils/configHandler');
+  const order = [];
+  const realFsync = fs.fsyncSync;
+  const realRename = fs.renameSync;
+  t.mock.method(fs, 'fsyncSync', fd => { order.push('fsync'); return realFsync(fd); });
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    order.push('rename');
+    assert.equal(path.dirname(from), dir);
+    assert.notEqual(from, target);
+    assert.equal(to, target);
+    assert.match(fs.readFileSync(from, 'utf8'), /name: Example/, 'complete before it is moved into place');
+    return realRename(from, to);
+  });
+  configHandler.writeConfig({ scripts: [{ name: 'Example', type: 'forever', command: 'echo hi' }] });
+  assert.deepEqual(order, ['fsync', 'rename']);
+  assert.match(fs.readFileSync(target, 'utf8'), /name: Example/);
+  assert.deepEqual(fs.readdirSync(dir), ['config.yaml'], 'no temporary file is left');
+  if (process.platform !== 'win32') assert.equal(fs.statSync(target).mode & 0o777, 0o600, 'the mode is kept');
+});
+
+test('a failed write leaves the old config.yaml alone and no temporary file', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'taskserver-write-'));
+  t.after(() => { delete process.env.TASKSERVER_CONFIG; fs.rmSync(dir, { recursive: true, force: true }); });
+  const target = path.join(dir, 'config.yaml');
+  fs.writeFileSync(target, 'scripts: []\n');
+  process.env.TASKSERVER_CONFIG = target;
+  const configHandler = require('../utils/configHandler');
+  t.mock.method(fs, 'renameSync', () => { throw new Error('disk says no'); });
+  t.mock.method(console, 'error', () => {});
+  configHandler.writeConfig({ scripts: [{ name: 'Changed' }] });
+  assert.equal(fs.readFileSync(target, 'utf8'), 'scripts: []\n');
+  assert.deepEqual(fs.readdirSync(dir), ['config.yaml']);
+});
+
+// ---------------------------------------------------------------------------
+// Wrong keys
+// ---------------------------------------------------------------------------
+
+test('wrong keys from one address are slowed down, doubling up to a limit, and forgotten later', async t => {
+  let clock = 1_000_000;
+  const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
+  const wrong = () => request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'wrong' } });
+  for (let i = 0; i < 4; i += 1) assert.equal((await wrong()).status, 401, `attempt ${i + 1}`);
+  assert.equal((await wrong()).status, 401, 'the fifth is still answered, then the pause starts');
+  const blocked = await wrong();
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.headers['retry-after'], '1');
+  assert.deepEqual(blocked.json(), { error: 'Too Many Requests', message: 'Too many wrong keys; wait and try again' });
+  // Even the right key waits out the pause: otherwise the pause would not slow guessing down.
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
+  clock += 1001;
+  assert.equal((await wrong()).status, 401);
+  assert.equal((await wrong()).headers['retry-after'], '2', 'doubled');
+  clock += 2001;
+  assert.equal((await wrong()).status, 401);
+  assert.equal((await wrong()).headers['retry-after'], '4');
+  clock += 4001;
+  for (let i = 0; i < 6; i += 1) { await wrong(); clock += 31000; }
+  clock -= 31000;
+  assert.equal((await wrong()).headers['retry-after'], '30', 'never longer than 30 seconds');
+  clock += 31000;
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200, 'the right key works once the pause is over');
+  clock += 11 * 60 * 1000;
+  for (let i = 0; i < 5; i += 1) assert.equal((await wrong()).status, 401, 'forgotten after ten quiet minutes');
+});
+
+test('the sign-in form is slowed down the same way, and requests without a key count for nothing', async t => {
+  let clock = 1_000_000;
+  const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
+  for (let i = 0; i < 20; i += 1) assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
+  for (let i = 0; i < 5; i += 1) assert.equal((await request(base, 'POST', '/login', { form: { apiKey: 'wrong' } })).status, 401);
+  const blocked = await request(base, 'POST', '/login', { form: { apiKey: KEY } });
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.headers['retry-after'], '1');
+  assert.equal(blocked.headers['set-cookie'], undefined);
+  assert.match(blocked.text, /Too many wrong keys/);
+  assert.doesNotMatch(blocked.text, new RegExp(KEY));
+  clock += 1500;
+  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
+});
+
+// ---------------------------------------------------------------------------
+// Origins
+// ---------------------------------------------------------------------------
+
+test('server.publicOrigins adds exact origins to the same-host check; X-Forwarded-Host is not used', async t => {
+  const { base } = await boot(t, { scripts: forever(), extra: { ...AUTH, server: { publicOrigins: ['https://dash.example.test'] } } });
+  const cookie = await signIn(base);
+  const token = await pageToken(base, { cookie });
+  const post = headers => request(base, 'POST', '/settings', { headers: { cookie, ...headers }, form: { _csrf: token, retentionDays: '5' } });
+  // The proxy rewrote Host, but the page's origin is on the list.
+  assert.equal((await post({ origin: 'https://dash.example.test' })).status, 302);
+  assert.equal((await post({ origin: 'https://dash.example.test:8443' })).status, 403, 'other port');
+  assert.equal((await post({ origin: 'http://dash.example.test' })).status, 403, 'other scheme');
+  assert.equal((await post({ origin: 'https://other.example.test' })).status, 403);
+  assert.equal((await post({ origin: 'https://dash.example.test.evil.example' })).status, 403);
+  assert.equal((await post({ origin: EVIL, 'x-forwarded-host': 'evil.example' })).status, 403);
+  assert.equal((await post({ origin: 'https://other.example.test', 'x-forwarded-host': 'other.example.test' })).status, 403);
+  assert.equal((await post({ origin: base })).status, 302, 'same host still works');
+});
+
+test('Sec-Fetch-Site "none" and a cookie without any Origin do not pass for a state change', async t => {
+  const { base, saved } = await boot(t, { scripts: forever(), extra: AUTH });
+  const cookie = await signIn(base);
+  const token = await pageToken(base, { cookie });
+  const form = { _csrf: token, name: 'Added', type: 'forever', command: 'echo hi', sourceType: 'command' };
+  assert.equal((await request(base, 'POST', '/add-script', { headers: { cookie }, form })).status, 403, 'cookie, no Origin');
+  assert.equal((await request(base, 'POST', '/add-script', { headers: { cookie, 'sec-fetch-site': 'none' }, form })).status, 403);
+  assert.equal((await request(base, 'POST', '/add-script', { headers: { cookie, 'sec-fetch-site': 'same-site' }, form })).status, 403);
+  assert.equal(saved().scripts.length, 1);
+  assert.equal((await request(base, 'POST', '/add-script', { headers: { cookie, 'sec-fetch-site': 'same-origin' }, form })).status, 302, 'same-origin with no Origin header');
+});
+
+test('a log delete with a session needs the token header and this site\'s origin', async t => {
+  const { base, logsDir } = await boot(t, { scripts: forever(), extra: AUTH });
+  const cookie = await signIn(base);
+  const token = await pageToken(base, { cookie });
+  const file = 'Example%20Worker-out-1.log';
+  const url = `/api/logs/Example%20Worker/delete?file=${file}`;
+  fs.writeFileSync(path.join(logsDir, 'Example Worker-out-1.log'), 'x');
+  assert.equal((await request(base, 'DELETE', url, { headers: { cookie } })).status, 403, 'no Origin, no token');
+  assert.equal((await request(base, 'DELETE', url, { headers: { cookie, 'x-csrf-token': token } })).status, 403, 'token but no Origin');
+  assert.equal((await request(base, 'DELETE', url, { headers: { cookie, origin: base } })).status, 403, 'Origin but no token');
+  assert.equal((await request(base, 'DELETE', url, { headers: { cookie, origin: EVIL, 'x-csrf-token': token } })).status, 403);
+  assert.ok(fs.existsSync(path.join(logsDir, 'Example Worker-out-1.log')));
+  assert.equal((await request(base, 'DELETE', url, { headers: { cookie, origin: base, 'x-csrf-token': token } })).status, 200);
+  assert.equal(fs.existsSync(path.join(logsDir, 'Example Worker-out-1.log')), false);
+});
+
+test('the sign-in page does not send you back to itself', async t => {
+  const { base } = await boot(t, { extra: AUTH });
+  for (const next of ['/login', '/login?next=/scripts', '/login/x']) {
+    const res = await request(base, 'POST', '/login', { form: { apiKey: KEY, next } });
+    assert.equal(res.headers.location, '/scripts', next);
+  }
+  assert.equal(localPath('/loginfo'), '/scripts');
 });

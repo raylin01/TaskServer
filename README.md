@@ -173,6 +173,7 @@ server:
   host: "127.0.0.1"           # Loopback only by default, even when omitted
   logsDir: "./logs"            # Directory to store logs (default: ./logs)
   allowedHosts: []             # Extra Host names to serve when api.authEnabled is off (see Security)
+  publicOrigins: []            # Exact origins (https://dashboard.example.com) a browser may post from, for a proxy that rewrites Host
 
 # API Authentication (Optional, see Security)
 api:
@@ -222,19 +223,31 @@ locked down in layers.
 API key, except the sign-in page and the static files in `public/`. Requests that
 do not have it get a `401` (browsers are sent to `/login`).
 
+- `api.authEnabled` must be `true` or `false` (not `"true"` or `yes`), and `api.apiKey`
+  must be a string of at least 16 characters when auth is on. Generate one with
+  `openssl rand -base64 24`.
 - Programs send the key in the `X-API-Key` header. The key is **not** accepted in a
   URL (`?apiKey=` no longer works) and is compared in constant time.
-- The dashboard signs in at `/login` with the same key and then uses a signed,
-  `HttpOnly`, `SameSite=Strict` session cookie (7 days; changing the key ends every
-  session). Use "Log out" in the navigation to end it earlier.
-- If `config.yaml` becomes unreadable while TaskServer runs, the last good security
-  settings stay in force, and with none every request is refused.
+- After 5 wrong keys in a row from one address (in the header or at `/login`),
+  requests from it are refused with `429` for 1 s, then 2 s, 4 s and so on up to
+  30 s, even with the right key. Failures are forgotten after 10 quiet minutes.
+  Behind a proxy or tunnel every client has the proxy's address, so they share one
+  count.
+- The dashboard signs in at `/login` with the same key and then uses a random,
+  `HttpOnly`, `SameSite=Strict` session cookie (7 days). Sessions are kept in memory:
+  "Log out" ends one at once, and restarting TaskServer ends all of them. Changing
+  the key ends them too. The cookie and the CSRF token are not derived from the key.
+- If `config.yaml` goes missing, becomes empty, is cut off, or gets settings that
+  make no sense while TaskServer runs, the last good security settings stay in
+  force, and with none every request is refused. Config writes are atomic
+  (temporary file, flush, rename).
 
 **Requests from other web pages.** A page open in the same browser cannot make
 TaskServer do anything:
 
 - A state-changing request from a browser must come from the dashboard's own origin
-  (`Origin` or `Sec-Fetch-Site`) and carry the CSRF token the dashboard pages embed
+  (its `Origin` is this server's own `Host`, or is listed in `server.publicOrigins`;
+  `X-Forwarded-Host` is not used) and carry the CSRF token the dashboard pages embed
   (a hidden `_csrf` form field, or the `X-CSRF-Token` header).
 - A request with a valid `X-API-Key` header is exempt: a web page cannot add that
   header, and scripts such as GitSync send no `Origin`. A program that sends no
@@ -247,14 +260,39 @@ TaskServer do anything:
 - Pages are sent with a Content-Security-Policy that allows scripts only from
   TaskServer itself, plus `X-Frame-Options: DENY` and `X-Content-Type-Options: nosniff`.
 
-**Logs.** The log viewer only serves files in the logs folder named
-`<job>-out-...` or `<job>-error-...` for the job in the URL. Anything else is
-refused, for viewing, downloading and deleting.
+If TaskServer is behind a proxy that rewrites the `Host` header, list the address
+people open in `server.publicOrigins` (for example `https://dashboard.example.com`),
+or the dashboard's forms are refused with "Cross-site request refused".
 
-**Start-up checks.** TaskServer exits instead of starting when
-`config.yaml` cannot be parsed, when `api.authEnabled` is on with an empty
-`api.apiKey`, or when `server.host` is not a loopback address or the Cloudflare
-Tunnel is enabled while `api.authEnabled` is off.
+**Logs.** The log viewer only serves files in the logs folder named
+`<job>-out-<stamp>.log` or `<job>-error-<stamp>.log` for the job in the URL.
+Anything else is refused, for viewing, downloading and deleting. A file is opened
+without following links, and has to be a regular file with a single name
+(no symbolic link, hard link or named pipe).
+
+Dashboard pages that were open when TaskServer restarted carry an old CSRF token:
+reload them before submitting a form.
+
+**Start-up checks.** TaskServer exits instead of starting when `config.yaml`
+cannot be parsed, when `api.authEnabled` is not a boolean, when `api.apiKey` is not
+a string or (with auth on) is shorter than 16 characters, when `server.publicOrigins`
+or `server.allowedHosts` are malformed, or when `server.host` is not a loopback
+address or `cloudflare.enabled` is true while `api.authEnabled` is off. The message
+names the config key and the reason.
+
+### Recovering from a startup refusal
+
+PM2 keeps restarting a process that exits at start-up and then leaves it
+`errored`, so a refusal also stops anything that restarts TaskServer for you
+(for example a deploy tool calling `POST /api/restart-script/taskserver`: nothing is
+listening to answer it). To recover, on the host:
+
+1. Read the reason: `pm2 logs taskserver --lines 20` shows
+   `Refusing to start: ...`, naming the config key.
+2. Fix `config.yaml` (the reason says what to change).
+3. Run `pm2 restart taskserver` (use your `server.selfName` if you changed it).
+
+Jobs that were already running keep running while TaskServer is down.
 
 ## Script Types
 
