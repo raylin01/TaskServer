@@ -117,7 +117,7 @@ PM2 keeps running when TaskServer restarts, so jobs are normally already running
 | `launching`, `waiting restart`, `stopping` | Leaves it to PM2 |
 | `online`, but the config says `stopped: true` | Leaves it running and logs a warning. The dashboard shows the real state with a "marked stopped in config" note; press Stop to stop it for good |
 
-"Effective config" is compared against the running process itself: the executable, args, working directory, the env keys the job configures (by value), and `autorestart`, `max_restarts` and the restart delay. Log file paths and the kill timeout are ignored. An env key removed from the config is not noticed (PM2 mixes the starter's whole environment into the job's env, so a removed key cannot be told apart from an inherited one); it goes away on the next restart.
+"Effective config" is compared against the running process itself, in the form PM2 stores it. PM2 rewrites two shapes: a `path:` containing a space runs as `bash -c "<path>"` (any `args` are dropped by PM2), and a bare command such as `path: sleep` is looked up on `PATH`. TaskServer applies the same rewrite before comparing, so these jobs are adopted like any other. The compared fields are the executable, args, working directory, the env keys the job configures (by value), and `autorestart`, `max_restarts` and the restart delay. Log file paths and the kill timeout are ignored. An env key removed from the config is not noticed (PM2 mixes the starter's whole environment into the job's env, so a removed key cannot be told apart from an inherited one); it goes away on the next restart.
 
 ### Stopping jobs that need time to shut down
 
@@ -135,11 +135,13 @@ scripts:
     stopCommand: sudo -n python3 tunnel.py --stop   # optional, see below
 ```
 
-New processes are started with that `kill_timeout`. PM2 uses the value stored on the *running* process, so for a process started before this setting existed TaskServer itself signals the process tree first, waits up to the job's timeout for it to exit, and only then asks PM2 to stop it. This applies to Stop, Restart, Delete and a config-change restart done from TaskServer. It does not apply to `pm2 stop` typed in a terminal.
+New processes are started with that `kill_timeout`. PM2 uses the value stored on the *running* process, so for a process started before this setting existed TaskServer itself signals the process tree first, waits up to the job's timeout for it to exit, and only then asks PM2 to stop it. This applies to Stop, Restart, Delete and a config-change restart done from TaskServer. It does not apply to `pm2 stop` typed in a terminal. Changes to one job are applied one at a time (a GitSync restart, a click in the dashboard and the boot reconcile cannot step on each other); other jobs and the dashboard are not held up while a slow job shuts down.
+
+Assumptions behind the signalling, worth knowing for `sudo` wrappers: TaskServer sends the signal to the whole process tree, children first, the same way PM2 does. `sudo` relays `SIGINT` to its command when the signal comes from a process without a terminal, which is the case here, so the root child gets it. TaskServer runs as a normal user, so signalling a root-owned child directly fails with `EPERM`; that is expected and ignored (the signal reaches it through `sudo`). If a `sudo` setup does not relay the signal, use `stopCommand`.
 
 `stopCommand` (optional) runs through the shell, in the job's directory and env, before the stop. Its output is discarded, it gets the job's timeout, and a failure only logs a warning. Use it when a job needs more than a signal, for example `sudo -n ... --stop` (needs a sudoers entry).
 
-For `pm2 stop` or a PM2 daemon restart from a terminal to be safe too, set `PM2_KILL_SIGNAL` and `PM2_KILL_TIMEOUT` in the environment the PM2 daemon starts with (for macOS, the LaunchAgent plist's `EnvironmentVariables`).
+For `pm2 stop` or a PM2 daemon restart from a terminal to be safe too, set `PM2_KILL_SIGNAL` and `PM2_KILL_TIMEOUT` in the environment the PM2 daemon starts with (for macOS, the LaunchAgent plist's `EnvironmentVariables`). If you set `PM2_KILL_SIGNAL`, set it to the same value for TaskServer too: TaskServer sends that signal itself when it stops a job whose stored kill timeout is shorter than the job's, so a mismatch would make the two stop paths behave differently.
 
 ## PM2 Client and Errors
 
@@ -471,10 +473,12 @@ stopped entries whose names match an exact configured job name followed by
 number removed, and scan failures log the error message.
 
 The sweep runs in the background and never delays scheduling or launches: cron
-jobs are registered at boot, and the sweep works in chunks of 200 entries (at
+jobs are registered at boot, and the sweep itself starts only after the server
+is listening and the jobs are reconciled. It works in chunks of 50 entries (at
 most 1000 deletions per scan, with follow-up scans about a second apart while a
-backlog remains). Each chunk is a separate PM2 operation, so a launch waits for
-at most one chunk. Inside a chunk the status of each entry is rechecked from a list
+backlog remains). Each chunk is a separate PM2 operation, and anything already
+waiting (a launch, a job restart) runs between chunks, so it waits for at most
+one chunk. Inside a chunk the status of each entry is rechecked from a list
 that is at most 25 deletes old, so a run someone restarts meanwhile is not killed;
 an id that has already disappeared is skipped. Every PM2 call has a timeout, so a
 lost reply cannot block launches; after a timeout the PM2 client is replaced with a
