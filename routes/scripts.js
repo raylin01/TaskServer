@@ -58,23 +58,14 @@ function buildScriptFromRequest(body) {
   return script;
 }
 
-// API key authentication middleware (optional, configured in config.yaml)
-function apiAuth(req, res, next) {
-  const config = configHandler.loadConfig();
-  
-  // If auth is not enabled, skip authentication
-  if (!config.api?.authEnabled) {
-    return next();
-  }
-  
-  // Check for API key in header or query param
-  const apiKey = req.headers['x-api-key'] || req.query.apiKey;
-  
-  if (apiKey && apiKey === config.api.apiKey) {
-    return next();
-  }
-  
-  res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required' });
+// Authentication and the cross-site checks run once for every route, before
+// the router (see utils/security.js and createApp in server.js).
+
+// Bodies on /api are JSON. A form post or a text/plain body from a web page is
+// refused instead of being half-read.
+function requireJson(req, res, next) {
+  if (req.is('json')) return next();
+  res.status(415).json({ success: false, error: 'Send the request as application/json' });
 }
 
 // Home page - redirect to scripts
@@ -110,24 +101,37 @@ router.get('/scripts', wrap(async (req, res) => {
   });
 }));
 
+// The log file to show: the one asked for, else the newest. Reading it refuses
+// a file that is not one of this job's logs (403) and reports a missing one (404).
+const pickLog = (logs, requested) => requested || (logs.length ? logs[0].name : '');
+
 // View logs for a script
-router.get('/logs/:scriptName', (req, res) => {
+router.get('/logs/:scriptName', wrap(async (req, res) => {
   const scriptName = req.params.scriptName;
   const logs = logViewer.listLogs(scriptName);
-  const selectedLog = req.query.file || (logs.length ? logs[0].name : '');
-  const logContent = selectedLog ? logViewer.readLog(selectedLog) : '';
+  const selectedLog = pickLog(logs, req.query.file);
+  let logContent = '';
+  let notFound = false;
+  if (selectedLog) {
+    try {
+      logContent = logViewer.readLog(scriptName, selectedLog);
+    } catch (error) {
+      if (error.status !== 404) throw error;
+      notFound = true;
+    }
+  }
   const stats = logViewer.getLogStats(scriptName);
-  res.render('logs', { scriptName, logs, logContent, selectedLog, stats });
-});
+  res.status(notFound ? 404 : 200).render('logs', { scriptName, logs, logContent, selectedLog, stats, notFound });
+}));
 
 // API endpoint to fetch log content (for auto-refresh)
-router.get('/api/logs/:scriptName', (req, res) => {
+router.get('/api/logs/:scriptName', wrap(async (req, res) => {
   const scriptName = req.params.scriptName;
   const logs = logViewer.listLogs(scriptName);
-  const selectedLog = req.query.file || (logs.length ? logs[0].name : '');
-  const logContent = selectedLog ? logViewer.readLog(selectedLog) : '';
+  const selectedLog = pickLog(logs, req.query.file);
+  const logContent = selectedLog ? logViewer.readLog(scriptName, selectedLog) : '';
   res.json({ logs, logContent, selectedLog });
-});
+}));
 
 // API endpoint to fetch log stats (for auto-refresh detection)
 router.get('/api/logs/:scriptName/stats', (req, res) => {
@@ -137,78 +141,25 @@ router.get('/api/logs/:scriptName/stats', (req, res) => {
 });
 
 // API endpoint to fetch log chunks (for progressive loading)
-router.get('/api/logs/:scriptName/chunk', (req, res) => {
-  const scriptName = req.params.scriptName;
-  const filename = req.query.file;
-  
-  if (!filename) {
-    return res.status(400).json({ error: 'No file specified' });
-  }
-  
+router.get('/api/logs/:scriptName/chunk', wrap(async (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
   const limit = parseInt(req.query.limit) || 500;
   const fromEnd = req.query.fromEnd !== 'false'; // default true
-  
-  const result = logViewer.readLogChunk(filename, { offset, limit, fromEnd });
-  res.json(result);
-});
+
+  res.json(logViewer.readLogChunk(req.params.scriptName, req.query.file, { offset, limit, fromEnd }));
+}));
 
 // API endpoint to download log file
-router.get('/api/logs/:scriptName/download', (req, res) => {
-  const scriptName = req.params.scriptName;
-  const filename = req.query.file;
-
-  if (!filename) {
-    return res.status(400).send('No file specified');
-  }
-
-  // Security: use basename to prevent path traversal
-  const safeFilename = path.basename(filename);
-  if (safeFilename !== filename || !safeFilename.startsWith(scriptName)) {
-    return res.status(403).send('Access denied');
-  }
-
-  const fs = require('fs');
-  const logsDir = configHandler.getLogsDir();
-  const filePath = path.join(logsDir, safeFilename);
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).send('Log file not found');
-  }
-
-  res.download(filePath, safeFilename);
-});
+router.get('/api/logs/:scriptName/download', wrap(async (req, res) => {
+  const filePath = logViewer.resolveLogFile(req.params.scriptName, req.query.file);
+  res.download(filePath, req.query.file);
+}));
 
 // API endpoint to delete log file
-router.delete('/api/logs/:scriptName/delete', (req, res) => {
-  const scriptName = req.params.scriptName;
-  const filename = req.query.file;
-
-  if (!filename) {
-    return res.status(400).json({ success: false, error: 'No file specified' });
-  }
-
-  // Security: use basename to prevent path traversal
-  const safeFilename = path.basename(filename);
-  if (safeFilename !== filename || !safeFilename.startsWith(scriptName)) {
-    return res.status(403).json({ success: false, error: 'Access denied' });
-  }
-
-  const fs = require('fs');
-  const logsDir = configHandler.getLogsDir();
-  const filePath = path.join(logsDir, safeFilename);
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({ success: false, error: 'Log file not found' });
-  }
-
-  try {
-    fs.unlinkSync(filePath);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
+router.delete('/api/logs/:scriptName/delete', wrap(async (req, res) => {
+  logViewer.deleteLog(req.params.scriptName, req.query.file);
+  res.json({ success: true });
+}));
 
 // Add a new script (form)
 router.get('/add-script', (req, res) => {
@@ -437,11 +388,12 @@ router.post('/settings', (req, res) => {
 
 // =============================================================================
 // JSON API Endpoints (for programmatic access, e.g., from GitSync)
-// These endpoints return JSON instead of redirects and support API key auth
+// These endpoints return JSON instead of redirects. They are authenticated
+// like every other route (X-API-Key header when api.authEnabled is on).
 // =============================================================================
 
 // Restart a script (JSON API)
-router.post('/api/restart-script/:scriptName', apiAuth, wrap(async (req, res) => {
+router.post('/api/restart-script/:scriptName', wrap(async (req, res) => {
   const config = configHandler.loadConfig();
   const scriptName = req.params.scriptName;
 
@@ -491,7 +443,7 @@ router.post('/api/restart-script/:scriptName', apiAuth, wrap(async (req, res) =>
 }));
 
 // Stop a script (JSON API)
-router.post('/api/stop-script/:scriptName', apiAuth, wrap(async (req, res) => {
+router.post('/api/stop-script/:scriptName', wrap(async (req, res) => {
   const script = findForever(req.params.scriptName);
   if (!script) {
     return res.status(404).json({
@@ -509,7 +461,7 @@ router.post('/api/stop-script/:scriptName', apiAuth, wrap(async (req, res) => {
 }));
 
 // Start a script (JSON API)
-router.post('/api/start-script/:scriptName', apiAuth, wrap(async (req, res) => {
+router.post('/api/start-script/:scriptName', wrap(async (req, res) => {
   const script = findForever(req.params.scriptName);
   if (!script) {
     return res.status(404).json({
@@ -540,7 +492,7 @@ router.post('/api/start-script/:scriptName', apiAuth, wrap(async (req, res) => {
 }));
 
 // List all scripts (JSON API)
-router.get('/api/scripts', apiAuth, wrap(async (req, res) => {
+router.get('/api/scripts', wrap(async (req, res) => {
   const list = await processService(req).list();
   const config = configHandler.loadConfig();
 
@@ -563,7 +515,7 @@ router.get('/api/scripts', apiAuth, wrap(async (req, res) => {
 }));
 
 // Add a new script (JSON API)
-router.post('/api/add-script', apiAuth, wrap(async (req, res) => {
+router.post('/api/add-script', requireJson, wrap(async (req, res) => {
   const config = configHandler.loadConfig();
   const { name, path: scriptPath, command, type, schedule } = req.body;
   

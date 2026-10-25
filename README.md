@@ -22,6 +22,7 @@
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [Security](#security)
 - [Script Types](#script-types)
 - [Web Dashboard](#web-dashboard)
 - [Cloudflare Tunnel Setup](#cloudflare-tunnel-setup)
@@ -100,7 +101,7 @@ To enable this:
     ```
 3.  **Configure GitSync**: Add TaskServer to your GitSync config (see GitSync docs).
 
-When updated, GitSync calls `POST /api/restart-script/taskserver` (with the `X-API-Key` header when `api.authEnabled` is on). TaskServer answers first, then asks PM2 to restart it, so the caller always gets a clean reply. The PM2 name it restarts is `server.selfName` (default `taskserver`).
+When updated, GitSync calls `POST /api/restart-script/taskserver` (with the `X-API-Key` header when `api.authEnabled` is on; see [Security](#security)). TaskServer answers first, then asks PM2 to restart it, so the caller always gets a clean reply. The PM2 name it restarts is `server.selfName` (default `taskserver`).
 
 On `SIGINT` or `SIGTERM` TaskServer closes its own listener and exits within a second. It never stops the jobs it manages. If the port is still held by the previous instance it logs that, retries with a growing pause (about 20 s in total), then exits with an error.
 
@@ -171,6 +172,12 @@ server:
   port: 3000                   # Web interface port (default: 3000)
   host: "127.0.0.1"           # Loopback only by default, even when omitted
   logsDir: "./logs"            # Directory to store logs (default: ./logs)
+  allowedHosts: []             # Extra Host names to serve when api.authEnabled is off (see Security)
+
+# API Authentication (Optional, see Security)
+api:
+  authEnabled: false
+  apiKey: ""
 
 # PM2 Settings (Optional)
 pm2:
@@ -203,9 +210,51 @@ scripts:
 
 TaskServer binds to `127.0.0.1` by default, including existing configurations
 without `server.host`. To allow LAN access, explicitly set `server.host: "0.0.0.0"`
-(all IPv4 interfaces). This exposes the dashboard and script-control endpoints to
-other machines. The dashboard has no login and API authentication is optional;
-only enable LAN access on a trusted, appropriately firewalled network.
+(all IPv4 interfaces); TaskServer then refuses to start unless `api.authEnabled`
+is on (see [Security](#security)).
+
+## Security
+
+Anything that can reach TaskServer can run commands on the machine, so it is
+locked down in layers.
+
+**One check for every route.** With `api.authEnabled: true` every route needs the
+API key, except the sign-in page and the static files in `public/`. Requests that
+do not have it get a `401` (browsers are sent to `/login`).
+
+- Programs send the key in the `X-API-Key` header. The key is **not** accepted in a
+  URL (`?apiKey=` no longer works) and is compared in constant time.
+- The dashboard signs in at `/login` with the same key and then uses a signed,
+  `HttpOnly`, `SameSite=Strict` session cookie (7 days; changing the key ends every
+  session). Use "Log out" in the navigation to end it earlier.
+- If `config.yaml` becomes unreadable while TaskServer runs, the last good security
+  settings stay in force, and with none every request is refused.
+
+**Requests from other web pages.** A page open in the same browser cannot make
+TaskServer do anything:
+
+- A state-changing request from a browser must come from the dashboard's own origin
+  (`Origin` or `Sec-Fetch-Site`) and carry the CSRF token the dashboard pages embed
+  (a hidden `_csrf` form field, or the `X-CSRF-Token` header).
+- A request with a valid `X-API-Key` header is exempt: a web page cannot add that
+  header, and scripts such as GitSync send no `Origin`. A program that sends no
+  `Origin` and no cookie is treated as a script and is only let through when
+  authentication is off.
+- `/api` takes JSON. `POST /api/add-script` answers `415` to anything but
+  `application/json`.
+- With authentication off, only `localhost`, `127.0.0.1`, `[::1]` and the names in
+  `server.allowedHosts` are served (protection against DNS rebinding).
+- Pages are sent with a Content-Security-Policy that allows scripts only from
+  TaskServer itself, plus `X-Frame-Options: DENY` and `X-Content-Type-Options: nosniff`.
+
+**Logs.** The log viewer only serves files in the logs folder named
+`<job>-out-...` or `<job>-error-...` for the job in the URL. Anything else is
+refused, for viewing, downloading and deleting.
+
+**Start-up checks.** TaskServer exits instead of starting when
+`config.yaml` cannot be parsed, when `api.authEnabled` is on with an empty
+`api.apiKey`, or when `server.host` is not a loopback address or the Cloudflare
+Tunnel is enabled while `api.authEnabled` is off.
 
 ## Script Types
 
@@ -392,8 +441,9 @@ Configure the named tunnel's origin service in Cloudflare as
 the address TaskServer actually bound to: `127.0.0.1` by default, `[::1]` for
 `host: "::1"`, loopback for wildcard binds (`0.0.0.0`, `::`), and the configured
 address otherwise. The default loopback bind works without LAN exposure.
-Protect public access with Cloudflare Access; a tunnel alone does not add a
-TaskServer dashboard login.
+TaskServer will not start with the tunnel enabled unless `api.authEnabled` is on
+with an `api.apiKey`: visitors then sign in with that key (see [Security](#security)).
+Cloudflare Access in front of it is still a good idea.
 
 ### Step 3: Start Your Server
 
@@ -531,14 +581,15 @@ TaskServer provides REST API endpoints for programmatic access.
 
 ### JSON API (Programmatic Access)
 
-These endpoints return JSON and support optional API key authentication:
+These endpoints return JSON. When `api.authEnabled` is on they, like every other route, need the API key:
 
 - `GET /api/scripts` - List all scripts with status as JSON
 - `POST /api/restart-script/:scriptName` - Restart a forever script
 - `POST /api/stop-script/:scriptName` - Stop a forever script
 - `POST /api/start-script/:scriptName` - Start a forever script
+- `POST /api/add-script` - Add a script (JSON body)
 
-**Authentication** (optional):
+**Authentication** (optional, see [Security](#security)):
 
 Enable in `config.yaml`:
 ```yaml
@@ -547,20 +598,17 @@ api:
   apiKey: "your-secret-key"
 ```
 
-Include the API key in requests:
+Send the API key in the `X-API-Key` header (it is not accepted in a URL):
 ```bash
-# Via header
 curl -X POST http://localhost:3000/api/restart-script/myScript \
   -H "X-API-Key: your-secret-key"
-
-# Via query parameter
-curl -X POST "http://localhost:3000/api/restart-script/myScript?apiKey=your-secret-key"
 ```
 
 ### Logs
 
 - `GET /logs/:scriptName` - View logs page
 - `GET /api/logs/:scriptName` - Get logs as JSON
+- `GET /api/logs/:scriptName/chunk?file=filename` - Get a part of one log file
 - `GET /api/logs/:scriptName/download?file=filename` - Download log file
 - `DELETE /api/logs/:scriptName/delete?file=filename` - Delete log file
 
@@ -699,7 +747,8 @@ TaskServer/
 ├── package.json           # Dependencies
 ├── logs/                  # Log files directory
 ├── public/               # Static assets
-│   └── styles.css        # Dashboard styles
+│   ├── styles.css        # Dashboard styles
+│   └── *.js              # Dashboard scripts (no inline scripts: the CSP forbids them)
 ├── routes/               # Express routes
 │   └── scripts.js        # Script management routes
 ├── scripts/              # Your scripts go here
@@ -711,7 +760,8 @@ TaskServer/
 │   ├── jobSpec.js        # PM2 config for a job; compare config with a running process
 │   ├── jobControl.js     # Start/stop/replace jobs, slow-shutdown handling
 │   ├── reconcile.js      # Boot-time adoption of running jobs
-│   ├── logViewer.js      # Log management
+│   ├── logViewer.js      # Log listing and reading, limited to the job's own log files
+│   ├── security.js       # Authentication, sign-in, CSRF and Host checks, start-up checks
 │   ├── logCleanup.js     # Automatic log cleanup
 │   └── cloudflareTunnel.js # Cloudflare Tunnel integration
 └── views/                # EJS templates
@@ -743,5 +793,7 @@ This project is licensed under the MIT License.
 If you encounter any issues or have questions, please open an issue on GitHub.
 
 ## Tests
+
+Dependencies are installed with `bun install` (`bun.lock` is the only lockfile). `pm2` is pinned to the daemon version, and `package.json` `overrides` pin patched releases of packages that PM2 and Express pull in; check `bun audit` before changing them.
 
 Run `bun run test` (or `npm test`) with Node.js 18 or newer (uses the built-in `node --test` runner). The PM2 contract test runs a real PM2 core in a private temp directory; it never touches your PM2.

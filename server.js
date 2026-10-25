@@ -14,16 +14,28 @@ const { createProcessService, errorText } = require('./utils/processService');
 const { createJobControl } = require('./utils/jobControl');
 const { reconcileWithRetry, checkPm2Versions } = require('./utils/reconcile');
 const { errorMiddleware, installProcessHandlers } = require('./utils/httpErrors');
+const { createSecurity, listenProblems } = require('./utils/security');
 const scriptsRouter = require('./routes/scripts');
 
-function createApp({ processService, jobControl, cronManager } = {}) {
+function createApp({ processService, jobControl, cronManager, security = createSecurity() } = {}) {
   if (!processService) throw new Error('createApp needs a processService');
   const app = express();
   app.set('view engine', 'ejs');
   app.set('views', path.join(__dirname, 'views'));
+
+  // Order matters. Everything below the static files and the login page is
+  // behind the authentication check, and nothing reads a request body before it.
+  app.use(security.headers);
   app.use(express.static(path.join(__dirname, 'public')));
-  app.use(bodyParser.urlencoded({ extended: true }));
+  app.use(security.hostGuard);
+  app.use(security.loginRouter);
+  app.use(security.authenticate);
+  // Forms are only for the dashboard pages; /api takes JSON.
+  const forms = bodyParser.urlencoded({ extended: true });
+  app.use((req, res, next) => (req.path.startsWith('/api/') ? next() : forms(req, res, next)));
   app.use(bodyParser.json());
+  app.use(security.csrfGuard);
+  app.use(security.sessionRouter);
 
   app.locals.processService = processService;
   app.locals.jobControl = jobControl || createJobControl({ service: processService });
@@ -81,7 +93,20 @@ function listenWithRetry(app, port, host, {
 }
 
 async function main() {
-  const config = configHandler.loadConfig();
+  // Do not start with settings that cannot be read, or that would expose the
+  // dashboard without a key.
+  let config;
+  try {
+    config = configHandler.loadConfigStrict();
+  } catch (error) {
+    console.error(`Refusing to start: ${error.message}`);
+    process.exit(1);
+  }
+  const problems = listenProblems(config);
+  if (problems.length) {
+    for (const problem of problems) console.error(`Refusing to start: ${problem}`);
+    process.exit(1);
+  }
   let closing = false;
 
   // Setup automatic log cleanup if enabled

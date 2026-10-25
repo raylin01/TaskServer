@@ -5,14 +5,7 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header>
-    <h1>TaskServer</h1>
-    <nav>
-      <a href="/scripts">Scripts</a> |
-      <a href="/add-script">Add Script</a> |
-      <a href="/settings">Settings</a>
-    </nav>
-  </header>
+  <%- include('partials/nav') %>
   <main>
     <h2>⚙️ Settings</h2>
     
@@ -21,6 +14,7 @@
     <% } %>
     
     <form method="post" action="/settings" class="script-form">
+      <%- include('partials/csrf-field') %>
       <h3>Log Management</h3>
       
       <div class="form-group">
@@ -55,9 +49,9 @@
                value="<%= logManagement.checkInterval %>" required>
         <small>How often to check for old logs (default: 3600000ms = 1 hour)</small>
         <div class="interval-helpers">
-          <button type="button" onclick="setInterval(3600000)">1 Hour</button>
-          <button type="button" onclick="setInterval(21600000)">6 Hours</button>
-          <button type="button" onclick="setInterval(86400000)">24 Hours</button>
+          <button type="button" data-interval="3600000">1 Hour</button>
+          <button type="button" data-interval="21600000">6 Hours</button>
+          <button type="button" data-interval="86400000">24 Hours</button>
         </div>
       </div>
 
@@ -81,10 +75,6 @@
     <small>&copy; 2025 TaskServer</small>
   </footer>
 
-  <script>
-    function setInterval(ms) {
-      document.getElementById('checkInterval').value = ms;
-    }
-  </script>
+  <script src="/settings.js"></script>
 </body>
 </html>

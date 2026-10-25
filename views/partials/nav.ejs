@@ -1,0 +1,15 @@
+<header>
+  <h1>TaskServer</h1>
+  <nav>
+    <a href="/scripts">Scripts</a> |
+    <a href="/add-script">Add Script</a> |
+    <a href="/settings">Settings</a>
+    <% if (typeof authEnabled !== 'undefined' && authEnabled) { %>
+      |
+      <form method="post" action="/logout" class="nav-form">
+        <%- include('csrf-field') %>
+        <button type="submit" class="nav-link">Log out</button>
+      </form>
+    <% } %>
+  </nav>
+</header>

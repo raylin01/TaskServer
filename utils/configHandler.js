@@ -33,25 +33,52 @@ const DEFAULT_CONFIG = {
   scripts: []
 };
 
+function withDefaults(userConfig) {
+  // Deep merge with defaults (simple version for this depth)
+  const config = { ...DEFAULT_CONFIG, ...userConfig };
+  config.logManagement = { ...DEFAULT_CONFIG.logManagement, ...(userConfig.logManagement || {}) };
+  config.server = { ...DEFAULT_CONFIG.server, ...(userConfig.server || {}) };
+  config.server.host = config.server.host || DEFAULT_CONFIG.server.host;
+  config.pm2 = { ...DEFAULT_CONFIG.pm2, ...(userConfig.pm2 || {}) };
+
+  // Ensure scripts exists
+  config.scripts = userConfig.scripts || [];
+
+  return config;
+}
+
 function loadConfig() {
   try {
     const file = fs.readFileSync(getConfigPath(), 'utf8');
-    const userConfig = yaml.load(file) || {};
-    
-    // Deep merge with defaults (simple version for this depth)
-    const config = { ...DEFAULT_CONFIG, ...userConfig };
-    config.logManagement = { ...DEFAULT_CONFIG.logManagement, ...(userConfig.logManagement || {}) };
-    config.server = { ...DEFAULT_CONFIG.server, ...(userConfig.server || {}) };
-    config.server.host = config.server.host || DEFAULT_CONFIG.server.host;
-    config.pm2 = { ...DEFAULT_CONFIG.pm2, ...(userConfig.pm2 || {}) };
-    
-    // Ensure scripts exists
-    config.scripts = userConfig.scripts || [];
-    
-    return config;
+    return withDefaults(yaml.load(file) || {});
   } catch (e) {
     console.error('Failed to load config.yaml:', e);
     return DEFAULT_CONFIG;
+  }
+}
+
+// Where a YAML error is, without the offending text: that can hold secrets.
+function describeParseError(error) {
+  const mark = error?.mark;
+  const where = mark ? ` at line ${mark.line + 1}, column ${mark.column + 1}` : '';
+  return `${error?.reason || 'invalid YAML'}${where}`;
+}
+
+// Like loadConfig, but a config file that cannot be read or parsed is an error
+// instead of an empty config. A missing file is still the defaults. The
+// security checks use this, so a typo can never switch authentication off.
+function loadConfigStrict() {
+  let file;
+  try {
+    file = fs.readFileSync(getConfigPath(), 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return DEFAULT_CONFIG;
+    throw new Error(`Could not read config.yaml: ${error.code || 'read error'}`);
+  }
+  try {
+    return withDefaults(yaml.load(file) || {});
+  } catch (error) {
+    throw new Error(`config.yaml is not valid YAML: ${describeParseError(error)}`);
   }
 }
 
@@ -87,4 +114,4 @@ function getSelfName(config = loadConfig()) {
   return config.server?.selfName || 'taskserver';
 }
 
-module.exports = { loadConfig, writeConfig, ensureLogDir, getLogsDir, getSelfName };
+module.exports = { loadConfig, loadConfigStrict, writeConfig, ensureLogDir, getLogsDir, getSelfName };
