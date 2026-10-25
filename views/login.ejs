@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>TaskServer - Sign in</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <h1>TaskServer</h1>
+  </header>
+  <main>
+    <h2>Sign in</h2>
+    <% if (error) { %>
+      <div class="alert alert-error"><%= error %></div>
+    <% } %>
+    <form method="post" action="/login" class="script-form">
+      <input type="hidden" name="next" value="<%= next %>">
+      <div class="form-group">
+        <label for="apiKey">API key</label>
+        <input type="password" id="apiKey" name="apiKey" required autofocus autocomplete="current-password">
+        <small>The <code>api.apiKey</code> value from config.yaml</small>
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="btn-primary">Sign in</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

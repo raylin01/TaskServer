@@ -85,7 +85,7 @@ test('dashboard still renders when PM2 is unreachable, and says the state is unk
 
 test('API with auth on: GitSync restarting TaskServer needs the header key and gets its reply before the restart', async t => {
   const { base, pm2 } = await boot(t, {
-    extra: { api: { authEnabled: true, apiKey: 'test-key-123' } },
+    extra: { api: { authEnabled: true, apiKey: 'test-key-1234567890' } },
     setupPm2: pm2 => pm2.add({ name: 'taskserver', script: 'server.js', cwd: os.tmpdir() }),
   });
   assert.equal((await request(base, 'POST', '/api/restart-script/taskserver')).status, 401);
@@ -93,7 +93,7 @@ test('API with auth on: GitSync restarting TaskServer needs the header key and g
   await sleep(150);
   assert.equal(pm2.calls.some(c => c[0] === 'restart'), false, 'nothing restarts without a valid key');
 
-  const res = await request(base, 'POST', '/api/restart-script/taskserver', { headers: { 'x-api-key': 'test-key-123' } });
+  const res = await request(base, 'POST', '/api/restart-script/taskserver', { headers: { 'x-api-key': 'test-key-1234567890' } });
   assert.equal(res.status, 200);
   assert.equal(res.json().success, true);
   assert.equal(res.headers.connection, 'close');

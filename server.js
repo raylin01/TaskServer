@@ -14,16 +14,28 @@ const { createProcessService, errorText } = require('./utils/processService');
 const { createJobControl } = require('./utils/jobControl');
 const { reconcileWithRetry, checkPm2Versions } = require('./utils/reconcile');
 const { errorMiddleware, installProcessHandlers } = require('./utils/httpErrors');
+const { createSecurity, createAuthSource, listenProblems } = require('./utils/security');
 const scriptsRouter = require('./routes/scripts');
 
-function createApp({ processService, jobControl, cronManager } = {}) {
+function createApp({ processService, jobControl, cronManager, security = createSecurity() } = {}) {
   if (!processService) throw new Error('createApp needs a processService');
   const app = express();
   app.set('view engine', 'ejs');
   app.set('views', path.join(__dirname, 'views'));
+
+  // Order matters. Everything below the static files and the login page is
+  // behind the authentication check, and nothing reads a request body before it.
+  app.use(security.headers);
   app.use(express.static(path.join(__dirname, 'public')));
-  app.use(bodyParser.urlencoded({ extended: true }));
+  app.use(security.hostGuard);
+  app.use(security.loginRouter);
+  app.use(security.authenticate);
+  // Forms are only for the dashboard pages; /api takes JSON.
+  const forms = bodyParser.urlencoded({ extended: true });
+  app.use((req, res, next) => (req.path.startsWith('/api/') ? next() : forms(req, res, next)));
   app.use(bodyParser.json());
+  app.use(security.csrfGuard);
+  app.use(security.sessionRouter);
 
   app.locals.processService = processService;
   app.locals.jobControl = jobControl || createJobControl({ service: processService });
@@ -80,8 +92,25 @@ function listenWithRetry(app, port, host, {
   });
 }
 
+// Say exactly why, and how to recover: PM2 keeps restarting a process that exits
+// like this, and then leaves it "errored".
+function refuseToStart(problems, selfName) {
+  for (const problem of problems) console.error(`Refusing to start: ${problem}`);
+  console.error(`Fix config.yaml, then run: pm2 restart ${selfName}   (see "Recovering from a startup refusal" in the README)`);
+  process.exit(1);
+}
+
 async function main() {
-  const config = configHandler.loadConfig();
+  // Do not start with settings that cannot be read, or that would expose the
+  // dashboard without a key.
+  let config;
+  try {
+    config = configHandler.loadConfigStrict();
+  } catch (error) {
+    refuseToStart([error.message], configHandler.getSelfName({}));
+  }
+  const problems = listenProblems(config);
+  if (problems.length) refuseToStart(problems, configHandler.getSelfName(config));
   let closing = false;
 
   // Setup automatic log cleanup if enabled
@@ -100,7 +129,10 @@ async function main() {
   const cronManager = createCronManager({ service: processService });
   cronManager.bootstrap(config.scripts, { cleanup: false });
 
-  const app = createApp({ processService, jobControl, cronManager });
+  // The security settings start from the config checked above, so there is no
+  // moment at which a missing or empty file could count as "no authentication".
+  const security = createSecurity({ loadAuth: createAuthSource({ seed: config }) });
+  const app = createApp({ processService, jobControl, cronManager, security });
   let server = null;
 
   // PM2 keeps running while TaskServer restarts, so shutting down only closes

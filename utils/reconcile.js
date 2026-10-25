@@ -167,19 +167,39 @@ async function reconcileJobs({
   return summary;
 }
 
-// PM2 may not be reachable the moment TaskServer starts. Try again, with a
-// growing pause, until it works or `isClosed()` says to stop. Only "PM2 is not
-// reachable" is retried; any other failure is thrown to the caller, which logs
-// it as it is.
-async function reconcileWithRetry({ isClosed = () => false, sleep, initialDelayMs = 1000, maxDelayMs = 15000, logger = console, ...options }) {
+// PM2 may not be reachable the moment TaskServer starts (a cold boot starts
+// both at once). Try again, with a growing pause, until it works or
+// `isClosed()` says to stop.
+//  - "PM2 is not reachable" is retried for as long as it lasts.
+//  - Any other failure can also be a daemon that is still coming up and
+//    answers with something unexpected, so it is retried too, but only
+//    `maxOtherRetries` times; after that the error goes to the caller, which
+//    logs it as it is. A pass that already handled some jobs is safe to repeat:
+//    those jobs are then simply adopted.
+async function reconcileWithRetry({
+  isClosed = () => false,
+  sleep,
+  initialDelayMs = 1000,
+  maxDelayMs = 15000,
+  maxOtherRetries = 5,
+  logger = console,
+  ...options
+}) {
   const wait = sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
   let delay = initialDelayMs;
+  let otherFailures = 0;
   while (!isClosed()) {
     try {
       return await reconcileJobs({ logger, ...options });
     } catch (error) {
-      if (!isUnavailable(error)) throw error;
-      logger.error?.(`[Reconcile] PM2 is not ready (${errorText(error)}); retrying in ${delay} ms`);
+      if (!isUnavailable(error)) {
+        otherFailures += 1;
+        if (otherFailures > maxOtherRetries) throw error;
+        logger.error?.(`[Reconcile] Unexpected error (${errorText(error)}); `
+          + `retrying in ${delay} ms (${otherFailures}/${maxOtherRetries})`);
+      } else {
+        logger.error?.(`[Reconcile] PM2 is not ready (${errorText(error)}); retrying in ${delay} ms`);
+      }
       await wait(delay);
       delay = Math.min(delay * 2, maxDelayMs);
     }

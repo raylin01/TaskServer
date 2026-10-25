@@ -12,10 +12,10 @@ const PM2 = { maxRestarts: 10000, autoRestart: true, restartDelay: 1000, killTim
 // path, and a sudo-wrapped runner.
 function scripts() {
   return [
-    { name: 'DNS', type: 'forever', command: 'python3 dns.py --serve', cwd: '/srv/dns', env: { DNS_PORT: 53, SECRET_TOKEN: 'hunter2' } },
-    { name: 'DDNS', type: 'forever', command: 'node ddns.js', cwd: '/srv/ddns' },
-    { name: 'WireGuard Helper', type: 'forever', command: 'sudo -n python3 helper.py', cwd: '/srv/wg', killTimeoutMs: 30000 },
-    { name: 'Worker', type: 'forever', path: './worker.js', args: ['--fast', 7], cwd: '/srv/worker', env: { DEBUG: true, EMPTY: '', NOTHING: null, NESTED: { a: [1, 2] } } },
+    { name: 'Example DNS', type: 'forever', command: 'python3 dns.py --serve', cwd: '/srv/example-dns', env: { DNS_PORT: 53, SECRET_TOKEN: 'hunter2' } },
+    { name: 'Example DDNS', type: 'forever', command: 'node ddns.js', cwd: '/srv/example-ddns' },
+    { name: 'Example Helper', type: 'forever', command: 'sudo -n python3 helper.py', cwd: '/srv/example-helper', killTimeoutMs: 30000 },
+    { name: 'Example Worker', type: 'forever', path: './worker.js', args: ['--fast', 7], cwd: '/srv/worker', env: { DEBUG: true, EMPTY: '', NOTHING: null, NESTED: { a: [1, 2] } } },
     { name: 'Nightly', type: 'cron', command: 'node nightly.js', schedule: '0 3 * * *' },
   ];
 }
@@ -37,7 +37,7 @@ test('deploy: jobs started by the previous TaskServer are all adopted and nothin
   const { pm2, logger, run } = setup(t);
   const summary = await run();
   assert.deepEqual(pm2.mutations(), [], 'no start, stop, delete or restart call at all');
-  assert.deepEqual(summary.adopted.sort(), ['DDNS', 'DNS', 'WireGuard Helper', 'Worker']);
+  assert.deepEqual(summary.adopted.sort(), ['Example DDNS', 'Example DNS', 'Example Helper', 'Example Worker']);
   assert.equal(summary.restarted.length + summary.started.length, 0);
   assert.match(logger.logs.at(-1), /4 adopted, 0 started, 0 restarted/);
 });
@@ -58,11 +58,11 @@ test('a changed command restarts only that job, and the log names the field but 
   config.scripts[1].command = 'node ddns.js --verbose';
   const before = pm2.procs.map(p => `${p.name}:${p.pid}`);
   const summary = await run();
-  assert.deepEqual(summary.restarted, ['DDNS']);
-  assert.deepEqual(pm2.mutations().map(([m, name]) => `${m}:${name}`), ['delete:DDNS', 'start:DDNS']);
+  assert.deepEqual(summary.restarted, ['Example DDNS']);
+  assert.deepEqual(pm2.mutations().map(([m, name]) => `${m}:${name}`), ['delete:Example DDNS', 'start:Example DDNS']);
   const after = pm2.procs.map(p => `${p.name}:${p.pid}`);
-  assert.deepEqual(after.filter(x => !x.startsWith('DDNS:')).sort(), before.filter(x => !x.startsWith('DDNS:')).sort());
-  const line = logger.logs.find(l => l.includes('Restarted DDNS'));
+  assert.deepEqual(after.filter(x => !x.startsWith('Example DDNS:')).sort(), before.filter(x => !x.startsWith('Example DDNS:')).sort());
+  const line = logger.logs.find(l => l.includes('Restarted Example DDNS'));
   assert.match(line, /changed args/);
   assert.doesNotMatch(logger.logs.join('\n'), /--verbose/);
 });
@@ -71,7 +71,7 @@ test('env changes are detected by key and never logged by value', async t => {
   const { logger, config, run } = setup(t);
   config.scripts[0].env = { DNS_PORT: 53, SECRET_TOKEN: 'rotated-secret-value' };
   const summary = await run();
-  assert.deepEqual(summary.restarted, ['DNS']);
+  assert.deepEqual(summary.restarted, ['Example DNS']);
   const text = [...logger.logs, ...logger.warns, ...logger.errors].join('\n');
   assert.match(text, /env\.SECRET_TOKEN/);
   assert.doesNotMatch(text, /rotated-secret-value|hunter2/);
@@ -82,15 +82,15 @@ test('an added env key, a new cwd and a new exec path each count as a change', a
   const [dns, , , worker] = config.scripts;
   const spec = script => buildPm2Config(script, PM2, LOGS);
   const running = name => pm2.procs.find(p => p.name === name);
-  assert.deepEqual(diffJob(spec({ ...dns, env: { ...dns.env, NEW_KEY: '1' } }), running('DNS')), ['env.NEW_KEY']);
-  assert.deepEqual(diffJob(spec({ ...dns, cwd: '/srv/elsewhere' }), running('DNS')), ['cwd']);
-  assert.deepEqual(diffJob(spec({ ...worker, path: './other.js' }), running('Worker')), ['exec path']);
+  assert.deepEqual(diffJob(spec({ ...dns, env: { ...dns.env, NEW_KEY: '1' } }), running('Example DNS')), ['env.NEW_KEY']);
+  assert.deepEqual(diffJob(spec({ ...dns, cwd: '/srv/elsewhere' }), running('Example DNS')), ['cwd']);
+  assert.deepEqual(diffJob(spec({ ...worker, path: './other.js' }), running('Example Worker')), ['exec path']);
 });
 
 test('settings that change how PM2 supervises count; log paths and kill timeout do not', async t => {
   const { pm2, config } = setup(t);
   const dns = config.scripts[0];
-  const proc = pm2.procs.find(p => p.name === 'DNS');
+  const proc = pm2.procs.find(p => p.name === 'Example DNS');
   const withSettings = settings => buildPm2Config(dns, { ...PM2, ...settings }, LOGS);
   assert.deepEqual(diffJob(withSettings({ restartDelay: 2000 }), proc), ['exp_backoff_restart_delay']);
   assert.deepEqual(diffJob(withSettings({ maxRestarts: 5 }), proc), ['max_restarts']);
@@ -102,29 +102,29 @@ test('settings that change how PM2 supervises count; log paths and kill timeout 
 test('env values compare the way PM2 stores them (numbers, booleans, null, objects)', async t => {
   const { pm2, config } = setup(t);
   const worker = config.scripts[3];
-  assert.deepEqual(diffJob(buildPm2Config(worker, PM2, LOGS), pm2.procs.find(p => p.name === 'Worker')), []);
+  assert.deepEqual(diffJob(buildPm2Config(worker, PM2, LOGS), pm2.procs.find(p => p.name === 'Example Worker')), []);
 });
 
 test('missing, stopped and errored jobs are started; a job marked stopped is not', async t => {
   const { pm2, config, run } = setup(t);
-  pm2.procs.splice(pm2.procs.findIndex(p => p.name === 'DNS'), 1);
-  pm2.procs.find(p => p.name === 'DDNS').pm2_env.status = 'stopped';
-  pm2.procs.find(p => p.name === 'WireGuard Helper').pm2_env.status = 'errored';
+  pm2.procs.splice(pm2.procs.findIndex(p => p.name === 'Example DNS'), 1);
+  pm2.procs.find(p => p.name === 'Example DDNS').pm2_env.status = 'stopped';
+  pm2.procs.find(p => p.name === 'Example Helper').pm2_env.status = 'errored';
   config.scripts[3].stopped = true;
-  pm2.procs.find(p => p.name === 'Worker').pm2_env.status = 'stopped';
+  pm2.procs.find(p => p.name === 'Example Worker').pm2_env.status = 'stopped';
   const summary = await run();
-  assert.deepEqual(summary.started.sort(), ['DDNS', 'DNS', 'WireGuard Helper']);
-  assert.deepEqual(summary.skipped, ['Worker']);
-  assert.equal(pm2.procs.find(p => p.name === 'Worker').pm2_env.status, 'stopped');
+  assert.deepEqual(summary.started.sort(), ['Example DDNS', 'Example DNS', 'Example Helper']);
+  assert.deepEqual(summary.skipped, ['Example Worker']);
+  assert.equal(pm2.procs.find(p => p.name === 'Example Worker').pm2_env.status, 'stopped');
 });
 
 test('jobs PM2 is already restarting are left alone', async t => {
   const { pm2, run } = setup(t);
-  for (const [name, status] of [['DNS', 'waiting restart'], ['DDNS', 'launching'], ['Worker', 'stopping']]) {
+  for (const [name, status] of [['Example DNS', 'waiting restart'], ['Example DDNS', 'launching'], ['Example Worker', 'stopping']]) {
     pm2.procs.find(p => p.name === name).pm2_env.status = status;
   }
   const summary = await run();
-  assert.deepEqual(summary.left.sort(), ['DDNS', 'DNS', 'Worker']);
+  assert.deepEqual(summary.left.sort(), ['Example DDNS', 'Example DNS', 'Example Worker']);
   assert.deepEqual(pm2.mutations(), []);
 });
 
@@ -133,8 +133,8 @@ test('a job that is online although the config says stopped keeps running, with 
   config.scripts[1].stopped = true;
   await run();
   assert.deepEqual(pm2.mutations(), []);
-  assert.equal(pm2.procs.find(p => p.name === 'DDNS').pm2_env.status, 'online');
-  assert.ok(logger.warns.some(w => w.includes('DDNS') && w.includes('marked stopped')));
+  assert.equal(pm2.procs.find(p => p.name === 'Example DDNS').pm2_env.status, 'online');
+  assert.ok(logger.warns.some(w => w.includes('Example DDNS') && w.includes('marked stopped')));
 });
 
 test('processes that are not in the config, and cron runs, are never touched', async t => {
@@ -151,7 +151,7 @@ test('one job failing does not stop the others; PM2 going away aborts the pass',
   config.scripts[1].command = 'changed too';
   pm2.state.startError = new Error('spawn failed');
   const summary = await run();
-  assert.deepEqual(summary.failed.sort(), ['DDNS', 'DNS']);
+  assert.deepEqual(summary.failed.sort(), ['Example DDNS', 'Example DNS']);
   assert.ok(logger.errors.some(e => e.includes('spawn failed')));
   pm2.state.startError = Object.assign(new Error('PM2 is not reachable: x'), { code: 'PM2_UNAVAILABLE' });
   await assert.rejects(run(), /not reachable/);
@@ -231,7 +231,7 @@ test('adopts, with zero mutations: a spaced path, a command with no cwd, a comma
     { name: 'Spaced Path', type: 'forever', path: '/Applications/My Tool/run it', args: ['--keep'], cwd: '/srv/spaced' },
     { name: 'Spaced Relative', type: 'forever', path: './my tool/run.sh', cwd: '/srv/spaced' },
     { name: 'Command No Cwd', type: 'forever', command: 'node ddns.js --serve' },
-    { name: 'Command Tilde Cwd', type: 'forever', command: 'bash ./update.sh', cwd: '~/Library/Application Support/Aeros DDNS' },
+    { name: 'Command Tilde Cwd', type: 'forever', command: 'bash ./update.sh', cwd: '~/Library/Application Support/Example DNS' },
     { name: 'Path No Cwd', type: 'forever', path: 'worker.js', args: ['--fast'] },
     { name: 'Path On PATH', type: 'forever', path: 'sleep', args: ['60'] },
   ];
@@ -239,7 +239,7 @@ test('adopts, with zero mutations: a spaced path, a command with no cwd, a comma
   const summary = await run();
   assert.deepEqual(pm2.mutations(), []);
   assert.deepEqual(summary.adopted.sort(), jobs.map(j => j.name).sort());
-  assert.equal(pm2.procs.find(p => p.name === 'Command Tilde Cwd').pm2_env.pm_cwd, path.join(home, 'Library/Application Support/Aeros DDNS'));
+  assert.equal(pm2.procs.find(p => p.name === 'Command Tilde Cwd').pm2_env.pm_cwd, path.join(home, 'Library/Application Support/Example DNS'));
   // PM2's own rewrite of the spaced path is what is stored, and it still matches.
   assert.deepEqual(pm2.procs.find(p => p.name === 'Spaced Path').pm2_env.args, ['-c', '/Applications/My Tool/run it']);
 });
@@ -258,7 +258,7 @@ test('a changed spaced path is still noticed and restarts only that job', async 
 });
 
 test('a restart that lands while reconcile waits for the job lock is not undone: reconcile re-checks and leaves it', async t => {
-  const jobs = [{ name: 'DDNS', type: 'forever', command: 'node ddns.js', cwd: '/srv/ddns' }];
+  const jobs = [{ name: 'Example DDNS', type: 'forever', command: 'node ddns.js', cwd: '/srv/example-ddns' }];
   const { pm2, run, logger } = adoptionCase(t, jobs);
   const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false });
   jobs[0].command = 'node ddns.js --v2';
@@ -269,7 +269,7 @@ test('a restart that lands while reconcile waits for the job lock is not undone:
   assert.deepEqual(pm2.mutations().map(([m]) => m), ['delete', 'start'], 'one replacement, not two');
   assert.equal(pm2.procs.length, 1);
   assert.deepEqual(summary.restarted, []);
-  assert.deepEqual(summary.left, ['DDNS']);
+  assert.deepEqual(summary.left, ['Example DDNS']);
 });
 
 test('a job started under another shell (bash vs zsh) is adopted, with an info line; a real change still restarts', async t => {
@@ -317,35 +317,69 @@ test('a config entry named like TaskServer itself is skipped with a warning, nev
 
 test('a Stop that lands while reconcile waits for the job lock is not undone', async t => {
   const { pm2, config, run, jobControl } = setup(t);
-  config.scripts[1].command = 'node ddns.js --v2';            // reconcile plans a restart of DDNS from its first look
-  const holder = jobControl.inLock('DDNS', async () => {
+  config.scripts[1].command = 'node ddns.js --v2';            // reconcile plans a restart of Example DDNS from its first look
+  const holder = jobControl.inLock('Example DDNS', async () => {
     await new Promise(resolve => setTimeout(resolve, 30));
     config.scripts[1].stopped = true;                          // the dashboard's Stop, saved to the config meanwhile
   });
   const [, summary] = await Promise.all([holder, run()]);
   assert.deepEqual(pm2.mutations(), [], 'the running job is left as it is');
-  assert.ok(summary.left.includes('DDNS'));
+  assert.ok(summary.left.includes('Example DDNS'));
   assert.equal(summary.restarted.length, 0);
 });
 
 test('a job removed from the config while reconcile waits is not started', async t => {
   const { pm2, config, run, jobControl } = setup(t, { legacy: false });
-  const holder = jobControl.inLock('DNS', async () => {
+  const holder = jobControl.inLock('Example DNS', async () => {
     await new Promise(resolve => setTimeout(resolve, 30));
-    config.scripts = config.scripts.filter(s => s.name !== 'DNS');
+    config.scripts = config.scripts.filter(s => s.name !== 'Example DNS');
   });
   await Promise.all([holder, run()]);
-  assert.equal(pm2.procs.some(p => p.name === 'DNS'), false);
+  assert.equal(pm2.procs.some(p => p.name === 'Example DNS'), false);
 });
 
-test('only "PM2 is not reachable" is retried; any other failure is thrown once, without the "not ready" message', async t => {
+test('cold boot: a failure PM2 does not classify as "not reachable" is retried a few times and then succeeds', async t => {
+  const { pm2, logger, jobControl, config } = setup(t);
+  const list = pm2.list;
+  let attempts = 0;
+  pm2.list = async () => {
+    attempts += 1;
+    if (attempts <= 2) throw new Error('unexpected: daemon not ready');
+    return list();
+  };
+  const waits = [];
+  const summary = await reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger,
+    sleep: async ms => { waits.push(ms); }, initialDelayMs: 10, maxDelayMs: 25 });
+  assert.equal(summary.adopted.length, 4);
+  assert.deepEqual(waits, [10, 20]);
+  assert.deepEqual(pm2.mutations(), []);
+  assert.match(logger.errors[0], /Unexpected error \(unexpected: daemon not ready\); retrying in 10 ms \(1\/5\)/);
+});
+
+test('cold boot: retries of other failures are bounded, then the error goes to the caller', async t => {
   const { pm2, logger, jobControl, config } = setup(t);
   pm2.state.listError = new Error('unexpected: bad shape');
-  let waits = 0;
-  await assert.rejects(reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger, sleep: async () => { waits += 1; } }), /bad shape/);
-  assert.equal(waits, 0);
-  assert.equal(pm2.calls.filter(c => c[0] === 'list').length, 1);
+  const waits = [];
+  await assert.rejects(reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger, maxOtherRetries: 3,
+    sleep: async ms => { waits.push(ms); }, initialDelayMs: 10, maxDelayMs: 25 }), /bad shape/);
+  assert.deepEqual(waits, [10, 20, 25]);
+  assert.equal(pm2.calls.filter(c => c[0] === 'list').length, 4);
   assert.doesNotMatch(logger.errors.join('\n'), /not ready/);
+});
+
+test('cold boot: the bound on other failures does not limit "PM2 is not reachable", which is retried until it answers', async t => {
+  const { pm2, logger, jobControl, config } = setup(t);
+  const list = pm2.list;
+  let attempts = 0;
+  pm2.list = async () => {
+    attempts += 1;
+    if (attempts <= 8) throw Object.assign(new Error('PM2 is not reachable: down'), { code: 'PM2_UNAVAILABLE' });
+    return list();
+  };
+  const summary = await reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger, maxOtherRetries: 1,
+    sleep: async () => {}, initialDelayMs: 1, maxDelayMs: 2 });
+  assert.equal(summary.adopted.length, 4);
+  assert.equal(attempts, 9);
 });
 
 // Safety valve: an environment mismatch must not bounce every job at boot.

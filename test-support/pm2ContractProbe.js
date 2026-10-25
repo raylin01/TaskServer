@@ -65,10 +65,10 @@ async function main() {
     await service.delete(shape.name);
   }
 
-  // A cron run whose cwd uses ~ and contains spaces (the "Aeros DDNS" shape),
+  // A cron run whose cwd uses ~ and contains spaces (the "Example DNS" shape),
   // built by the cron manager's own code and launched through PM2.
   const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'taskserver-probe-home-'));
-  const cronCwd = path.join(fakeHome, 'Library', 'Application Support', 'Aeros DDNS');
+  const cronCwd = path.join(fakeHome, 'Library', 'Application Support', 'Example DNS');
   fs.mkdirSync(cronCwd, { recursive: true });
   const probeConfig = path.join(fakeHome, 'config.yaml');
   fs.writeFileSync(probeConfig, `server:\n  logsDir: ${JSON.stringify(path.join(fakeHome, 'logs'))}\npm2:\n  killTimeoutMs: 5000\nscripts: []\n`);
@@ -76,7 +76,7 @@ async function main() {
   process.env.TASKSERVER_CONFIG = probeConfig;
   const savedHome = process.env.HOME;
   process.env.HOME = fakeHome;
-  const cronScript = { name: 'Aeros DDNS', type: 'cron', schedule: '0 3 * * *', command: 'pwd > cwd-seen.txt', cwd: '~/Library/Application Support/Aeros DDNS' };
+  const cronScript = { name: 'Example DNS', type: 'cron', schedule: '0 3 * * *', command: 'pwd > cwd-seen.txt', cwd: '~/Library/Application Support/Example DNS' };
   const runConfig = require('../utils/cronManager').buildRunConfig(cronScript, 'manual');
   process.env.HOME = savedHome;
   out.cronCwdExpanded = runConfig.cwd === cronCwd;

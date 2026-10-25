@@ -5,17 +5,11 @@
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <header>
-    <h1>TaskServer</h1>
-    <nav>
-      <a href="/scripts">Scripts</a> |
-      <a href="/add-script">Add Script</a> |
-      <a href="/settings">Settings</a>
-    </nav>
-  </header>
+  <%- include('partials/nav') %>
   <main>
     <h2>Edit Script: <%= script.name %></h2>
-    <form method="post" action="/edit-script/<%= script.name %>" class="script-form">
+    <form method="post" action="/edit-script/<%= encodeURIComponent(script.name) %>" class="script-form">
+      <%- include('partials/csrf-field') %>
       <div class="form-group">
         <label for="name">Script Name <span class="required">*</span></label>
         <input type="text" id="name" name="name" required value="<%= script.name %>">
@@ -24,7 +18,7 @@
 
       <div class="form-group">
         <label for="sourceType">Script Source <span class="required">*</span></label>
-        <select id="sourceType" name="sourceType" onchange="toggleSourceType()">
+        <select id="sourceType" name="sourceType">
           <option value="file" <%= script.path ? 'selected' : '' %>>Script File</option>
           <option value="command" <%= script.command ? 'selected' : '' %>>Command Line</option>
         </select>
@@ -51,7 +45,7 @@
 
       <div class="form-group">
         <label for="type">Execution Type <span class="required">*</span></label>
-        <select id="type" name="type" onchange="toggleCronOptions()">
+        <select id="type" name="type">
           <option value="forever" <%= script.type === 'forever' ? 'selected' : '' %>>Forever (Always Running)</option>
           <option value="cron" <%= script.type === 'cron' ? 'selected' : '' %>>Cron (Scheduled)</option>
         </select>
@@ -85,48 +79,6 @@
   </footer>
 
   <script src="/cron-builder.js"></script>
-  <script>
-    function toggleSourceType() {
-      const sourceType = document.getElementById('sourceType').value;
-      const pathGroup = document.getElementById('pathGroup');
-      const commandGroup = document.getElementById('commandGroup');
-      const sourceTypeHelp = document.getElementById('sourceTypeHelp');
-      const pathInput = document.getElementById('path');
-      const commandInput = document.getElementById('command');
-      
-      if (sourceType === 'command') {
-        pathGroup.style.display = 'none';
-        commandGroup.style.display = 'block';
-        sourceTypeHelp.textContent = 'Execute a shell command directly';
-        pathInput.removeAttribute('required');
-        commandInput.setAttribute('required', 'required');
-      } else {
-        pathGroup.style.display = 'block';
-        commandGroup.style.display = 'none';
-        sourceTypeHelp.textContent = 'Run a script file from disk';
-        pathInput.setAttribute('required', 'required');
-        commandInput.removeAttribute('required');
-      }
-    }
-
-    function toggleCronOptions() {
-      const type = document.getElementById('type').value;
-      const cronOptions = document.getElementById('cronOptions');
-      const typeHelp = document.getElementById('typeHelp');
-      
-      if (type === 'cron') {
-        cronOptions.style.display = 'block';
-        typeHelp.textContent = 'Script will run on a schedule';
-      } else {
-        cronOptions.style.display = 'none';
-        typeHelp.textContent = 'Script will run continuously and restart on crash';
-      }
-    }
-
-    // Initialize on page load
-    toggleSourceType();
-    toggleCronOptions();
-    initCronBuilder();
-  </script>
+  <script src="/script-form.js"></script>
 </body>
 </html>
