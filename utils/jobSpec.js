@@ -116,13 +116,30 @@ function sameBoolean(a, b) {
   return String(a) === String(b);
 }
 
+// A `command:` job runs through TaskServer's $SHELL. The shell a process was
+// started with depends on who started it (a login shell, PM2's environment, an
+// older TaskServer under another $SHELL) and says nothing about the job, so a
+// different shell is not a change: it applies at the next restart.
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
+const isShell = file => SHELLS.has(path.basename(String(file || '')));
+const shellFlag = /^-[a-zA-Z]*c$/;
+
+function sameShellArgs(running, wanted) {
+  if (sameList(running, wanted)) return true;
+  return running.length === 2 && wanted.length === 2
+    && shellFlag.test(running[0]) && shellFlag.test(wanted[0]) && String(running[1]) === String(wanted[1]);
+}
+
 // Which fields differ between the config a job should have and the process PM2
 // is running. Only the fields listed above, and only the env keys the job
 // configures: PM2 merges the whole environment of whoever started the process
 // into its env, so the rest of it says nothing about this job.
 //
 // Returns names only, for logging. Never values.
-function diffJob(desired, proc) {
+//
+// `options.shellJob` marks a `command:` job (see above). `options.notes`, if
+// given, receives a line for differences that are tolerated.
+function diffJob(desired, proc, { shellJob = false, notes } = {}) {
   const env = proc?.pm2_env || {};
   const changed = [];
   const wantCwd = desired.cwd;
@@ -130,8 +147,17 @@ function diffJob(desired, proc) {
   if (!env.pm_cwd || path.resolve(env.pm_cwd) !== path.resolve(wantCwd)) changed.push('cwd');
   // Compare with what PM2 will have made of the config, not the config itself.
   const form = pm2CommandForm(desired.script, desired.args || []);
-  if (env.pm_exec_path !== resolveExecPath(form.script, wantCwd)) changed.push('exec path');
-  if (!sameList(Array.isArray(env.args) ? env.args : [], form.args)) changed.push('args');
+  const wantExec = resolveExecPath(form.script, wantCwd);
+  const runningArgs = Array.isArray(env.args) ? env.args : [];
+  if (env.pm_exec_path === wantExec) {
+    if (!sameList(runningArgs, form.args)) changed.push('args');
+  } else if (shellJob && isShell(env.pm_exec_path) && isShell(wantExec)) {
+    notes?.push(`shell differs (running ${path.basename(env.pm_exec_path)}, config would use ${path.basename(wantExec)}); applies at the next restart`);
+    if (!sameShellArgs(runningArgs, form.args)) changed.push('args');
+  } else {
+    changed.push('exec path');
+    if (!sameList(runningArgs, form.args)) changed.push('args');
+  }
   if (!sameBoolean(env.autorestart, desired.autorestart)) changed.push('autorestart');
   if (Number(env.max_restarts) !== Number(desired.max_restarts)) changed.push('max_restarts');
   if (Number(env.exp_backoff_restart_delay) !== Number(desired.exp_backoff_restart_delay)) {

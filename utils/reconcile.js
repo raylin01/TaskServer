@@ -43,31 +43,74 @@ function planJob(script, spec, proc) {
   }
   if (RUNNING.has(status)) {
     if (script.stopped) return { action: 'adopt', warn: 'is running but marked stopped in config' };
-    const changed = diffJob(spec, proc);
-    return changed.length ? { action: 'restart', changed } : { action: 'adopt' };
+    const notes = [];
+    const changed = diffJob(spec, proc, { shellJob: Boolean(script.command), notes });
+    return changed.length ? { action: 'restart', changed, notes } : { action: 'adopt', notes };
   }
   return { action: 'leave', reason: status };
+}
+
+// How many of the changed jobs boot may restart at once. If more than this
+// fraction of the online jobs (and more than MIN_TRIPPED_RESTARTS) look changed,
+// the cause is almost certainly the environment (the shell, a working
+// directory, a PATH) and not the config, so none are restarted. A value of 1 or
+// more switches the check off.
+const DEFAULT_MAX_RESTART_FRACTION = 0.5;
+const MIN_TRIPPED_RESTARTS = 2;
+
+function maxRestartFraction(pm2Settings) {
+  const value = pm2Settings?.reconcileMaxRestartFraction;
+  return typeof value === 'number' && value >= 0 ? value : DEFAULT_MAX_RESTART_FRACTION;
 }
 
 async function reconcileJobs({
   service,
   jobControl,
-  config = configHandler.loadConfig(),
+  config,
+  loadConfig = () => config || configHandler.loadConfig(),
   logsDir = configHandler.getLogsDir(),
   logger = console,
+  selfName = configHandler.getSelfName,
 }) {
+  const initial = loadConfig();
   const list = await service.list();
   const summary = { started: [], restarted: [], adopted: [], left: [], skipped: [], failed: [] };
+  const self = selfName(initial);
 
-  for (const script of config.scripts) {
+  // Plan every forever job from one list.
+  const plans = [];
+  for (const script of initial.scripts) {
     if (script.type !== 'forever') continue;
-    const spec = buildPm2Config(script, config.pm2, logsDir);
-    const plan = planJob(script, spec, findProcess(list, script.name));
+    if (script.name === self) {
+      summary.skipped.push(script.name);
+      logger.warn?.(`[Reconcile] '${script.name}' in the config is TaskServer itself; skipping it. Remove it from the config.`);
+      continue;
+    }
+    const spec = buildPm2Config(script, initial.pm2, logsDir);
+    plans.push({ script, spec, plan: planJob(script, spec, findProcess(list, script.name)) });
+  }
+
+  // Safety valve: too many restarts at once is read as an environment mismatch.
+  const online = plans.filter(p => p.plan.action === 'adopt' || p.plan.action === 'restart');
+  const restarts = plans.filter(p => p.plan.action === 'restart');
+  if (restarts.length > MIN_TRIPPED_RESTARTS && restarts.length > online.length * maxRestartFraction(initial.pm2)) {
+    logger.warn?.(`[Reconcile] ${restarts.length} of ${online.length} running jobs look changed, which is more than `
+      + 'boot restarts at once (an environment difference such as the shell or a working directory?). '
+      + 'Adopting all of them unchanged; restart a job yourself to apply its change. '
+      + 'Set pm2.reconcileMaxRestartFraction to 1 to turn this check off.');
+    for (const { script, plan } of restarts) {
+      logger.warn?.(`[Reconcile] ${script.name} differs in: ${plan.changed.join(', ')}`);
+      plan.action = 'adopt';
+    }
+  }
+
+  for (const { script, spec, plan } of plans) {
     try {
       switch (plan.action) {
         case 'adopt':
           summary.adopted.push(script.name);
           if (plan.warn) logger.warn?.(`[Reconcile] ${script.name} ${plan.warn}; leaving it running`);
+          for (const note of plan.notes || []) logger.info?.(`[Reconcile] ${script.name}: ${note}`);
           break;
         case 'leave':
           summary.left.push(script.name);
@@ -79,13 +122,18 @@ async function reconcileJobs({
           break;
         case 'start':
         case 'restart': {
-          // Look again under the job's lock: a restart from GitSync or the
-          // dashboard may have run since the list above was taken.
+          // Look again under the job's lock, at PM2 and at the config: a restart
+          // or a Stop from GitSync or the dashboard may have run since the
+          // list above was taken, and must not be undone.
           const outcome = await jobControl.inLock(script.name, async ops => {
-            const current = planJob(script, spec, findProcess(await service.list(), script.name));
-            if (current.action !== 'start' && current.action !== 'restart') return current;
-            await ops.startFresh(script, spec);
-            return current;
+            const current = loadConfig();
+            const fresh = current.scripts.find(entry => entry.name === script.name && entry.type === 'forever');
+            if (!fresh) return { action: 'skip', reason: 'removed from the config' };
+            const freshSpec = buildPm2Config(fresh, current.pm2, logsDir);
+            const now = planJob(fresh, freshSpec, findProcess(await service.list(), script.name));
+            if (now.action !== 'start' && now.action !== 'restart') return now;
+            await ops.startFresh(fresh, freshSpec);
+            return now;
           });
           if (outcome.action === 'start') {
             summary.started.push(script.name);
@@ -107,7 +155,9 @@ async function reconcileJobs({
       // already handled are then simply adopted.
       if (isUnavailable(error)) throw error;
       summary.failed.push(script.name);
-      logger.error?.(`[Reconcile] Could not ${plan.action} ${script.name}: ${errorText(error)}`);
+      const lost = plan.action === 'restart' || plan.action === 'start'
+        ? ' If the old process was already removed, the job is not running now.' : '';
+      logger.error?.(`[Reconcile] Could not ${plan.action} ${script.name}: ${errorText(error)}.${lost}`);
     }
   }
 
@@ -118,7 +168,9 @@ async function reconcileJobs({
 }
 
 // PM2 may not be reachable the moment TaskServer starts. Try again, with a
-// growing pause, until it works or `isClosed()` says to stop.
+// growing pause, until it works or `isClosed()` says to stop. Only "PM2 is not
+// reachable" is retried; any other failure is thrown to the caller, which logs
+// it as it is.
 async function reconcileWithRetry({ isClosed = () => false, sleep, initialDelayMs = 1000, maxDelayMs = 15000, logger = console, ...options }) {
   const wait = sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
   let delay = initialDelayMs;
@@ -126,6 +178,7 @@ async function reconcileWithRetry({ isClosed = () => false, sleep, initialDelayM
     try {
       return await reconcileJobs({ logger, ...options });
     } catch (error) {
+      if (!isUnavailable(error)) throw error;
       logger.error?.(`[Reconcile] PM2 is not ready (${errorText(error)}); retrying in ${delay} ms`);
       await wait(delay);
       delay = Math.min(delay * 2, maxDelayMs);

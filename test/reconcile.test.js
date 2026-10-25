@@ -22,8 +22,8 @@ function scripts() {
 
 function setup(t, { legacy = true, extra = {} } = {}) {
   const pm2 = createFakePm2();
-  const logger = { logs: [], warns: [], errors: [], log(m) { this.logs.push(m); }, warn(m) { this.warns.push(m); }, error(m) { this.errors.push(m); } };
-  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false });
+  const logger = { logs: [], infos: [], warns: [], errors: [], log(m) { this.logs.push(m); }, info(m) { this.infos.push(m); }, warn(m) { this.warns.push(m); }, error(m) { this.errors.push(m); } };
+  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false, getSelfName: () => 'taskserver' });
   const config = { pm2: PM2, scripts: scripts(), ...extra };
   if (legacy) {
     // Processes exactly as the previous TaskServer started them: no kill_timeout.
@@ -176,7 +176,7 @@ test('boot retries until PM2 answers, then reconciles once', async t => {
 
 test('retry stops when TaskServer is shutting down', async t => {
   const { pm2, logger, jobControl, config } = setup(t);
-  pm2.state.listError = new Error('down');
+  pm2.state.listError = Object.assign(new Error('PM2 is not reachable: down'), { code: 'PM2_UNAVAILABLE' });
   let closed = false;
   const result = await reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger,
     isClosed: () => closed, sleep: async () => { closed = true; } });
@@ -215,8 +215,8 @@ const fs = require('fs');
 
 function adoptionCase(t, jobs) {
   const pm2 = createFakePm2();
-  const logger = { logs: [], warns: [], errors: [], log(m) { this.logs.push(m); }, warn(m) { this.warns.push(m); }, error(m) { this.errors.push(m); } };
-  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false });
+  const logger = { logs: [], infos: [], warns: [], errors: [], log(m) { this.logs.push(m); }, info(m) { this.infos.push(m); }, warn(m) { this.warns.push(m); }, error(m) { this.errors.push(m); } };
+  const jobControl = createJobControl({ service: pm2, logger, getPm2Settings: () => PM2, getLogsDir: () => LOGS, isAlive: () => false, getSelfName: () => 'taskserver' });
   const config = { pm2: PM2, scripts: jobs };
   for (const script of jobs) pm2.add(legacyPm2Config(script, PM2, LOGS));
   return { pm2, logger, run: () => reconcileJobs({ service: pm2, jobControl, config, logsDir: LOGS, logger }) };
@@ -270,4 +270,123 @@ test('a restart that lands while reconcile waits for the job lock is not undone:
   assert.equal(pm2.procs.length, 1);
   assert.deepEqual(summary.restarted, []);
   assert.deepEqual(summary.left, ['DDNS']);
+});
+
+test('a job started under another shell (bash vs zsh) is adopted, with an info line; a real change still restarts', async t => {
+  const jobs = [
+    { name: 'Connector', type: 'forever', command: 'cloudflared tunnel run', cwd: '/srv/c' },
+    { name: 'Other', type: 'forever', command: 'node o.js', cwd: '/srv/o' },
+  ];
+  const savedShell = process.env.SHELL;
+  t.after(() => { process.env.SHELL = savedShell; });
+  process.env.SHELL = '/bin/bash';
+  const { pm2, logger, run } = adoptionCase(t, jobs);
+  process.env.SHELL = '/bin/zsh';
+  assert.equal(pm2.procs[0].pm2_env.pm_exec_path, '/bin/bash');
+  const summary = await run();
+  assert.deepEqual(pm2.mutations(), []);
+  assert.deepEqual(summary.adopted.sort(), ['Connector', 'Other']);
+  assert.equal(logger.infos.filter(l => /shell differs \(running bash, config would use zsh\).*next restart/.test(l)).length, 2);
+
+  jobs[0].command = 'cloudflared tunnel run --changed';
+  const again = await run();
+  assert.deepEqual(again.restarted, ['Connector']);
+  assert.deepEqual(pm2.mutations().map(([m, name]) => `${m}:${name}`), ['delete:Connector', 'start:Connector']);
+});
+
+test('a different executable that is not a shell is still a change', () => {
+  const spec = buildPm2Config({ name: 'P', type: 'forever', path: '/srv/p/run', cwd: '/srv/p' }, PM2, LOGS);
+  const proc = { pm2_env: { status: 'online', pm_exec_path: '/srv/p/other', pm_cwd: '/srv/p', args: [], autorestart: true, max_restarts: 10000, exp_backoff_restart_delay: 1000, env: {} } };
+  assert.deepEqual(diffJob(spec, proc, { shellJob: false }), ['exec path']);
+  const bash = { ...proc, pm2_env: { ...proc.pm2_env, pm_exec_path: '/bin/bash' } };
+  assert.deepEqual(diffJob({ ...spec, script: '/bin/zsh' }, bash, { shellJob: false }), ['exec path'], 'only command jobs get the shell tolerance');
+});
+
+test('a config entry named like TaskServer itself is skipped with a warning, never touched', async t => {
+  const { pm2, logger, config, run } = setup(t, { extra: {} });
+  config.scripts.push({ name: 'taskserver', type: 'forever', command: 'node server.js', cwd: '/srv/ts' });
+  const summary = await run();
+  assert.ok(summary.skipped.includes('taskserver'));
+  assert.ok(logger.warns.some(w => /'taskserver' in the config is TaskServer itself/.test(w)));
+  assert.deepEqual(pm2.mutations(), []);
+  config.scripts.find(s => s.name === 'taskserver').command = 'node server.js --new';
+  pm2.add(buildPm2Config(config.scripts.at(-1), PM2, LOGS));
+  await run();
+  assert.deepEqual(pm2.mutations(), []);
+});
+
+test('a Stop that lands while reconcile waits for the job lock is not undone', async t => {
+  const { pm2, config, run, jobControl } = setup(t);
+  config.scripts[1].command = 'node ddns.js --v2';            // reconcile plans a restart of DDNS from its first look
+  const holder = jobControl.inLock('DDNS', async () => {
+    await new Promise(resolve => setTimeout(resolve, 30));
+    config.scripts[1].stopped = true;                          // the dashboard's Stop, saved to the config meanwhile
+  });
+  const [, summary] = await Promise.all([holder, run()]);
+  assert.deepEqual(pm2.mutations(), [], 'the running job is left as it is');
+  assert.ok(summary.left.includes('DDNS'));
+  assert.equal(summary.restarted.length, 0);
+});
+
+test('a job removed from the config while reconcile waits is not started', async t => {
+  const { pm2, config, run, jobControl } = setup(t, { legacy: false });
+  const holder = jobControl.inLock('DNS', async () => {
+    await new Promise(resolve => setTimeout(resolve, 30));
+    config.scripts = config.scripts.filter(s => s.name !== 'DNS');
+  });
+  await Promise.all([holder, run()]);
+  assert.equal(pm2.procs.some(p => p.name === 'DNS'), false);
+});
+
+test('only "PM2 is not reachable" is retried; any other failure is thrown once, without the "not ready" message', async t => {
+  const { pm2, logger, jobControl, config } = setup(t);
+  pm2.state.listError = new Error('unexpected: bad shape');
+  let waits = 0;
+  await assert.rejects(reconcileWithRetry({ service: pm2, jobControl, config, logsDir: LOGS, logger, sleep: async () => { waits += 1; } }), /bad shape/);
+  assert.equal(waits, 0);
+  assert.equal(pm2.calls.filter(c => c[0] === 'list').length, 1);
+  assert.doesNotMatch(logger.errors.join('\n'), /not ready/);
+});
+
+// Safety valve: an environment mismatch must not bounce every job at boot.
+function changeJobs(config, names) {
+  for (const script of config.scripts) if (names.includes(script.name)) script.command = `${script.command} --changed`;
+}
+
+test('safety valve: more than half of the running jobs (and more than 2) look changed -> none restart, all are adopted, fields are warned', async t => {
+  const extra = { scripts: Array.from({ length: 5 }, (_, i) => ({ name: `J${i}`, type: 'forever', command: `node j${i}.js`, cwd: '/srv' })) };
+  const { pm2, logger, config, run } = setup(t, { legacy: false, extra });
+  for (const script of config.scripts) pm2.add(legacyPm2Config(script, PM2, LOGS));
+  changeJobs(config, ['J0', 'J1', 'J2']);
+  const summary = await run();
+  assert.deepEqual(pm2.mutations(), []);
+  assert.equal(summary.adopted.length, 5);
+  assert.equal(summary.restarted.length, 0);
+  const text = logger.warns.join('\n');
+  assert.match(text, /3 of 5 running jobs look changed/);
+  for (const name of ['J0', 'J1', 'J2']) assert.match(text, new RegExp(`${name} differs in: args`));
+  assert.doesNotMatch(text, /--changed|node j0/, 'field names only');
+  assert.match(text, /reconcileMaxRestartFraction/);
+});
+
+test('safety valve: up to the limit, changes are applied as before', async t => {
+  const extra = { scripts: Array.from({ length: 6 }, (_, i) => ({ name: `J${i}`, type: 'forever', command: `node j${i}.js`, cwd: '/srv' })) };
+  const { pm2, config, run } = setup(t, { legacy: false, extra });
+  for (const script of config.scripts) pm2.add(legacyPm2Config(script, PM2, LOGS));
+  changeJobs(config, ['J0', 'J1', 'J2']);      // exactly half of 6
+  assert.equal((await run()).restarted.length, 3);
+  changeJobs(config, ['J3', 'J4']);            // one and two changed jobs are never "too many"
+  const small = setup(t, { legacy: false, extra: { scripts: extra.scripts.slice(0, 3).map(s => ({ ...s })) } });
+  for (const script of small.config.scripts) small.pm2.add(legacyPm2Config(script, PM2, LOGS));
+  changeJobs(small.config, ['J0', 'J1']);
+  assert.equal((await small.run()).restarted.length, 2);
+});
+
+test('safety valve: pm2.reconcileMaxRestartFraction of 1 switches it off', async t => {
+  const extra = { pm2: { ...PM2, reconcileMaxRestartFraction: 1 }, scripts: Array.from({ length: 4 }, (_, i) => ({ name: `J${i}`, type: 'forever', command: `node j${i}.js`, cwd: '/srv' })) };
+  const { pm2, config, run } = setup(t, { legacy: false, extra });
+  for (const script of config.scripts) pm2.add(legacyPm2Config(script, PM2, LOGS));
+  changeJobs(config, ['J0', 'J1', 'J2', 'J3']);
+  assert.equal((await run()).restarted.length, 4);
+  assert.equal(pm2.mutations().length, 8);
 });

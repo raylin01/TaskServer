@@ -82,4 +82,9 @@ function ensureLogDir() {
   }
 }
 
-module.exports = { loadConfig, writeConfig, ensureLogDir, getLogsDir };
+// The name TaskServer itself runs under in PM2 (`server.selfName`).
+function getSelfName(config = loadConfig()) {
+  return config.server?.selfName || 'taskserver';
+}
+
+module.exports = { loadConfig, writeConfig, ensureLogDir, getLogsDir, getSelfName };
