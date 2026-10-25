@@ -118,6 +118,7 @@ logManagement:
 # Server Settings (Optional)
 server:
   port: 3000                   # Web interface port (default: 3000)
+  host: "127.0.0.1"           # Loopback only by default, even when omitted
   logsDir: "./logs"            # Directory to store logs (default: ./logs)
 
 # PM2 Settings (Optional)
@@ -148,6 +149,12 @@ scripts:
     args: ["--foo", "bar"]
     env: {FOO: "bar"}
 ```
+
+TaskServer binds to `127.0.0.1` by default, including existing configurations
+without `server.host`. To allow LAN access, explicitly set `server.host: "0.0.0.0"`
+(all IPv4 interfaces). This exposes the dashboard and script-control endpoints to
+other machines. The dashboard has no login and API authentication is optional;
+only enable LAN access on a trusted, appropriately firewalled network.
 
 ## Script Types
 
@@ -329,6 +336,14 @@ cloudflare:
   tunnelToken: "your-cloudflare-tunnel-token-here"
 ```
 
+Configure the named tunnel's origin service in Cloudflare as
+`http://127.0.0.1:3000` (use your configured port). The built-in local origin follows
+the address TaskServer actually bound to: `127.0.0.1` by default, `[::1]` for
+`host: "::1"`, loopback for wildcard binds (`0.0.0.0`, `::`), and the configured
+address otherwise. The default loopback bind works without LAN exposure.
+Protect public access with Cloudflare Access; a tunnel alone does not add a
+TaskServer dashboard login.
+
 ### Step 3: Start Your Server
 
 ```bash
@@ -338,7 +353,7 @@ npm start
 The console will display your public URL:
 
 ```
-TaskServer running at http://localhost:3000
+TaskServer running at http://127.0.0.1:3000
 Starting Cloudflare Tunnel...
 Cloudflare Tunnel URL: https://xxx-xxx-xxx.trycloudflare.com
 Dashboard accessible online at: https://xxx-xxx-xxx.trycloudflare.com
@@ -402,6 +417,40 @@ Logs are stored in the `logs/` directory with the following naming convention:
 
 - **Forever scripts**: `{scriptName}-out-{timestamp}.log` and `{scriptName}-error-{timestamp}.log`
 - **Cron scripts**: `{scriptName}-out-{timestamp}.log` and `{scriptName}-error-{timestamp}.log`
+
+### Finished run cleanup
+
+Cron and manual run processes are removed from PM2 within about a minute after
+stopping (the scan interval is 30 seconds). Running processes and forever jobs
+are retained. On the first start after this update, TaskServer also removes old
+stopped entries whose names match an exact configured job name followed by
+`-cron-` or `-manual-` and a 13-digit timestamp. The cleanup log reports only the
+number removed, and scan failures log the error message.
+
+The sweep runs in the background and never delays scheduling or launches: cron
+jobs are registered at boot, and the sweep works in chunks of 200 entries (at
+most 1000 deletions per scan, with follow-up scans about a second apart while a
+backlog remains). Each chunk is a separate PM2 operation, so a launch waits for
+at most one chunk. Inside a chunk the status of each entry is rechecked from a list
+that is at most 25 deletes old, so a run someone restarts meanwhile is not killed;
+an id that has already disappeared is skipped. Every PM2 call has a timeout, so a
+lost reply cannot block launches; after a timeout the PM2 client is replaced with a
+fresh one. If `pm2 start` times out, the run may still have started: the error says
+so, the launch is never retried automatically, and the run is not recorded until a
+later scan sees its process.
+
+The latest run time and trigger of each job (plus the launch id that identifies the
+newest run) are saved atomically in `.taskserver-run-history.json` next to
+`config.yaml` before deletion. Keep that file writable and retain it across
+restarts for the dashboard's last-run time. It contains no job commands or
+environment variables. Entries for scripts that are no longer in `config.yaml` are
+dropped at the next scan. If the file is empty, truncated or not a JSON object,
+TaskServer logs one warning, renames it to `.taskserver-run-history.json.corrupt-<time>`
+and starts with empty history. Overlapping runs keep separate log files, and an
+older run finishing cannot replace the latest run. Log files remain subject to the
+existing retention settings (7 days by default when automatic cleanup is enabled).
+Cleanup scans reconnect and retry after PM2 errors, including runs that exit while
+TaskServer is down.
 
 ### Viewing Logs
 
@@ -635,3 +684,7 @@ This project is licensed under the MIT License.
 ## Support
 
 If you encounter any issues or have questions, please open an issue on GitHub.
+
+## Tests
+
+Run `npm test` with Node.js 18 or newer (uses the built-in `node --test` runner).

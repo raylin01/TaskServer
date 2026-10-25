@@ -1,11 +1,14 @@
 const cron = require('node-cron');
-const pm2 = require('pm2');
 const path = require('path');
 const configHandler = require('./configHandler');
+const { createRunCleanup } = require('./runCleanup');
 const { applyScriptExecution } = require('./scriptRunner');
 
+let lastRunId = 0;
+
 function buildRunConfig(script, trigger) {
-  const runId = Date.now();
+  const runId = Math.max(Date.now(), lastRunId + 1);
+  lastRunId = runId;
   const logsDir = configHandler.getLogsDir();
   const pm2Config = {
     name: `${script.name}-${trigger}-${runId}`,
@@ -19,41 +22,10 @@ function buildRunConfig(script, trigger) {
   return applyScriptExecution(pm2Config, script);
 }
 
-function connectPm2() {
-  return new Promise((resolve, reject) => {
-    pm2.connect((err) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
-function startPm2(pm2Config) {
-  return new Promise((resolve, reject) => {
-    pm2.start(pm2Config, (err) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve();
-    });
-  });
-}
-
-function disconnectPm2() {
-  try {
-    pm2.disconnect();
-  } catch (error) {
-    // Ignore disconnect errors because PM2 may already be disconnected.
-  }
-}
-
-function createCronManager() {
+function createCronManager(options = {}) {
   const jobs = new Map();
-  const cronRunHistory = {};
+  const runCleanup = createRunCleanup({ getScripts: () => configHandler.loadConfig().scripts, ...options });
+  const cronRunHistory = runCleanup.history;
   const cronSuspended = {};
 
   function ensureHistory(scriptName) {
@@ -75,13 +47,10 @@ function createCronManager() {
     const pm2Config = buildRunConfig(script, trigger);
 
     try {
-      await connectPm2();
-      await startPm2(pm2Config);
+      await runCleanup.launch(script.name, pm2Config);
     } catch (error) {
       cronRunHistory[script.name].lastError = error.message;
       throw error;
-    } finally {
-      disconnectPm2();
     }
   }
 
@@ -175,12 +144,24 @@ function createCronManager() {
     cronSuspended[scriptName] = Boolean(suspended);
   }
 
+  // Register every cron job right away, then start the cleanup scans in the
+  // background. Scheduling never waits on PM2 or on the startup sweep.
+  function bootstrap(scripts) {
+    scripts.forEach((script) => upsertScript(script));
+    return runCleanup.start().catch(() => {
+      // The failure is already logged with its message; scans keep retrying.
+    });
+  }
+
   function shutdown() {
+    runCleanup.shutdown();
     Array.from(jobs.keys()).forEach((scriptName) => unregisterScript(scriptName));
   }
 
   return {
     cronRunHistory,
+    start: runCleanup.start,
+    bootstrap,
     cronSuspended,
     upsertScript,
     unregisterScript,
