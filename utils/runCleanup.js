@@ -50,7 +50,7 @@ function createRunCleanup({
   intervalMs = 30000,
   // While a backlog of old entries remains, the next scan follows quickly.
   backlogIntervalMs = 1000,
-  chunkSize = 200,
+  chunkSize = 50,
   maxDeletesPerScan = 1000,
   chunkPauseMs = 100,
   operationTimeoutMs = 120000,

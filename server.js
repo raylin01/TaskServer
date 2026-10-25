@@ -94,9 +94,11 @@ async function main() {
 
   const processService = createProcessService();
   const jobControl = createJobControl({ service: processService });
-  // Schedule cron jobs now; the sweep of old stopped runs runs in the background.
+  // Schedule cron jobs now. The sweep of old stopped runs starts later (below),
+  // after the server listens and the jobs are reconciled, so it never queues
+  // ahead of job control at boot.
   const cronManager = createCronManager({ service: processService });
-  cronManager.bootstrap(config.scripts);
+  cronManager.bootstrap(config.scripts, { cleanup: false });
 
   const app = createApp({ processService, jobControl, cronManager });
   let server = null;
@@ -138,9 +140,12 @@ async function main() {
 
   // Adopt the jobs PM2 already runs and start the missing ones. Runs in the
   // background and retries until PM2 answers.
+  // The version check runs alongside, so a slow answer cannot delay it.
   checkPm2Versions({ service: processService })
-    .then(() => reconcileWithRetry({ service: processService, jobControl, isClosed: () => closing }))
-    .catch(error => console.error(`[Reconcile] Failed: ${errorText(error)}`));
+    .catch(error => console.error(`[PM2] Version check failed: ${errorText(error)}`));
+  reconcileWithRetry({ service: processService, jobControl, isClosed: () => closing })
+    .catch(error => console.error(`[Reconcile] Failed: ${errorText(error)}`))
+    .finally(() => { if (!closing) cronManager.startCleanup(); });
 
   const tunnelOrigin = cloudflareTunnel.localOrigin(address);
   // Start Cloudflare Tunnel if configured
