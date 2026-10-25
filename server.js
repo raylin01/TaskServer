@@ -1,97 +1,153 @@
-// Main entry point for TaskServer
+// Main entry point for TaskServer.
+//
+// Requiring this file has no side effects: createApp() builds the Express app
+// from the pieces it is given, and main() (run only when this file is the
+// entry point) wires up PM2, cron, the listener and signal handling.
 const express = require('express');
 const bodyParser = require('body-parser');
-const pm2 = require('pm2');
 const path = require('path');
 const configHandler = require('./utils/configHandler');
-const logViewer = require('./utils/logViewer');
 const logCleanup = require('./utils/logCleanup');
 const cloudflareTunnel = require('./utils/cloudflareTunnel');
-const { applyScriptExecution } = require('./utils/scriptRunner');
 const createCronManager = require('./utils/cronManager');
+const { createProcessService, errorText } = require('./utils/processService');
+const { createJobControl } = require('./utils/jobControl');
+const { reconcileWithRetry, checkPm2Versions } = require('./utils/reconcile');
+const { errorMiddleware, installProcessHandlers } = require('./utils/httpErrors');
 const scriptsRouter = require('./routes/scripts');
 
-const app = express();
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+function createApp({ processService, jobControl, cronManager } = {}) {
+  if (!processService) throw new Error('createApp needs a processService');
+  const app = express();
+  app.set('view engine', 'ejs');
+  app.set('views', path.join(__dirname, 'views'));
+  app.use(express.static(path.join(__dirname, 'public')));
+  app.use(bodyParser.urlencoded({ extended: true }));
+  app.use(bodyParser.json());
 
-// Load config
-const config = configHandler.loadConfig();
+  app.locals.processService = processService;
+  app.locals.jobControl = jobControl || createJobControl({ service: processService });
+  // Make cron history and jobs available to routes
+  app.locals.cronManager = cronManager;
+  app.locals.cronRunHistory = cronManager?.cronRunHistory;
+  app.locals.cronSuspended = cronManager?.cronSuspended;
+  app.locals.serverTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-// Setup automatic log cleanup if enabled
-let cleanupInterval = null;
-if (config.logManagement && config.logManagement.autoDelete) {
-  const retentionDays = config.logManagement.retentionDays || 7;
-  const checkInterval = config.logManagement.checkInterval || 3600000; // default 1 hour
-  cleanupInterval = logCleanup.startAutoCleanup(retentionDays, checkInterval);
+  app.use((req, res, next) => {
+    res.locals.serverTimeZone = req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+    res.locals.serverNow = new Date();
+    next();
+  });
+
+  app.use('/', scriptsRouter);
+  app.use(errorMiddleware());
+  return app;
 }
 
-// Start PM2 and forever scripts
-pm2.connect(function(err) {
-  if (err) {
-    console.error('PM2 connect error:', err);
-    process.exit(2);
-  }
-  config.scripts.forEach(script => {
-    if (script.type === 'forever') {
-      // Only start if not marked as stopped
-      if (script.stopped) {
-        console.log(`Skipping ${script.name} (marked as stopped)`);
-        return;
-      }
-      
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const logsDir = configHandler.getLogsDir();
-      const pm2Config = {
-        name: script.name,
-        args: script.args || [],
-        env: script.env || {},
-        autorestart: config.pm2.autoRestart !== undefined ? config.pm2.autoRestart : true,
-        max_restarts: config.pm2.maxRestarts || 10000,
-        exp_backoff_restart_delay: config.pm2.restartDelay !== undefined ? config.pm2.restartDelay : 1000,
-        out_file: path.join(logsDir, `${script.name}-out-${timestamp}.log`),
-        error_file: path.join(logsDir, `${script.name}-error-${timestamp}.log`),
-      };
-
-      pm2.start(applyScriptExecution(pm2Config, script), (err) => {
-        if (err) console.error(`Failed to start ${script.name}:`, err);
+// Listen, and cope with the port still being held by the previous instance
+// (for example a restart that raced the old process shutting down): say so
+// clearly and retry with a growing pause instead of crash-looping. Gives up
+// after `attempts` tries.
+function listenWithRetry(app, port, host, {
+  attempts = 8,
+  baseDelayMs = 500,
+  maxDelayMs = 5000,
+  logger = console,
+  isClosed = () => false,
+} = {}) {
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const tryListen = () => {
+      attempt += 1;
+      const server = app.listen(port, host);
+      server.once('listening', () => resolve(server));
+      server.once('error', error => {
+        if (error.code === 'EADDRINUSE' && attempt < attempts && !isClosed()) {
+          const delay = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
+          logger.error(`Port ${port} on ${host} is already in use (attempt ${attempt}/${attempts}); `
+            + `another TaskServer may still be shutting down. Retrying in ${delay} ms`);
+          setTimeout(tryListen, delay);
+          return;
+        }
+        if (error.code === 'EADDRINUSE') {
+          logger.error(`Port ${port} on ${host} is still in use after ${attempt} attempts. `
+            + 'Stop whatever holds it, or change server.port in config.yaml.');
+        }
+        reject(error);
       });
-    }
+    };
+    tryListen();
   });
-});
+}
 
-// Setup cron jobs with last run tracking
-const cronManager = createCronManager();
-// Schedule cron jobs now; the sweep of old stopped runs runs in the background.
-cronManager.bootstrap(config.scripts);
+async function main() {
+  const config = configHandler.loadConfig();
+  let closing = false;
 
-// Make cron history and jobs available to routes
-app.locals.cronManager = cronManager;
-app.locals.cronRunHistory = cronManager.cronRunHistory;
-app.locals.cronSuspended = cronManager.cronSuspended;
-app.locals.serverTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  // Setup automatic log cleanup if enabled
+  let cleanupInterval = null;
+  if (config.logManagement && config.logManagement.autoDelete) {
+    const retentionDays = config.logManagement.retentionDays || 7;
+    const checkInterval = config.logManagement.checkInterval || 3600000; // default 1 hour
+    cleanupInterval = logCleanup.startAutoCleanup(retentionDays, checkInterval);
+  }
 
-app.use((req, res, next) => {
-  res.locals.serverTimeZone = req.app.locals.serverTimeZone || Intl.DateTimeFormat().resolvedOptions().timeZone;
-  res.locals.serverNow = new Date();
-  next();
-});
+  const processService = createProcessService();
+  const jobControl = createJobControl({ service: processService });
+  // Schedule cron jobs now. The sweep of old stopped runs starts later (below),
+  // after the server listens and the jobs are reconciled, so it never queues
+  // ahead of job control at boot.
+  const cronManager = createCronManager({ service: processService });
+  cronManager.bootstrap(config.scripts, { cleanup: false });
 
-// Use scripts router
-app.use('/', scriptsRouter);
+  const app = createApp({ processService, jobControl, cronManager });
+  let server = null;
 
-// Start server
-const PORT = config.server.port || 3000;
-const HOST = config.server.host;
-const server = app.listen(PORT, HOST, async () => {
+  // PM2 keeps running while TaskServer restarts, so shutting down only closes
+  // TaskServer's own things. It never stops a job.
+  const shutdown = (signal, exitCode = 0) => {
+    if (closing) return;
+    closing = true;
+    console.log(`\nShutting down TaskServer (${signal})...`);
+    // PM2 force-kills a process 1600 ms after asking it to stop; stay inside that.
+    setTimeout(() => process.exit(exitCode), 1000).unref();
+    cronManager.shutdown();
+    if (cleanupInterval) clearInterval(cleanupInterval);
+    cloudflareTunnel.stopTunnel();
+    if (server) {
+      server.close();
+      server.closeIdleConnections?.();
+      setTimeout(() => server.closeAllConnections?.(), 300).unref();
+    }
+    processService.close().finally(() => process.exit(exitCode));
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  installProcessHandlers({ onFatal: () => shutdown('uncaughtException', 1) });
+
+  const PORT = config.server.port || 3000;
+  const HOST = config.server.host;
+  try {
+    server = await listenWithRetry(app, PORT, HOST, { isClosed: () => closing });
+  } catch (error) {
+    console.error(`Could not listen on ${HOST}:${PORT}: ${errorText(error)}`);
+    shutdown('listen failure', 1);
+    return;
+  }
   const address = server.address();
   const host = address.family === 'IPv6' ? `[${address.address}]` : address.address;
   console.log(`TaskServer running at http://${host}:${address.port}`);
+
+  // Adopt the jobs PM2 already runs and start the missing ones. Runs in the
+  // background and retries until PM2 answers.
+  // The version check runs alongside, so a slow answer cannot delay it.
+  checkPm2Versions({ service: processService })
+    .catch(error => console.error(`[PM2] Version check failed: ${errorText(error)}`));
+  reconcileWithRetry({ service: processService, jobControl, isClosed: () => closing })
+    .catch(error => console.error(`[Reconcile] Failed: ${errorText(error)}`))
+    .finally(() => { if (!closing) cronManager.startCleanup(); });
+
   const tunnelOrigin = cloudflareTunnel.localOrigin(address);
-  
   // Start Cloudflare Tunnel if configured
   if (config.cloudflare && config.cloudflare.enabled && config.cloudflare.tunnelToken) {
     try {
@@ -105,17 +161,10 @@ const server = app.listen(PORT, HOST, async () => {
       console.error('❌ Failed to start Cloudflare Tunnel:', error.message);
     }
   }
-});
+}
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down TaskServer...');
-  cronManager.shutdown();
-  if (cleanupInterval) {
-    clearInterval(cleanupInterval);
-    console.log('Stopped log cleanup interval');
-  }
-  cloudflareTunnel.stopTunnel();
-  pm2.disconnect();
-  process.exit();
-});
+if (require.main === module) {
+  main();
+}
+
+module.exports = { createApp, listenWithRetry, main };

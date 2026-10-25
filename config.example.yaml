@@ -11,6 +11,7 @@ server:
   port: 3000
   host: "127.0.0.1"             # Default even if omitted; only this machine can connect
   logsDir: "./logs"
+  selfName: "taskserver"        # The PM2 name TaskServer runs under, so it can restart itself
 # For LAN access, explicitly set host: "0.0.0.0" (all IPv4 interfaces).
 # Risk: the dashboard has no login and can control scripts; restrict network access.
 
@@ -33,6 +34,10 @@ pm2:
   maxRestarts: 10000
   autoRestart: true
   restartDelay: 1000            # Start with a 1 second backoff for crashed forever scripts
+  killTimeoutMs: 5000           # How long a job may take to exit when stopped, before PM2 force-kills it
+                                # (a script can set its own killTimeoutMs, and an optional stopCommand)
+  reconcileMaxRestartFraction: 0.5  # At boot, if more than this share of running jobs look changed (and more
+                                # than 2), none are restarted. 1 turns the check off.
 
 # Scripts Configuration
 # PM2 automatically detects script types based on file extension:

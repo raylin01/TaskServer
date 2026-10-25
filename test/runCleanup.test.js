@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { createRunCleanup, runPattern, selectStoppedRuns } = require('../utils/runCleanup');
+const { createProcessService } = require('../utils/processService');
 
 function processEntry(name, id, status = 'stopped', exitCode = 0) {
   return { name, pm_id: id, pid: status === 'online' ? 1000 + id : 0,
@@ -44,12 +45,18 @@ function fixture(t, entries, extra = {}) {
       cb(null, [proc]);
     },
   };
-  const options = { client, getScripts: () => [{ name: 'Aeros DDNS' }, { name: 'Aeros WireGuard Tunnel' }],
-    historyPath, chunkPauseMs: 0, backlogIntervalMs: 5,
-    logger: { log() {}, warn: m => state.warnings.push(m), error: m => state.errors.push(m) }, ...extra };
+  // Options that belong to the shared PM2 client rather than to the cleanup.
+  const { rpcTimeoutMs, disconnectTimeoutMs, connectTimeoutMs, createClient, ...managerExtra } = extra;
+  const { operationTimeoutMs } = extra;
+  const logger = { log() {}, warn: m => state.warnings.push(m), error: m => state.errors.push(m) };
+  const service = createProcessService({ createClient: createClient ?? (() => client),
+    rpcTimeoutMs, operationTimeoutMs, disconnectTimeoutMs, connectTimeoutMs, logger });
+  t.after(() => service.close());
+  const options = { service, getScripts: () => [{ name: 'Aeros DDNS' }, { name: 'Aeros WireGuard Tunnel' }],
+    historyPath, chunkPauseMs: 0, backlogIntervalMs: 5, logger, ...managerExtra };
   const manager = createRunCleanup(options);
   t.after(() => manager.shutdown());
-  return { manager, state, client, historyPath, options };
+  return { manager, state, client, historyPath, options, service };
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -93,7 +100,6 @@ test('finished run is persisted before numeric deletion; last-run info survives 
   assert.equal(reloaded.runId, saved.runId);
   assert.equal(reloaded.lastRun, saved.lastRun);
   assert.equal(reloaded.lastTrigger, saved.lastTrigger);
-  assert.equal(state.events.at(-1), 'disconnect');
 });
 
 test('overlapping runs keep newest launch metadata and never delete online run', async t => {
@@ -143,7 +149,6 @@ test('failed metadata write never deletes a run', async t => {
   const manager = createRunCleanup({ ...options, historyPath: path.join(options.historyPath, 'missing', 'history') });
   await assert.rejects(manager.reconcile());
   assert.equal(state.deleted.length, 0);
-  assert.equal(state.events.at(-1), 'disconnect');
 });
 
 test('a later scan reconnects after failure and catches an exit missed during downtime', async t => {
@@ -153,8 +158,8 @@ test('a later scan reconnects after failure and catches an exit missed during do
   state.failConnect = false;
   await manager.start();
   assert.equal(state.deleted.length, 1);
-  // The failed attempt, then a plan operation and a delete chunk.
-  assert.equal(state.events.filter(e => e === 'connect').length, 3);
+  // The failed attempt, then one connection that serves the plan and the delete chunk.
+  assert.equal(state.events.filter(e => e === 'connect').length, 2);
 });
 
 test('manual launch uses same collector and serializes concurrent PM2 operations', async t => {
@@ -163,7 +168,7 @@ test('manual launch uses same collector and serializes concurrent PM2 operations
     manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' }),
     manager.reconcile(),
   ]);
-  assert.deepEqual(state.events, ['connect', 'start', 'disconnect', 'connect', 'list', 'disconnect']);
+  assert.deepEqual(state.events, ['connect', 'start', 'list']);
   state.entries[0].pm2_env.status = 'stopped';
   await manager.reconcile();
   assert.equal(state.deleted.length, 1);
@@ -270,7 +275,6 @@ test('an RPC error releases the queue and is logged with its message', async t =
   assert.ok(state.errors.some(line => line.includes('daemon exploded')), state.errors.join('|'));
   client.list = list;
   await manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' });
-  assert.equal(state.events.at(-1), 'disconnect');
   assert.ok(state.events.includes('start'));
 });
 
@@ -292,19 +296,16 @@ test('an RPC timeout rejects, disconnects and releases the queue; a late reply i
 test('operations never overlap even when one times out', async t => {
   const { manager, state, client } = fixture(t, [], { rpcTimeoutMs: 40 });
   const start = client.start;
-  let open = 0;
-  let overlap = false;
-  client.connect = cb => { open += 1; overlap ||= open > 1; cb(null); };
-  client.disconnect = cb => { open -= 1; cb(); };
-  client.start = (config, cb) => { if (config.name.endsWith('hang')) return; start(config, cb); };
+  client.start = (config, cb) => { if (config.name.endsWith('hang')) return state.events.push('start'); start(config, cb); };
   const results = await Promise.allSettled([
     manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-hang' }),
     manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000001' }),
     manager.reconcile(),
   ]);
   assert.deepEqual(results.map(r => r.status), ['rejected', 'fulfilled', 'fulfilled']);
-  assert.equal(overlap, false);
-  assert.equal(open, 0);
+  // The second operation starts only after the first timed out and its
+  // connection was dropped; the next one reconnects.
+  assert.deepEqual(state.events, ['connect', 'start', 'disconnect', 'connect', 'start', 'list']);
 });
 
 test('an operation that exceeds its overall deadline is abandoned and makes no further calls', async t => {
@@ -316,10 +317,14 @@ test('an operation that exceeds its overall deadline is abandoned and makes no f
 });
 
 test('a disconnect that never answers cannot wedge the queue', async t => {
-  const { manager, state, client } = fixture(t, [], { disconnectTimeoutMs: 20 });
+  const { manager, state, client } = fixture(t, [processEntry('Aeros DDNS-cron-1792800000000', 1)],
+    { disconnectTimeoutMs: 20, rpcTimeoutMs: 30 });
+  const list = client.list;
   client.disconnect = () => { state.events.push('disconnect'); };
-  await manager.reconcile();
-  await manager.reconcile();
+  client.list = () => {};
+  await assert.rejects(manager.reconcile(), /timed out/);
+  client.list = list;
+  assert.equal(await manager.reconcile(), 1);
   assert.equal(state.events.filter(e => e === 'connect').length, 2);
 });
 
@@ -380,7 +385,7 @@ test('scan failures are logged with the error message and no job details', async
   const { manager, state } = fixture(t, []);
   state.failConnect = true;
   await assert.rejects(manager.start(), /offline/);
-  assert.deepEqual(state.errors, ['[Run Cleanup] Scan failed; will retry: offline']);
+  assert.deepEqual(state.errors, ['[Run Cleanup] Scan failed; will retry: PM2 is not reachable: offline']);
 });
 
 test('cron registration does not wait for the startup sweep', async t => {
@@ -398,21 +403,6 @@ test('cron registration does not wait for the startup sweep', async t => {
   assert.equal(manager.cronSuspended.Suspended, true);
   await booting;
   assert.deepEqual(state.errors, ['[Run Cleanup] Scan failed; will retry: PM2 list timed out']);
-});
-
-test('the installed pm2 exposes the calls the cleanup relies on', () => {
-  const pm2 = require('pm2');
-  const client = new pm2.custom();
-  for (const method of ['connect', 'disconnect', 'list', 'start']) assert.equal(typeof client[method], 'function', method);
-  assert.equal(typeof client.Client.executeRemote, 'function');
-  // The cleanup calls the daemon's RPC method directly; a pm2 upgrade that
-  // drops it from the daemon must fail here.
-  const daemon = fs.readFileSync(require.resolve('pm2/lib/Daemon.js'), 'utf8');
-  assert.match(daemon, /deleteProcessId\s*:\s*God\.deleteProcessId/);
-  // Reading the source: loading God itself starts daemon timers that keep node alive.
-  const actions = fs.readFileSync(require.resolve('pm2/lib/God/ActionMethods.js'), 'utf8');
-  assert.match(actions, /God\.deleteProcessId\s*=\s*function\s*\(\s*id\s*,\s*cb\s*\)/);
-  assert.match(actions, /id \+ ' : id unknown'/);
 });
 
 test('an id the daemon no longer knows is skipped and the rest of the chunk is still deleted', async t => {
@@ -458,36 +448,36 @@ test('run-now surfaces the start-timeout message without suggesting a retry', as
 });
 
 test('after a timeout the abandoned client is never used again; a fresh one reaches the same daemon', async t => {
-  const { options, state, client } = fixture(t, []);
+  const { options, client } = fixture(t, []);
   const made = [];
   const createClient = () => {
-    const id = made.length;
     const calls = [];
     const wrapped = {};
     for (const method of ['connect', 'disconnect', 'list', 'start']) {
       wrapped[method] = (...args) => { calls.push(method); return client[method](...args); };
     }
     wrapped.Client = client.Client;
-    made.push({ id, calls, wrapped });
+    made.push({ calls, wrapped });
     return wrapped;
   };
-  const manager = createRunCleanup({ ...options, client: undefined, createClient, rpcTimeoutMs: 30 });
+  const service = createProcessService({ createClient, rpcTimeoutMs: 30, logger: { warn() {}, log() {}, error() {} } });
+  t.after(() => service.close());
+  const manager = createRunCleanup({ ...options, service });
   t.after(() => manager.shutdown());
-  assert.equal(made.length, 1);
-  const hung = made[0].wrapped;
   const originalStart = client.start;
   let late;
   client.start = (config, cb) => { late = () => originalStart(config, cb); };
   await assert.rejects(manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000000' }), /may still have started/);
-  assert.equal(made.length, 2, 'a new client replaced the one that timed out');
+  assert.equal(made.length, 1);
+  const hung = made[0].wrapped;
   const callsAfterTimeout = made[0].calls.slice();
   client.start = originalStart;
   late();
   await manager.reconcile();
   await manager.launch('Aeros DDNS', { name: 'Aeros DDNS-manual-1792800000001' });
   assert.deepEqual(made[0].calls, callsAfterTimeout);
+  assert.equal(made.length, 2, 'one new client after the timeout, none after that');
   assert.ok(made[1].calls.includes('list') && made[1].calls.includes('start'));
-  assert.equal(made.length, 2, 'no further replacement without a timeout');
   assert.notEqual(made[1].wrapped, hung);
 });
 

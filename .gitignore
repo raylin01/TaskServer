@@ -41,3 +41,6 @@ yarn-error.log*
 
 # Latest cron/manual run metadata (no commands or environment)
 .taskserver-run-history.json*
+
+# bun is the package manager (bun.lock is committed)
+package-lock.json

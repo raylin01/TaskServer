@@ -3,6 +3,7 @@ const path = require('path');
 const configHandler = require('./configHandler');
 const { createRunCleanup } = require('./runCleanup');
 const { applyScriptExecution } = require('./scriptRunner');
+const { killTimeoutFor } = require('./jobSpec');
 
 let lastRunId = 0;
 
@@ -15,6 +16,7 @@ function buildRunConfig(script, trigger) {
     args: script.args || [],
     env: script.env || {},
     autorestart: false,
+    kill_timeout: killTimeoutFor(script, configHandler.loadConfig().pm2),
     out_file: path.join(logsDir, `${script.name}-out-${runId}.log`),
     error_file: path.join(logsDir, `${script.name}-error-${runId}.log`),
   };
@@ -22,6 +24,7 @@ function buildRunConfig(script, trigger) {
   return applyScriptExecution(pm2Config, script);
 }
 
+// `options.service` is the shared PM2 client (utils/processService.js).
 function createCronManager(options = {}) {
   const jobs = new Map();
   const runCleanup = createRunCleanup({ getScripts: () => configHandler.loadConfig().scripts, ...options });
@@ -144,13 +147,19 @@ function createCronManager(options = {}) {
     cronSuspended[scriptName] = Boolean(suspended);
   }
 
-  // Register every cron job right away, then start the cleanup scans in the
-  // background. Scheduling never waits on PM2 or on the startup sweep.
-  function bootstrap(scripts) {
+  // Start the cleanup scans in the background. The failure of a scan is already
+  // logged with its message, and scans keep retrying.
+  function startCleanup() {
+    return runCleanup.start().catch(() => {});
+  }
+
+  // Register every cron job right away. Scheduling never waits on PM2 or on the
+  // startup sweep. The server passes `cleanup: false` and starts the sweep
+  // itself once it is listening and the jobs are reconciled, so the sweep's
+  // PM2 calls do not queue ahead of job control at boot.
+  function bootstrap(scripts, { cleanup = true } = {}) {
     scripts.forEach((script) => upsertScript(script));
-    return runCleanup.start().catch(() => {
-      // The failure is already logged with its message; scans keep retrying.
-    });
+    return cleanup ? startCleanup() : Promise.resolve();
   }
 
   function shutdown() {
@@ -162,6 +171,7 @@ function createCronManager(options = {}) {
     cronRunHistory,
     start: runCleanup.start,
     bootstrap,
+    startCleanup,
     cronSuspended,
     upsertScript,
     unregisterScript,
@@ -174,5 +184,7 @@ function createCronManager(options = {}) {
     })),
   };
 }
+
+createCronManager.buildRunConfig = buildRunConfig;
 
 module.exports = createCronManager;
