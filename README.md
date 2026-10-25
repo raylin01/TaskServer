@@ -3,7 +3,7 @@
 **TaskServer** is an always-on Node.js server for running and scheduling scripts with a web-based dashboard. It provides an easy way to manage long-running processes and scheduled cron jobs without the need for a database.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Node](https://img.shields.io/badge/node-%3E%3D14.0.0-brightgreen.svg)
+![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)
 
 ## Features
 
@@ -34,8 +34,8 @@
 
 ### Prerequisites
 
-- Node.js >= 14.0.0
-- npm or yarn
+- Node.js >= 18
+- [Bun](https://bun.sh) (the committed lockfile is `bun.lock`; use `bun install`)
 - Python 3.x (if you plan to run Python scripts)
 
 ### Setup
@@ -50,7 +50,7 @@ cd TaskServer
 2. **Install dependencies**:
 
 ```bash
-npm install
+bun install
 ```
 
 3. **Create your configuration file**:
@@ -100,7 +100,50 @@ To enable this:
     ```
 3.  **Configure GitSync**: Add TaskServer to your GitSync config (see GitSync docs).
 
-When updated, GitSync will call the restart API. TaskServer detects it is restarting itself and performs a graceful `pm2 restart` instead of a full stop/start cycle.
+When updated, GitSync calls `POST /api/restart-script/taskserver` (with the `X-API-Key` header when `api.authEnabled` is on). TaskServer answers first, then asks PM2 to restart it, so the caller always gets a clean reply. The PM2 name it restarts is `server.selfName` (default `taskserver`).
+
+On `SIGINT` or `SIGTERM` TaskServer closes its own listener and exits within a second. It never stops the jobs it manages. If the port is still held by the previous instance it logs that, retries with a growing pause (about 20 s in total), then exits with an error.
+
+## Restarts, Adoption and Slow Shutdowns
+
+PM2 keeps running when TaskServer restarts, so jobs are normally already running at boot. TaskServer compares the config with `pm2 list` and only acts where it has to:
+
+| What PM2 has | What TaskServer does |
+|---|---|
+| Nothing for this job | Starts it (unless the config says `stopped: true`) |
+| `stopped` or `errored` | Starts it (unless `stopped: true`) |
+| `online`, same effective config | Leaves it running (adopts it) |
+| `online`, effective config changed | Restarts it and logs which fields changed (names only, never values) |
+| `launching`, `waiting restart`, `stopping` | Leaves it to PM2 |
+| `online`, but the config says `stopped: true` | Leaves it running and logs a warning. The dashboard shows the real state with a "marked stopped in config" note; press Stop to stop it for good |
+
+"Effective config" is compared against the running process itself: the executable, args, working directory, the env keys the job configures (by value), and `autorestart`, `max_restarts` and the restart delay. Log file paths and the kill timeout are ignored. An env key removed from the config is not noticed (PM2 mixes the starter's whole environment into the job's env, so a removed key cannot be told apart from an inherited one); it goes away on the next restart.
+
+### Stopping jobs that need time to shut down
+
+PM2 signals a job (`SIGINT` by default), waits `kill_timeout`, then `SIGKILL`s it. For a job that needs longer, such as a `sudo` wrapper whose root child must exit, that strands the child. Set how long a job may take:
+
+```yaml
+pm2:
+  killTimeoutMs: 5000          # default for every job
+
+scripts:
+  - name: Tunnel
+    command: sudo -n python3 tunnel.py
+    type: forever
+    killTimeoutMs: 30000       # this job gets 30 s
+    stopCommand: sudo -n python3 tunnel.py --stop   # optional, see below
+```
+
+New processes are started with that `kill_timeout`. PM2 uses the value stored on the *running* process, so for a process started before this setting existed TaskServer itself signals the process tree first, waits up to the job's timeout for it to exit, and only then asks PM2 to stop it. This applies to Stop, Restart, Delete and a config-change restart done from TaskServer. It does not apply to `pm2 stop` typed in a terminal.
+
+`stopCommand` (optional) runs through the shell, in the job's directory and env, before the stop. Its output is discarded, it gets the job's timeout, and a failure only logs a warning. Use it when a job needs more than a signal, for example `sudo -n ... --stop` (needs a sudoers entry).
+
+For `pm2 stop` or a PM2 daemon restart from a terminal to be safe too, set `PM2_KILL_SIGNAL` and `PM2_KILL_TIMEOUT` in the environment the PM2 daemon starts with (for macOS, the LaunchAgent plist's `EnvironmentVariables`).
+
+## PM2 Client and Errors
+
+All PM2 access goes through one long-lived client (`utils/processService.js`) with a queue for changes and a timeout on every call. If PM2 is unreachable the dashboard still loads (job states show as `unknown`), JSON API calls return `503`, and nothing crashes; at boot the reconcile step retries until PM2 answers. At start TaskServer warns if the `pm2` package version differs from the running daemon's. `package.json` pins `pm2` to the daemon's version for this reason: when you upgrade PM2 itself, change the pin and run `bun install`.
 
 ## Configuration
 
@@ -633,7 +676,7 @@ scripts:
 
 ### PM2 Connection Errors
 
-1. Restart the server: `npm start`
+1. Restart the server: `npm start`  (TaskServer retries PM2 on its own at boot)
 2. Clear PM2 processes: `pm2 kill` then restart
 3. Check PM2 logs: `pm2 logs`
 
@@ -653,7 +696,11 @@ TaskServer/
 │   ├── exampleForever.js
 │   └── exampleCron.py
 ├── utils/                # Utility modules
-│   ├── configHandler.js  # Config loading/saving
+│   ├── configHandler.js  # Config loading/saving (TASKSERVER_CONFIG overrides the path)
+│   ├── processService.js # The one PM2 client: queue, timeouts, reconnect
+│   ├── jobSpec.js        # PM2 config for a job; compare config with a running process
+│   ├── jobControl.js     # Start/stop/replace jobs, slow-shutdown handling
+│   ├── reconcile.js      # Boot-time adoption of running jobs
 │   ├── logViewer.js      # Log management
 │   ├── logCleanup.js     # Automatic log cleanup
 │   └── cloudflareTunnel.js # Cloudflare Tunnel integration
@@ -687,4 +734,4 @@ If you encounter any issues or have questions, please open an issue on GitHub.
 
 ## Tests
 
-Run `npm test` with Node.js 18 or newer (uses the built-in `node --test` runner).
+Run `bun run test` (or `npm test`) with Node.js 18 or newer (uses the built-in `node --test` runner). The PM2 contract test runs a real PM2 core in a private temp directory; it never touches your PM2.
