@@ -144,6 +144,15 @@ function createCronManager(options = {}) {
     cronSuspended[scriptName] = Boolean(suspended);
   }
 
+  // Register every cron job right away, then start the cleanup scans in the
+  // background. Scheduling never waits on PM2 or on the startup sweep.
+  function bootstrap(scripts) {
+    scripts.forEach((script) => upsertScript(script));
+    return runCleanup.start().catch(() => {
+      // The failure is already logged with its message; scans keep retrying.
+    });
+  }
+
   function shutdown() {
     runCleanup.shutdown();
     Array.from(jobs.keys()).forEach((scriptName) => unregisterScript(scriptName));
@@ -152,6 +161,7 @@ function createCronManager(options = {}) {
   return {
     cronRunHistory,
     start: runCleanup.start,
+    bootstrap,
     cronSuspended,
     upsertScript,
     unregisterScript,
