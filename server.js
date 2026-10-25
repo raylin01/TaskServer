@@ -14,7 +14,7 @@ const { createProcessService, errorText } = require('./utils/processService');
 const { createJobControl } = require('./utils/jobControl');
 const { reconcileWithRetry, checkPm2Versions } = require('./utils/reconcile');
 const { errorMiddleware, installProcessHandlers } = require('./utils/httpErrors');
-const { createSecurity, listenProblems } = require('./utils/security');
+const { createSecurity, createAuthSource, listenProblems } = require('./utils/security');
 const scriptsRouter = require('./routes/scripts');
 
 function createApp({ processService, jobControl, cronManager, security = createSecurity() } = {}) {
@@ -129,7 +129,10 @@ async function main() {
   const cronManager = createCronManager({ service: processService });
   cronManager.bootstrap(config.scripts, { cleanup: false });
 
-  const app = createApp({ processService, jobControl, cronManager });
+  // The security settings start from the config checked above, so there is no
+  // moment at which a missing or empty file could count as "no authentication".
+  const security = createSecurity({ loadAuth: createAuthSource({ seed: config }) });
+  const app = createApp({ processService, jobControl, cronManager, security });
   let server = null;
 
   // PM2 keeps running while TaskServer restarts, so shutting down only closes

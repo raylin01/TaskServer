@@ -38,13 +38,23 @@ const MIN_KEY_LENGTH = 16;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
 
-// Wrong keys: after FREE_FAILURES in a row from one address, further requests
-// from it are refused for a pause that doubles up to MAX_PAUSE_MS. Failures are
-// forgotten after FORGET_MS without a new one.
+// Wrong keys: after FREE_FAILURES different wrong keys from one address, further
+// requests from it are refused for a pause that doubles up to MAX_PAUSE_MS. The
+// same wrong key again counts for nothing (a client that forgot to update its
+// key must not lock everyone else out). A right key outside a pause starts the
+// count again. Failures are forgotten after FORGET_MS without a new one.
+// Clients on the loopback interface (the scripts and the console on the same
+// machine, all sharing one address) get a short pause, LOOPBACK_PAUSE_MS, unless a
+// proxy or tunnel is configured or announced by its headers.
 const FREE_FAILURES = 5;
 const BASE_PAUSE_MS = 1000;
 const MAX_PAUSE_MS = 30000;
+const LOOPBACK_PAUSE_MS = 2000;
 const FORGET_MS = 10 * 60 * 1000;
+const REMEMBERED_WRONG_KEYS = 8;
+const MAX_CLIENTS = 10000;
+const SWEEP_MS = 60 * 1000;
+const PROXY_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-real-ip', 'forwarded', 'cf-connecting-ip'];
 
 // Scripts and styles only from this site, nothing inline. Inline styles stay
 // allowed because the pages use style attributes.
@@ -91,6 +101,9 @@ function parseSettings(config, previous = null) {
   if (previous?.hasApi && !hasApi) return { problem: 'config.yaml no longer has the api section' };
   if (hasApi && !isMapping(config.api)) return { problem: 'api in config.yaml must be a mapping' };
   const api = hasApi ? config.api : {};
+  if (previous?.enabled && api.authEnabled === undefined) {
+    return { problem: 'api.authEnabled in config.yaml is missing (it was on); set it to false to turn authentication off' };
+  }
   if (api.authEnabled !== undefined && typeof api.authEnabled !== 'boolean') {
     return { problem: 'api.authEnabled in config.yaml must be true or false' };
   }
@@ -143,8 +156,12 @@ const REFUSE_ALL = { enabled: true, apiKey: '', hasApi: true, host: undefined, a
 // running). Settings that cannot be used never switch protection off: the last
 // good ones stay in force. Only the very first read may fall back to "no
 // authentication" (no config.yaml yet).
-function createAuthSource({ read = configHandler.readRawConfig, logger = console } = {}) {
-  let lastGood = null;
+//
+// `seed` is the config start-up already loaded and checked: it is the "last good"
+// from the first request on, so there is no window in which an empty or missing
+// file could be taken for "no authentication".
+function createAuthSource({ read = configHandler.readRawConfig, logger = console, seed } = {}) {
+  let lastGood = seed === undefined ? null : parseSettings(seed).settings || null;
   let lastProblem = null;
   return () => {
     let outcome;
@@ -199,29 +216,54 @@ function localPath(value, fallback = '/scripts') {
   return /^\/(?![/\\])/.test(text) && !/[\r\n]/.test(text) && !text.startsWith('/login') ? text : fallback;
 }
 
-// Failed-key bookkeeping per client address.
-function createThrottle(now, freeFailures) {
-  const failures = new Map();
+const isLoopbackAddress = address => /^(127(\.\d{1,3}){3}|::1|::ffff:127(\.\d{1,3}){3})$/.test(String(address || ''));
+
+// Failed-key bookkeeping per client address: { count, last, blockedUntil, seen }
+// where `seen` holds short hashes of the last few wrong keys. The table is
+// capped: the entry touched longest ago goes first (an update re-inserts the
+// entry at the end), and stale entries are swept at most once a minute.
+function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS } = {}) {
+  const clients = new Map();
+  let swept = now();
+  const sweep = time => {
+    if (time - swept < SWEEP_MS) return;
+    swept = time;
+    for (const [key, entry] of clients) if (time - entry.last > FORGET_MS) clients.delete(key);
+  };
   return {
     // Seconds to wait, or 0.
     wait(client) {
-      const entry = failures.get(client);
+      const entry = clients.get(client);
       return entry && entry.blockedUntil > now() ? Math.ceil((entry.blockedUntil - now()) / 1000) : 0;
     },
-    fail(client) {
+    // A wrong key. `maxPauseMs` caps the pause for this client.
+    fail(client, key, maxPauseMs = MAX_PAUSE_MS) {
       const time = now();
-      if (failures.size > 1000) {
-        for (const [key, entry] of failures) if (time - entry.last > FORGET_MS) failures.delete(key);
-      }
-      let entry = failures.get(client);
-      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, last: time, blockedUntil: 0 };
+      sweep(time);
+      let entry = clients.get(client);
+      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, last: time, blockedUntil: 0, seen: new Set() };
+      const tag = sha256(key).toString('hex').slice(0, 16);
+      if (entry.seen.has(tag)) return; // the same wrong key again: nothing new was guessed
+      entry.seen.add(tag);
+      if (entry.seen.size > REMEMBERED_WRONG_KEYS) entry.seen.delete(entry.seen.values().next().value);
       entry.count += 1;
       entry.last = time;
       if (entry.count >= freeFailures) {
-        entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** (entry.count - freeFailures), MAX_PAUSE_MS);
+        entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** (entry.count - freeFailures), maxPauseMs);
       }
-      failures.set(client, entry);
+      clients.delete(client);
+      clients.set(client, entry);
+      while (clients.size > maxClients) clients.delete(clients.keys().next().value);
     },
+    // A right key outside a pause.
+    succeed(client) {
+      const entry = clients.get(client);
+      if (entry && entry.blockedUntil <= now()) {
+        entry.count = 0;
+        entry.blockedUntil = 0;
+      }
+    },
+    size: () => clients.size,
   };
 }
 
@@ -233,10 +275,15 @@ function createSecurity({
 } = {}) {
   const throttle = createThrottle(now, freeFailures);
   const clientOf = req => req.socket?.remoteAddress || 'unknown';
+  const pauseCapFor = (req, auth) => (isLoopbackAddress(clientOf(req)) && auth.publicOrigins.length === 0
+    && !PROXY_HEADERS.some(name => req.headers[name] !== undefined) ? LOOPBACK_PAUSE_MS : MAX_PAUSE_MS);
 
   // One read of config.yaml per request, shared by every check.
   const settingsFor = req => {
-    req.securitySettings = req.securitySettings || loadAuth();
+    if (!req.securitySettings) {
+      req.securitySettings = loadAuth();
+      if (!req.securitySettings.enabled && sessions.size) sessions.clear(); // auth switched off: forget every session
+    }
     return req.securitySettings;
   };
 
@@ -314,10 +361,11 @@ function createSecurity({
       const seconds = throttle.wait(clientOf(req));
       if (seconds) return tooMany(res, seconds);
       if (keyMatches(auth, given)) {
+        throttle.succeed(clientOf(req));
         req.authMode = 'key';
         return next();
       }
-      throttle.fail(clientOf(req));
+      throttle.fail(clientOf(req), given, pauseCapFor(req, auth));
     } else {
       const id = parseCookies(req.headers.cookie)[SESSION_COOKIE];
       if (sessionValid(auth, id)) {
@@ -385,9 +433,10 @@ function createSecurity({
         .render('login', { next, error: `Too many wrong keys. Wait ${seconds} s and try again.` });
     }
     if (!keyMatches(auth, req.body?.apiKey)) {
-      throttle.fail(clientOf(req));
+      throttle.fail(clientOf(req), String(req.body?.apiKey ?? ''), pauseCapFor(req, auth));
       return res.status(401).render('login', { next, error: 'That key is not correct.' });
     }
+    throttle.succeed(clientOf(req));
     res.set('Set-Cookie', sessionCookie(req, newSession(auth), SESSION_MS));
     res.redirect(next);
   });
@@ -407,6 +456,7 @@ function createSecurity({
 module.exports = {
   createSecurity,
   createAuthSource,
+  createThrottle,
   parseSettings,
   listenProblems,
   isLoopbackHost,

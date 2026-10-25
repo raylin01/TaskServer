@@ -106,11 +106,21 @@ function getLogsDir() {
 }
 
 // Replace the file in one step: the new text goes to a temporary file in the
-// same folder, is flushed to disk, and is then renamed over the old file. A
-// reader (this process's auth check, or anything else) sees the whole old file
-// or the whole new one, never a half-written one.
+// same folder, is flushed to disk, is renamed over the old file, and the folder
+// is flushed too. A reader (this process's auth check, or anything else) sees
+// the whole old file or the whole new one, never a half-written one. If the
+// config path is a symbolic link, the file it points to is the one replaced.
+//
+// A failed write is logged (without the file's text) and thrown, so a request
+// that changes the config answers with an error instead of reporting a change
+// that did not happen. The old file is left as it was.
 function writeConfig(config) {
-  const target = getConfigPath();
+  let target = getConfigPath();
+  try {
+    target = fs.realpathSync(target);
+  } catch (error) {
+    // A new file: write at the path as given.
+  }
   const temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`);
   let fd;
   try {
@@ -127,11 +137,25 @@ function writeConfig(config) {
     fd = undefined;
     fs.renameSync(temp, target);
   } catch (e) {
-    console.error('Failed to write config.yaml:', e);
     if (fd !== undefined) {
       try { fs.closeSync(fd); } catch (closeError) { /* already closed */ }
     }
     try { fs.unlinkSync(temp); } catch (unlinkError) { /* never created */ }
+    console.error(`Failed to write config.yaml: ${e.code || e.message}`);
+    throw new Error(`Could not write config.yaml: ${e.code || 'write error'}`);
+  }
+  // Make the rename itself durable. Not every platform can open a folder.
+  try {
+    const dir = fs.openSync(path.dirname(target), 'r');
+    try {
+      fs.fsyncSync(dir);
+    } finally {
+      fs.closeSync(dir);
+    }
+  } catch (e) {
+    if (!['EISDIR', 'EPERM', 'EACCES', 'EINVAL', 'ENOTSUP'].includes(e.code)) {
+      console.error(`Could not flush the config folder: ${e.code || e.message}`);
+    }
   }
 }
 

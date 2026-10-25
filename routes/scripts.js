@@ -5,6 +5,7 @@ const cron = require('node-cron');
 const configHandler = require('../utils/configHandler');
 const logViewer = require('../utils/logViewer');
 const fs = require('fs');
+const { pipeline } = require('stream');
 const path = require('path');
 const { asyncHandler: wrap } = require('../utils/httpErrors');
 const { describeJob, findProcess, LIVE } = require('../utils/jobControl');
@@ -152,7 +153,8 @@ router.get('/api/logs/:scriptName/chunk', wrap(async (req, res) => {
 
 // API endpoint to download log file. It streams from the descriptor that was
 // checked (see logViewer.openLog), up to the size seen then: a log that is still
-// being written does not make the length wrong.
+// being written does not make the length wrong. pipeline() closes the file when
+// the client goes away or the stream fails.
 router.get('/api/logs/:scriptName/download', wrap(async (req, res, next) => {
   const { fd, size } = logViewer.openLog(req.params.scriptName, req.query.file);
   res.attachment(req.query.file);
@@ -162,8 +164,9 @@ router.get('/api/logs/:scriptName/download', wrap(async (req, res, next) => {
     stream.destroy();
     return res.end();
   }
-  stream.on('error', next);
-  stream.pipe(res);
+  pipeline(stream, res, error => {
+    if (error && error.code !== 'ERR_STREAM_PREMATURE_CLOSE') next(error);
+  });
 }));
 
 // API endpoint to delete log file

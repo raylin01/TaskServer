@@ -10,7 +10,8 @@ const path = require('path');
 const yaml = require('js-yaml');
 const { createFakePm2 } = require('./fakePm2');
 const { createApp } = require('../server');
-const { createSecurity } = require('../utils/security');
+const { createSecurity, createAuthSource } = require('../utils/security');
+const configHandler = require('../utils/configHandler');
 
 const fakeCron = () => ({
   cronRunHistory: {}, cronSuspended: {}, upsertScript() {}, unregisterScript() {}, setSuspended() {}, runNow: async () => {},
@@ -43,7 +44,7 @@ function request(base, method, url, { headers = {}, json, form, raw } = {}) {
   });
 }
 
-async function boot(t, { scripts = [], extra = {}, setupPm2, prefix = 'taskserver-http-', securityOptions } = {}) {
+async function boot(t, { scripts = [], extra = {}, setupPm2, prefix = 'taskserver-http-', securityOptions, seedFromStartup = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const file = path.join(dir, 'config.yaml');
   const logsDir = path.join(dir, 'logs');
@@ -55,7 +56,8 @@ async function boot(t, { scripts = [], extra = {}, setupPm2, prefix = 'taskserve
   process.env.TASKSERVER_CONFIG = file;
   const pm2 = createFakePm2();
   setupPm2?.(pm2, config);
-  const app = createApp({ processService: pm2, cronManager: fakeCron(), ...(securityOptions && { security: createSecurity(securityOptions) }) });
+  const app = createApp({ processService: pm2, cronManager: fakeCron(), ...((securityOptions || seedFromStartup) && { security: createSecurity({ ...securityOptions,
+    ...(seedFromStartup && { loadAuth: createAuthSource({ seed: configHandler.loadConfigStrict() }) }) }) }) });
   const server = await new Promise(resolve => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections?.(); }));
   t.after(() => { delete process.env.TASKSERVER_CONFIG; fs.rmSync(dir, { recursive: true, force: true }); });

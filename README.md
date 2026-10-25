@@ -228,19 +228,28 @@ do not have it get a `401` (browsers are sent to `/login`).
   `openssl rand -base64 24`.
 - Programs send the key in the `X-API-Key` header. The key is **not** accepted in a
   URL (`?apiKey=` no longer works) and is compared in constant time.
-- After 5 wrong keys in a row from one address (in the header or at `/login`),
-  requests from it are refused with `429` for 1 s, then 2 s, 4 s and so on up to
-  30 s, even with the right key. Failures are forgotten after 10 quiet minutes.
-  Behind a proxy or tunnel every client has the proxy's address, so they share one
-  count.
+- After 5 *different* wrong keys from one address (in the header or at `/login`),
+  requests from it are refused with `429` for a pause that doubles from 1 s up to
+  30 s, even with the right key (otherwise 429 against 200 would tell a guesser
+  which key is right). The same wrong key sent again counts for nothing, so a
+  client with an out-of-date key cannot lock anyone else out. A right key outside
+  a pause starts the count again, and failures are forgotten after 10 quiet
+  minutes. Clients on the loopback interface (scripts and consoles on the same
+  machine) get a pause of at most 2 s, unless `server.publicOrigins` is set or the
+  request carries proxy headers (`X-Forwarded-For` and similar): behind a proxy or
+  tunnel every client has the proxy's address, so they share one count and the
+  full 30 s ladder applies.
 - The dashboard signs in at `/login` with the same key and then uses a random,
   `HttpOnly`, `SameSite=Strict` session cookie (7 days). Sessions are kept in memory:
   "Log out" ends one at once, and restarting TaskServer ends all of them. Changing
   the key ends them too. The cookie and the CSRF token are not derived from the key.
-- If `config.yaml` goes missing, becomes empty, is cut off, or gets settings that
-  make no sense while TaskServer runs, the last good security settings stay in
-  force, and with none every request is refused. Config writes are atomic
-  (temporary file, flush, rename).
+- The security settings TaskServer checked at start-up are in force from the first
+  request. If `config.yaml` goes missing, becomes empty, is cut off, drops
+  `api.authEnabled` while auth was on, or gets settings that make no sense while
+  TaskServer runs, the last good settings stay in force (turn auth off by setting
+  `api.authEnabled: false`, which also ends every session). Config writes are
+  atomic (temporary file, flush, rename, flush the folder; a symbolic link is
+  followed), and a write that fails is an error response, never a reported success.
 
 **Requests from other web pages.** A page open in the same browser cannot make
 TaskServer do anything:

@@ -207,3 +207,29 @@ test('a download streams the checked file with its length, including an empty on
   assert.equal(big.headers['content-length'], '100000');
   assert.equal(big.text.length, 100000);
 });
+
+test('a download whose client goes away releases the file', async t => {
+  const { base, logsDir } = await bootWithLogs(t);
+  fs.writeFileSync(path.join(logsDir, 'Example Job-out-50.log'), Buffer.alloc(64 * 1024 * 1024, 'x'));
+  const streams = [];
+  const real = fs.createReadStream;
+  t.mock.method(fs, 'createReadStream', (...args) => {
+    const stream = real(...args);
+    streams.push({ stream, closed: new Promise(resolve => stream.once('close', resolve)) });
+    return stream;
+  });
+  const http = require('http');
+  await new Promise((resolve, reject) => {
+    const req = http.get(`${base}/api/logs/Example%20Job/download?file=${enc('Example Job-out-50.log')}`, { agent: false }, res => {
+      res.once('data', () => { res.destroy(); resolve(); });
+    });
+    req.on('error', () => {});
+    setTimeout(() => reject(new Error('no response')), 5000).unref();
+  });
+  assert.equal(streams.length, 1);
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('the file was not released')), 5000).unref());
+  await Promise.race([streams[0].closed, timeout]);
+  assert.equal(streams[0].stream.destroyed, true);
+  // And the server still serves.
+  assert.equal((await request(base, 'GET', '/api/logs/Example%20Job/stats')).status, 200);
+});

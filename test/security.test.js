@@ -530,20 +530,21 @@ test('config.yaml is replaced atomically: temp file in the same folder, flushed,
   t.mock.method(fs, 'fsyncSync', fd => { order.push('fsync'); return realFsync(fd); });
   t.mock.method(fs, 'renameSync', (from, to) => {
     order.push('rename');
-    assert.equal(path.dirname(from), dir);
+    assert.equal(path.dirname(from), fs.realpathSync(dir));
     assert.notEqual(from, target);
-    assert.equal(to, target);
+    assert.equal(fs.realpathSync(path.dirname(to)), fs.realpathSync(dir));
+    assert.equal(path.basename(to), 'config.yaml');
     assert.match(fs.readFileSync(from, 'utf8'), /name: Example/, 'complete before it is moved into place');
     return realRename(from, to);
   });
   configHandler.writeConfig({ scripts: [{ name: 'Example', type: 'forever', command: 'echo hi' }] });
-  assert.deepEqual(order, ['fsync', 'rename']);
+  assert.deepEqual(order, ['fsync', 'rename', 'fsync'], 'file flushed, renamed, then the folder flushed');
   assert.match(fs.readFileSync(target, 'utf8'), /name: Example/);
   assert.deepEqual(fs.readdirSync(dir), ['config.yaml'], 'no temporary file is left');
   if (process.platform !== 'win32') assert.equal(fs.statSync(target).mode & 0o777, 0o600, 'the mode is kept');
 });
 
-test('a failed write leaves the old config.yaml alone and no temporary file', t => {
+test('a failed write is an error, leaves the old config.yaml alone and no temporary file', t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'taskserver-write-'));
   t.after(() => { delete process.env.TASKSERVER_CONFIG; fs.rmSync(dir, { recursive: true, force: true }); });
   const target = path.join(dir, 'config.yaml');
@@ -552,7 +553,7 @@ test('a failed write leaves the old config.yaml alone and no temporary file', t 
   const configHandler = require('../utils/configHandler');
   t.mock.method(fs, 'renameSync', () => { throw new Error('disk says no'); });
   t.mock.method(console, 'error', () => {});
-  configHandler.writeConfig({ scripts: [{ name: 'Changed' }] });
+  assert.throws(() => configHandler.writeConfig({ scripts: [{ name: 'Changed' }] }), /Could not write config\.yaml/);
   assert.equal(fs.readFileSync(target, 'utf8'), 'scripts: []\n');
   assert.deepEqual(fs.readdirSync(dir), ['config.yaml']);
 });
@@ -561,17 +562,18 @@ test('a failed write leaves the old config.yaml alone and no temporary file', t 
 // Wrong keys
 // ---------------------------------------------------------------------------
 
-test('wrong keys from one address are slowed down, doubling up to a limit, and forgotten later', async t => {
+test('different wrong keys from one address are slowed down, doubling up to a limit, and forgotten later', async t => {
   let clock = 1_000_000;
-  const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
-  const wrong = () => request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'wrong' } });
-  for (let i = 0; i < 4; i += 1) assert.equal((await wrong()).status, 401, `attempt ${i + 1}`);
-  assert.equal((await wrong()).status, 401, 'the fifth is still answered, then the pause starts');
+  // A configured public origin means a proxy may share the address: the full ladder.
+  const { base } = await boot(t, { extra: { ...AUTH, server: { publicOrigins: ['https://dash.example.test'] } }, securityOptions: { now: () => clock } });
+  let n = 0;
+  const wrong = () => request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': `wrong-key-${n += 1}` } });
+  for (let i = 0; i < 5; i += 1) assert.equal((await wrong()).status, 401, `attempt ${i + 1}`);
   const blocked = await wrong();
   assert.equal(blocked.status, 429);
   assert.equal(blocked.headers['retry-after'], '1');
   assert.deepEqual(blocked.json(), { error: 'Too Many Requests', message: 'Too many wrong keys; wait and try again' });
-  // Even the right key waits out the pause: otherwise the pause would not slow guessing down.
+  // Even the right key waits out the pause: otherwise 429 against 200 would tell a guesser which key is right.
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
   clock += 1001;
   assert.equal((await wrong()).status, 401);
@@ -589,11 +591,66 @@ test('wrong keys from one address are slowed down, doubling up to a limit, and f
   for (let i = 0; i < 5; i += 1) assert.equal((await wrong()).status, 401, 'forgotten after ten quiet minutes');
 });
 
+test('one stale key sent over and over never locks anyone out', async t => {
+  const { base } = await boot(t, { extra: AUTH });
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'stale-key-of-a-poller' } })).status, 401, `repeat ${i + 1}`);
+  }
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
+  for (let i = 0; i < 20; i += 1) assert.equal((await request(base, 'POST', '/login', { form: { apiKey: 'stale-key-of-a-poller' } })).status, 401);
+  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
+});
+
+test('twenty different wrong keys get 429, and the right key is refused during the pause', async t => {
+  const { base } = await boot(t, { extra: AUTH });
+  const statuses = [];
+  for (let i = 0; i < 20; i += 1) statuses.push((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': `guess-${i}` } })).status);
+  assert.deepEqual(statuses.slice(0, 5), [401, 401, 401, 401, 401]);
+  assert.ok(statuses.slice(5).every(status => status === 429), statuses.join());
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
+  // A key already tried also gets the pause, not a different answer.
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'guess-0' } })).status, 429);
+});
+
+test('on the loopback interface the pause is short (2 s) unless a proxy is configured or announced', async t => {
+  let clock = 1_000_000;
+  const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
+  let n = 0;
+  const wrong = headers => request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': `wrong-key-${n += 1}`, ...headers } });
+  const pauses = [];
+  for (let i = 0; i < 20; i += 1) {
+    const res = await wrong();
+    if (res.status === 429) { pauses.push(Number(res.headers['retry-after'])); clock += 3000; }
+  }
+  assert.ok(pauses.length >= 5);
+  assert.ok(pauses.every(seconds => seconds <= 2), pauses.join());
+  clock += 11 * 60 * 1000;
+  // The same address with proxy headers: the full ladder.
+  const proxied = [];
+  for (let i = 0; i < 14; i += 1) {
+    const res = await wrong({ 'x-forwarded-for': '203.0.113.9' });
+    if (res.status === 429) { proxied.push(Number(res.headers['retry-after'])); clock += Number(res.headers['retry-after']) * 1000 + 1; }
+  }
+  assert.ok(proxied.some(seconds => seconds > 2), proxied.join());
+});
+
+test('a right key outside a pause starts the count again', async t => {
+  let clock = 1_000_000;
+  const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
+  let n = 0;
+  const wrong = () => request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': `wrong-key-${n += 1}` } });
+  for (let round = 0; round < 3; round += 1) {
+    for (let i = 0; i < 4; i += 1) assert.equal((await wrong()).status, 401, `round ${round} wrong ${i + 1}`);
+    assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  }
+});
+
 test('the sign-in form is slowed down the same way, and requests without a key count for nothing', async t => {
   let clock = 1_000_000;
   const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
   for (let i = 0; i < 20; i += 1) assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
-  for (let i = 0; i < 5; i += 1) assert.equal((await request(base, 'POST', '/login', { form: { apiKey: 'wrong' } })).status, 401);
+  for (let i = 0; i < 5; i += 1) assert.equal((await request(base, 'POST', '/login', { form: { apiKey: `wrong-${i}` } })).status, 401);
   const blocked = await request(base, 'POST', '/login', { form: { apiKey: KEY } });
   assert.equal(blocked.status, 429);
   assert.equal(blocked.headers['retry-after'], '1');
@@ -602,6 +659,35 @@ test('the sign-in form is slowed down the same way, and requests without a key c
   assert.doesNotMatch(blocked.text, new RegExp(KEY));
   clock += 1500;
   assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
+});
+
+test('the table of clients is capped, least recently touched first, and swept at most once a minute', () => {
+  const { createThrottle } = require('../utils/security');
+  let clock = 1_000_000;
+  const throttle = createThrottle(() => clock, 1, { maxClients: 100 });
+  for (let i = 0; i < 100; i += 1) throttle.fail(`client-${i}`, 'a');
+  assert.equal(throttle.size(), 100);
+  throttle.fail('client-0', 'b'); // touched again: now the newest
+  throttle.fail('client-new', 'a');
+  assert.equal(throttle.size(), 100);
+  assert.ok(throttle.wait('client-0') > 0, 'the recently touched client was kept');
+  assert.equal(throttle.wait('client-1'), 0, 'the oldest was evicted');
+  for (let i = 0; i < 10_000; i += 1) throttle.fail(`flood-${i}`, 'a');
+  assert.equal(throttle.size(), 100, 'a flood cannot grow the table');
+  // Stale entries are swept, but not on every call.
+  clock += 11 * 60 * 1000;
+  throttle.fail('fresh', 'a');
+  assert.equal(throttle.size(), 1, 'swept after ten quiet minutes');
+  const sweeps = [];
+  const spy = createThrottle(() => clock, 1, { maxClients: 100 });
+  spy.fail('x', 'a');
+  clock += 11 * 60 * 1000;
+  spy.fail('y', 'a'); // sweeps x
+  sweeps.push(spy.size());
+  clock += 12 * 60 * 1000;
+  spy.fail('z', 'a'); clock += 1000; spy.fail('w', 'a');
+  sweeps.push(spy.size());
+  assert.deepEqual(sweeps, [1, 2]);
 });
 
 // ---------------------------------------------------------------------------
@@ -659,4 +745,64 @@ test('the sign-in page does not send you back to itself', async t => {
     assert.equal(res.headers.location, '/scripts', next);
   }
   assert.equal(localPath('/loginfo'), '/scripts');
+});
+
+// ---------------------------------------------------------------------------
+// Settings from start-up, and other settings changes
+// ---------------------------------------------------------------------------
+
+test('settings checked at start-up are in force from the first request, even if the file is empty by then', async t => {
+  const { base, file } = await boot(t, { scripts: forever(), extra: AUTH, seedFromStartup: true });
+  fs.writeFileSync(file, '');
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  fs.unlinkSync(file);
+  assert.equal((await request(base, 'GET', '/scripts')).status, 401);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+});
+
+test('an api section that drops authEnabled does not turn authentication off; false does', async t => {
+  const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH });
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  write({ ...config, api: { apiKey: KEY } });
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 401, 'dropped: the last good settings stay');
+  write({ ...config, api: {} });
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
+  write({ ...config, api: { authEnabled: false, apiKey: KEY } });
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 200, 'an explicit false is a decision');
+});
+
+test('turning authentication off forgets every session, so turning it on again needs a new sign-in', async t => {
+  const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH });
+  const cookie = await signIn(base);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 200);
+  write({ ...config, api: { authEnabled: false, apiKey: KEY } });
+  assert.equal((await request(base, 'GET', '/api/scripts')).status, 200);
+  write({ ...config, ...AUTH });
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401);
+});
+
+test('a failed config write is an error response, not a reported success', async t => {
+  const { base, saved } = await boot(t, { scripts: forever() });
+  t.mock.method(fs, 'renameSync', () => { throw Object.assign(new Error('disk says no'), { code: 'EIO' }); });
+  t.mock.method(console, 'error', () => {});
+  const res = await request(base, 'POST', '/api/add-script', { json: { name: 'Added', type: 'cron', schedule: '0 * * * *', command: 'echo hi' } });
+  assert.equal(res.status, 500);
+  assert.match(res.json().error, /Could not write config\.yaml/);
+  assert.equal(saved().scripts.length, 1);
+});
+
+test('a symbolic link as the config path: the file it points to is replaced, the link stays', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'taskserver-link-'));
+  t.after(() => { delete process.env.TASKSERVER_CONFIG; fs.rmSync(dir, { recursive: true, force: true }); });
+  fs.mkdirSync(path.join(dir, 'real'));
+  const real = path.join(dir, 'real', 'config.yaml');
+  const link = path.join(dir, 'config.yaml');
+  fs.writeFileSync(real, 'scripts: []\n');
+  fs.symlinkSync(real, link);
+  process.env.TASKSERVER_CONFIG = link;
+  require('../utils/configHandler').writeConfig({ scripts: [{ name: 'Example' }] });
+  assert.ok(fs.lstatSync(link).isSymbolicLink());
+  assert.match(fs.readFileSync(real, 'utf8'), /name: Example/);
+  assert.deepEqual(fs.readdirSync(path.join(dir, 'real')), ['config.yaml']);
 });
