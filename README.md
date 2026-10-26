@@ -179,6 +179,7 @@ server:
 api:
   authEnabled: false
   apiKey: ""
+  # dashboardAuth: true        # false: dashboard pages need no key from this machine (see Security)
 
 # PM2 Settings (Optional)
 pm2:
@@ -243,6 +244,8 @@ do not have it get a `401` (browsers are sent to `/login`).
   `HttpOnly`, `SameSite=Strict` session cookie (7 days). Sessions are kept in memory:
   "Log out" ends one at once, and restarting TaskServer ends all of them. Changing
   the key ends them too. The cookie and the CSRF token are not derived from the key.
+- `api.dashboardAuth` (default `true`) can switch the key off for the dashboard
+  pages only; see [Dashboard without a key](#dashboard-without-a-key).
 - The security settings TaskServer checked at start-up are in force from the first
   request. If `config.yaml` goes missing, becomes empty, is cut off, drops
   `api.authEnabled` while auth was on, or gets settings that make no sense while
@@ -290,8 +293,64 @@ reload them before submitting a form.
 cannot be parsed, when `api.authEnabled` is not a boolean, when `api.apiKey` is not
 a string or (with auth on) is shorter than 16 characters, when `server.publicOrigins`
 or `server.allowedHosts` are malformed, or when `server.host` is not a loopback
-address or `cloudflare.enabled` is true while `api.authEnabled` is off. The message
+address or `cloudflare.enabled` is true while `api.authEnabled` is off, when `api.dashboardAuth`
+is not a boolean, or when `api.dashboardAuth` is `false` with a non-loopback
+`server.host`, `cloudflare.enabled` or a non-empty `server.publicOrigins`. The message
 names the config key and the reason.
+
+### Dashboard without a key
+
+By default the dashboard asks for the key like everything else. If you only open
+it on the machine TaskServer runs on and want the key for programs that call the
+API, set:
+
+```yaml
+api:
+  authEnabled: true
+  apiKey: "a-key-of-16-or-more-characters"
+  dashboardAuth: false
+```
+
+With `api.authEnabled: true` and `api.dashboardAuth: false`:
+
+- The dashboard pages and forms (`/scripts`, `/add-script`, `/edit-script/...`,
+  `/settings`, the log viewer and the buttons on them) open with no key and no
+  sign-in. `/login` just sends you on to the page you asked for.
+- Everything under `/api/` still needs the `X-API-Key` header, exactly as before.
+  The dashboard's own scripts do not call `/api`: the log viewer reads its data
+  from `/logs/<job>/data...`, which follow the dashboard rules above, so no
+  request can reach `/api/` without the key.
+- A request only gets this when it looks unmistakably local: the connection comes
+  from a loopback address, the `Host` header is `localhost`, `127.0.0.1` or `[::1]`
+  (so a page cannot reach it through DNS rebinding), and it carries none of the
+  proxy headers (`X-Forwarded-For`, `-Host`, `-Proto`, `-Port` and `-Server`,
+  `X-Real-IP`, `Forwarded`, `Via`, `CF-Connecting-IP`, `True-Client-IP`,
+  `X-Client-IP`, `X-Original-URL`). Any other request is asked for the key as usual.
+- A state-changing request still needs this site's `Origin` (or `Sec-Fetch-Site:
+  same-origin`) and the CSRF token embedded in the page, even when it sends no
+  `Origin` at all. With no session to bind the token to, it is bound to the running
+  process: a random value made at start-up, different on each start, never derived
+  from the key. Reload a page that was open across a restart.
+- TaskServer refuses to start when `api.dashboardAuth` is not `true` or `false`, and
+  when it is `false` while `server.host` is not a loopback address,
+  `cloudflare.enabled` is true, or `server.publicOrigins` is not empty. Each
+  message names the key and the reason. If such a setting is added to a running
+  server's `config.yaml`, the dashboard goes back to asking for the key.
+
+**Only use this when nothing forwards to TaskServer's port.** TaskServer cannot tell
+a forwarded connection from a local one unless it carries one of the headers above.
+Any reverse proxy or port forward that reaches the port over loopback without such
+headers (nginx with default settings, `ssh -L`, `socat` and the like) bypasses the
+key in this mode and exposes the dashboard, including adding, editing and running
+jobs, to whoever can reach that proxy or forward.
+
+**The trade-off.** The key no longer protects the dashboard from other programs on
+the same machine. Any local program can fetch a page to get the CSRF token and then
+post with its own `Origin` header to add, edit, delete or run jobs (which run
+commands) without the key. The CSRF checks stop other web pages, not local programs.
+So with `dashboardAuth: false` the key mainly protects `/api/*` from programs that
+only use the API. Leave it at the default (`true`) on a machine where you do not
+trust every local user and program.
 
 ### Recovering from a startup refusal
 
@@ -659,9 +718,14 @@ curl -X POST http://localhost:3000/api/restart-script/myScript \
 
 - `GET /logs/:scriptName` - View logs page
 - `GET /api/logs/:scriptName` - Get logs as JSON
+- `GET /api/logs/:scriptName/stats` - Get log counts and the newest file
 - `GET /api/logs/:scriptName/chunk?file=filename` - Get a part of one log file
 - `GET /api/logs/:scriptName/download?file=filename` - Download log file
 - `DELETE /api/logs/:scriptName/delete?file=filename` - Delete log file
+
+The log viewer page loads the same data from `/logs/:scriptName/data`, `/data/stats`,
+`/data/chunk`, `/data/download` and `/data/delete` (same parameters). Those are the
+dashboard's own routes, protected like the dashboard pages; programs should use `/api/logs`.
 
 ### Settings
 

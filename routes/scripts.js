@@ -126,54 +126,62 @@ router.get('/logs/:scriptName', wrap(async (req, res) => {
   res.status(notFound ? 404 : 200).render('logs', { scriptName, logs, logContent, selectedLog, stats, notFound });
 }));
 
-// API endpoint to fetch log content (for auto-refresh)
-router.get('/api/logs/:scriptName', wrap(async (req, res) => {
-  const scriptName = req.params.scriptName;
-  const logs = logViewer.listLogs(scriptName);
-  const selectedLog = pickLog(logs, req.query.file);
-  const logContent = selectedLog ? logViewer.readLog(scriptName, selectedLog) : '';
-  res.json({ logs, logContent, selectedLog });
-}));
+// The log data routes. They are registered twice: under /api/logs for programs
+// (which always need the API key), and under /logs/:scriptName/data for the
+// dashboard's own scripts. The dashboard must not call /api: with
+// `api.dashboardAuth: false` its pages need no key, while /api always does.
+function logDataRoutes(base) {
+  // Fetch log content (for auto-refresh)
+  router.get(base, wrap(async (req, res) => {
+    const scriptName = req.params.scriptName;
+    const logs = logViewer.listLogs(scriptName);
+    const selectedLog = pickLog(logs, req.query.file);
+    const logContent = selectedLog ? logViewer.readLog(scriptName, selectedLog) : '';
+    res.json({ logs, logContent, selectedLog });
+  }));
 
-// API endpoint to fetch log stats (for auto-refresh detection)
-router.get('/api/logs/:scriptName/stats', (req, res) => {
-  const scriptName = req.params.scriptName;
-  const stats = logViewer.getLogStats(scriptName);
-  res.json(stats);
-});
-
-// API endpoint to fetch log chunks (for progressive loading)
-router.get('/api/logs/:scriptName/chunk', wrap(async (req, res) => {
-  const offset = parseInt(req.query.offset) || 0;
-  const limit = parseInt(req.query.limit) || 500;
-  const fromEnd = req.query.fromEnd !== 'false'; // default true
-
-  res.json(logViewer.readLogChunk(req.params.scriptName, req.query.file, { offset, limit, fromEnd }));
-}));
-
-// API endpoint to download log file. It streams from the descriptor that was
-// checked (see logViewer.openLog), up to the size seen then: a log that is still
-// being written does not make the length wrong. pipeline() closes the file when
-// the client goes away or the stream fails.
-router.get('/api/logs/:scriptName/download', wrap(async (req, res, next) => {
-  const { fd, size } = logViewer.openLog(req.params.scriptName, req.query.file);
-  res.attachment(req.query.file);
-  res.set('Content-Length', String(size));
-  const stream = fs.createReadStream(null, { fd, start: 0, end: Math.max(size - 1, 0), autoClose: true });
-  if (size === 0) {
-    stream.destroy();
-    return res.end();
-  }
-  pipeline(stream, res, error => {
-    if (error && error.code !== 'ERR_STREAM_PREMATURE_CLOSE') next(error);
+  // Fetch log stats (for auto-refresh detection)
+  router.get(`${base}/stats`, (req, res) => {
+    const scriptName = req.params.scriptName;
+    const stats = logViewer.getLogStats(scriptName);
+    res.json(stats);
   });
-}));
 
-// API endpoint to delete log file
-router.delete('/api/logs/:scriptName/delete', wrap(async (req, res) => {
-  logViewer.deleteLog(req.params.scriptName, req.query.file);
-  res.json({ success: true });
-}));
+  // Fetch log chunks (for progressive loading)
+  router.get(`${base}/chunk`, wrap(async (req, res) => {
+    const offset = parseInt(req.query.offset) || 0;
+    const limit = parseInt(req.query.limit) || 500;
+    const fromEnd = req.query.fromEnd !== 'false'; // default true
+
+    res.json(logViewer.readLogChunk(req.params.scriptName, req.query.file, { offset, limit, fromEnd }));
+  }));
+
+  // Download a log file. It streams from the descriptor that was checked (see
+  // logViewer.openLog), up to the size seen then: a log that is still being
+  // written does not make the length wrong. pipeline() closes the file when the
+  // client goes away or the stream fails.
+  router.get(`${base}/download`, wrap(async (req, res, next) => {
+    const { fd, size } = logViewer.openLog(req.params.scriptName, req.query.file);
+    res.attachment(req.query.file);
+    res.set('Content-Length', String(size));
+    const stream = fs.createReadStream(null, { fd, start: 0, end: Math.max(size - 1, 0), autoClose: true });
+    if (size === 0) {
+      stream.destroy();
+      return res.end();
+    }
+    pipeline(stream, res, error => {
+      if (error && error.code !== 'ERR_STREAM_PREMATURE_CLOSE') next(error);
+    });
+  }));
+
+  // Delete a log file
+  router.delete(`${base}/delete`, wrap(async (req, res) => {
+    logViewer.deleteLog(req.params.scriptName, req.query.file);
+    res.json({ success: true });
+  }));
+}
+logDataRoutes('/api/logs/:scriptName');
+logDataRoutes('/logs/:scriptName/data');
 
 // Add a new script (form)
 router.get('/add-script', (req, res) => {
