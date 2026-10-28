@@ -8,6 +8,8 @@
   },
   "scripts": {
     "start": "node server.js",
+    "set-api-key": "node scripts/set-api-key.js",
+    "set-dashboard-password": "node scripts/set-dashboard-password.js",
     "test": "node --test"
   },
   "dependencies": {

@@ -107,9 +107,10 @@ function getLogsDir() {
 
 // Replace the file in one step: the new text goes to a temporary file in the
 // same folder, is flushed to disk, is renamed over the old file, and the folder
-// is flushed too. A reader (this process's auth check, or anything else) sees
-// the whole old file or the whole new one, never a half-written one. If the
-// config path is a symbolic link, the file it points to is the one replaced.
+// is flushed too. The file is always mode 600. A reader (this process's auth
+// check, or anything else) sees the whole old file or the whole new one, never
+// a half-written one. If the config path is a symbolic link, the file it points
+// to is the one replaced.
 //
 // A failed write is logged (without the file's text) and thrown, so a request
 // that changes the config answers with an error instead of reporting a change
@@ -124,13 +125,10 @@ function writeConfig(config) {
   const temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`);
   let fd;
   try {
-    let mode;
-    try {
-      mode = fs.statSync(target).mode & 0o777;
-    } catch (error) {
-      mode = undefined; // a new file gets the default mode
-    }
-    fd = fs.openSync(temp, 'wx', mode);
+    // config.yaml holds secrets (the API key, the password hash, tunnel token):
+    // owner read/write only, whatever the umask or the old file's mode was.
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.fchmodSync(fd, 0o600);
     fs.writeSync(fd, yaml.dump(config));
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -171,4 +169,4 @@ function getSelfName(config = loadConfig()) {
   return config.server?.selfName || 'taskserver';
 }
 
-module.exports = { loadConfig, loadConfigStrict, readRawConfig, writeConfig, ensureLogDir, getLogsDir, getSelfName };
+module.exports = { getConfigPath, loadConfig, loadConfigStrict, readRawConfig, writeConfig, ensureLogDir, getLogsDir, getSelfName };

@@ -17,9 +17,8 @@
     <form method="post" action="/login" class="script-form">
       <input type="hidden" name="next" value="<%= next %>">
       <div class="form-group">
-        <label for="apiKey">API key</label>
-        <input type="password" id="apiKey" name="apiKey" required autofocus autocomplete="current-password">
-        <small>The <code>api.apiKey</code> value from config.yaml</small>
+        <label for="password">Dashboard password</label>
+        <input type="password" id="password" name="password" required autofocus autocomplete="current-password">
       </div>
       <div class="form-actions">
         <button type="submit" class="btn-primary">Sign in</button>

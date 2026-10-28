@@ -7,6 +7,7 @@ const path = require('path');
 const yaml = require('js-yaml');
 const { createFakePm2, legacyPm2Config } = require('../test-support/fakePm2');
 const { createApp } = require('../server');
+const { KEY, AUTH } = require('../test-support/authFixture');
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const PM2_SETTINGS = { maxRestarts: 10000, autoRestart: true, restartDelay: 1000 };
@@ -85,7 +86,7 @@ test('dashboard still renders when PM2 is unreachable, and says the state is unk
 
 test('API with auth on: GitSync restarting TaskServer needs the header key and gets its reply before the restart', async t => {
   const { base, pm2 } = await boot(t, {
-    extra: { api: { authEnabled: true, apiKey: 'test-key-1234567890' } },
+    extra: AUTH,
     setupPm2: pm2 => pm2.add({ name: 'taskserver', script: 'server.js', cwd: os.tmpdir() }),
   });
   assert.equal((await request(base, 'POST', '/api/restart-script/taskserver')).status, 401);
@@ -93,7 +94,7 @@ test('API with auth on: GitSync restarting TaskServer needs the header key and g
   await sleep(150);
   assert.equal(pm2.calls.some(c => c[0] === 'restart'), false, 'nothing restarts without a valid key');
 
-  const res = await request(base, 'POST', '/api/restart-script/taskserver', { headers: { 'x-api-key': 'test-key-1234567890' } });
+  const res = await request(base, 'POST', '/api/restart-script/taskserver', { headers: { 'x-api-key': KEY } });
   assert.equal(res.status, 200);
   assert.equal(res.json().success, true);
   assert.equal(res.headers.connection, 'close');
@@ -238,7 +239,7 @@ test('TaskServer itself in the config cannot be stopped, restarted or deleted fr
   });
   t.mock.method(console, 'error', () => {});
   for (const url of ['/stop-script/taskserver', '/start-script/taskserver', '/restart-script/taskserver', '/delete-script/taskserver',
-    '/api/stop-script/taskserver']) {
+    '/api/stop-script/taskserver', '/api/delete-script/taskserver']) {
     const res = await request(base, 'POST', url);
     assert.equal(res.status, 400, url);
     assert.match(res.text, /TaskServer itself/);

@@ -127,9 +127,9 @@ router.get('/logs/:scriptName', wrap(async (req, res) => {
 }));
 
 // The log data routes. They are registered twice: under /api/logs for programs
-// (which always need the API key), and under /logs/:scriptName/data for the
-// dashboard's own scripts. The dashboard must not call /api: with
-// `api.dashboardAuth: false` its pages need no key, while /api always does.
+// (which need the API key), and under /logs/:scriptName/data for the
+// dashboard's own scripts (which need the dashboard session). The dashboard must
+// not call /api: the session does not open it.
 function logDataRoutes(base) {
   // Fetch log content (for auto-refresh)
   router.get(base, wrap(async (req, res) => {
@@ -265,13 +265,12 @@ router.post('/edit-script/:scriptName', wrap(async (req, res) => {
   res.redirect('/scripts');
 }));
 
-// Delete a script
-router.post('/delete-script/:scriptName', wrap(async (req, res) => {
-  const name = req.params.scriptName;
+// Remove a script: stop and remove it from PM2 (a forever job), unregister it
+// from the scheduler (a cron job), then drop it from the config. Shared by the
+// dashboard form and the JSON API. Returns false when there is no such script.
+async function deleteScript(req, name) {
   const found = configHandler.loadConfig().scripts.find(s => s.name === name);
-  if (!found) {
-    return res.status(404).send('Script not found');
-  }
+  if (!found) return false;
 
   // A forever job is stopped and removed from PM2 first. If that fails the
   // script stays in the config, so it is not left running with nothing in
@@ -292,7 +291,14 @@ router.post('/delete-script/:scriptName', wrap(async (req, res) => {
     config.scripts.splice(index, 1);
     configHandler.writeConfig(config);
   }
+  return true;
+}
 
+// Delete a script
+router.post('/delete-script/:scriptName', wrap(async (req, res) => {
+  if (!(await deleteScript(req, req.params.scriptName))) {
+    return res.status(404).send('Script not found');
+  }
   res.redirect('/scripts');
 }));
 
@@ -410,8 +416,9 @@ router.post('/settings', (req, res) => {
 
 // =============================================================================
 // JSON API Endpoints (for programmatic access, e.g., from GitSync)
-// These endpoints return JSON instead of redirects. They are authenticated
-// like every other route (X-API-Key header when api.authEnabled is on).
+// These endpoints return JSON instead of redirects. With auth.required on they
+// need the X-API-Key header (see utils/security.js); the dashboard's session
+// does not open them.
 // =============================================================================
 
 // Restart a script (JSON API)
@@ -534,6 +541,15 @@ router.get('/api/scripts', wrap(async (req, res) => {
   });
 
   res.json({ success: true, scripts });
+}));
+
+// Delete a script (JSON API)
+router.post('/api/delete-script/:scriptName', wrap(async (req, res) => {
+  const name = req.params.scriptName;
+  if (!(await deleteScript(req, name))) {
+    return res.status(404).json({ success: false, error: 'Script not found' });
+  }
+  res.json({ success: true, message: `Script '${name}' deleted` });
 }));
 
 // Add a new script (JSON API)
