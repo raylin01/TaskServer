@@ -26,7 +26,7 @@ function validateCronSchedule(schedule) {
 // PM2 call earlier in the request cannot overwrite another change with a
 // stale copy.
 function setStopped(name, stopped) {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const script = config.scripts.find(s => s.name === name && s.type === 'forever');
   if (script) {
     script.stopped = stopped;
@@ -86,7 +86,7 @@ router.get('/scripts', wrap(async (req, res) => {
     pm2Available = false;
     console.error(`[HTTP] Could not read PM2 state for the dashboard: ${errorText(error)}`);
   }
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const jobStates = {};
   for (const script of config.scripts) {
     if (script.type === 'forever') {
@@ -194,7 +194,7 @@ router.get('/add-script', (req, res) => {
 
 // Add a new script (POST)
 router.post('/add-script', (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const newScript = buildScriptFromRequest(req.body);
 
   if (newScript.type === 'cron' && !validateCronSchedule(newScript.schedule)) {
@@ -213,7 +213,7 @@ router.post('/add-script', (req, res) => {
 
 // Edit a script (form)
 router.get('/edit-script/:scriptName', (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const script = config.scripts.find(s => s.name === req.params.scriptName);
   if (!script) {
     return res.status(404).send('Script not found');
@@ -227,7 +227,7 @@ router.get('/edit-script/:scriptName', (req, res) => {
 
 // Edit a script (POST)
 router.post('/edit-script/:scriptName', wrap(async (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const scriptIndex = config.scripts.findIndex(s => s.name === req.params.scriptName);
   if (scriptIndex === -1) {
     return res.status(404).send('Script not found');
@@ -269,7 +269,7 @@ router.post('/edit-script/:scriptName', wrap(async (req, res) => {
 // from the scheduler (a cron job), then drop it from the config. Shared by the
 // dashboard form and the JSON API. Returns false when there is no such script.
 async function deleteScript(req, name) {
-  const found = configHandler.loadConfig().scripts.find(s => s.name === name);
+  const found = configHandler.loadConfigStrict().scripts.find(s => s.name === name);
   if (!found) return false;
 
   // A forever job is stopped and removed from PM2 first. If that fails the
@@ -285,7 +285,7 @@ async function deleteScript(req, name) {
   }
 
   // Remove from config (loaded fresh: the PM2 call above can take a while)
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const index = config.scripts.findIndex(s => s.name === name);
   if (index !== -1) {
     config.scripts.splice(index, 1);
@@ -303,7 +303,7 @@ router.post('/delete-script/:scriptName', wrap(async (req, res) => {
 }));
 
 function findForever(name) {
-  return configHandler.loadConfig().scripts.find(s => s.name === name && s.type === 'forever');
+  return configHandler.loadConfigStrict().scripts.find(s => s.name === name && s.type === 'forever');
 }
 
 // Stop a running script (forever tasks only)
@@ -345,7 +345,7 @@ router.post('/suspend-cron/:scriptName', (req, res) => {
   }
   
   // Save suspended status to config
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'cron');
   if (script) {
     script.suspended = true;
@@ -362,7 +362,7 @@ router.post('/resume-cron/:scriptName', (req, res) => {
   }
   
   // Clear suspended status from config
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'cron');
   if (script) {
     script.suspended = false;
@@ -373,7 +373,7 @@ router.post('/resume-cron/:scriptName', (req, res) => {
 });
 
 router.post('/run-cron-now/:scriptName', async (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const script = config.scripts.find(s => s.name === req.params.scriptName && s.type === 'cron');
 
   if (!script) {
@@ -393,7 +393,7 @@ router.post('/run-cron-now/:scriptName', async (req, res) => {
 
 // Settings page
 router.get('/settings', (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   res.render('settings', { 
     logManagement: config.logManagement || { autoDelete: false, retentionDays: 7, checkInterval: 3600000 }
   });
@@ -401,7 +401,7 @@ router.get('/settings', (req, res) => {
 
 // Update settings
 router.post('/settings', (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const { autoDelete, retentionDays, checkInterval } = req.body;
   
   config.logManagement = {
@@ -423,7 +423,7 @@ router.post('/settings', (req, res) => {
 
 // Restart a script (JSON API)
 router.post('/api/restart-script/:scriptName', wrap(async (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const scriptName = req.params.scriptName;
 
   // TaskServer restarting itself (GitSync does this on every deploy). The name
@@ -523,7 +523,7 @@ router.post('/api/start-script/:scriptName', wrap(async (req, res) => {
 // List all scripts (JSON API)
 router.get('/api/scripts', wrap(async (req, res) => {
   const list = await processService(req).list();
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
 
   const scripts = config.scripts.map(script => {
     const pm2Process = findProcess(list, script.name);
@@ -554,7 +554,7 @@ router.post('/api/delete-script/:scriptName', wrap(async (req, res) => {
 
 // Add a new script (JSON API)
 router.post('/api/add-script', requireJson, wrap(async (req, res) => {
-  const config = configHandler.loadConfig();
+  const config = configHandler.loadConfigStrict();
   const { name, path: scriptPath, command, type, schedule } = req.body;
   
   // Validate required fields

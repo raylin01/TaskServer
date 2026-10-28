@@ -5,6 +5,18 @@
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)
 
+## Before you update
+
+**If your `config.yaml` has `api.authEnabled`, `api.apiKey` or `api.dashboardAuth`, read this first.** Those settings were replaced by an `auth` section (see [Authentication](#authentication)), and TaskServer refuses to start while it still sees the old ones, so a server you thought was protected cannot quietly become open. Do the settings part **while the old version is still running**, so the restart is the only moment anything changes:
+
+1. **Get the new version into a separate folder** (a fresh clone and `npm install`), without touching the running one. Run the commands below from that folder and point them at the live file: `TASKSERVER_CONFIG=/path/to/the/running/config.yaml`. They work against the old version's `config.yaml`: they add only the `auth` settings and leave `api` and everything else alone.
+2. **Make the secrets**: `npm run set-dashboard-password`, and `npm run set-api-key` (it prints the key once). Programs keep using the old key until step 5. If the old key is already 32 or more printable characters you may instead copy it into `auth.apiKey` by hand and skip `set-api-key`, so programs need no change.
+3. **Move the settings** in `config.yaml`: add `auth.required: true` (the old `api.authEnabled: true` becomes this), and remove the `api` section. Do not set `api.authEnabled: false` on the way: that turns the old version's protection off. The old version ignores the `auth` section, and when the `api` section disappears it logs `config.yaml no longer has the api section; keeping the last good security settings` and keeps requiring the old key (checked against the previous release). An `api` block that only says "off" (`authEnabled: false`, `apiKey: ""`) is harmless and may stay.
+4. **Check the file**: `TASKSERVER_CONFIG=... npm run check-config` prints `OK`, or every problem by key name, and exits 1 on a problem. It does not start anything. Fix what it lists and run it again until it says `OK`.
+5. **Update and restart** straight away (`git pull`, install, restart). Then change programs that call `/api/*` to send the new key if it changed.
+
+Until the restart, do not restart the old version: with the `api` section gone it would start with authentication **off** (it only refuses to start when `server.host` is not a loopback address or the Cloudflare tunnel is on).
+
 ## Features
 
 - **Forever Scripts**: Run long-running scripts that automatically restart on failure
@@ -19,6 +31,7 @@
 
 ## Table of Contents
 
+- [Before you update](#before-you-update)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
@@ -261,7 +274,8 @@ Do these in order, on the machine TaskServer runs on:
      dashboardPasswordHash: "..."  # written by set-dashboard-password
    ```
 
-4. **Restart TaskServer** (`pm2 restart taskserver`, or restart however you run it)
+4. **Check, then restart TaskServer.** `npm run check-config` prints `OK` or lists
+   what is wrong. Then restart (`pm2 restart taskserver`, or however you run it)
    and update every program that calls `/api/*` to send the key (below). The
    setting is also read on every request, so it takes effect without a restart.
 5. Open the dashboard: it sends you to the login page.
@@ -278,11 +292,12 @@ TaskServer **refuses to turn authentication on** unless both secrets exist: with
 running server keeps its previous settings. To turn authentication off again, set
 `auth.required: false` (this also ends every dashboard session).
 
-> **Upgrading.** `api.authEnabled`, `api.apiKey` and `api.dashboardAuth` are gone,
+> **Upgrading.** See [Before you update](#before-you-update) for the steps to follow while the old version is still running. `api.authEnabled`, `api.apiKey` and `api.dashboardAuth` are gone,
 > replaced by `auth.required`, `auth.apiKey` and `auth.dashboardPasswordHash`. This
 > is a breaking change: a `config.yaml` that still has any of the old keys makes
 > TaskServer refuse to start (so a server you thought was protected cannot silently
-> become open), with a message saying what to rename. The dashboard no longer signs
+> become open), with one message that lists every old key and what it became. (An
+> `api` block that only says "off" is accepted and ignored.) The dashboard no longer signs
 > in with the API key, and there is no longer a way to open the dashboard without a
 > credential.
 
@@ -303,8 +318,9 @@ curl -X POST http://localhost:3000/api/restart-script/myScript \
   `{"error":"Unauthorized","message":"Valid API key required"}`, whatever was wrong.
   Each refusal logs one line, `TaskServer API refused: <METHOD> <path> from <address>`,
   with no key, query string or headers.
-- The key is compared in constant time. After 5 *different* wrong keys from one
-  address, requests from it get `429` for a growing pause (see [Security](#security)).
+- The key is compared in constant time. A correct key is always accepted. After 5
+  *different* wrong keys from one address, further wrong keys from it get `429` for
+  a growing pause (see [Security](#security)).
 - Requests made with the key are not browser requests, so they need no `Origin`
   header and no CSRF token.
 
@@ -312,7 +328,12 @@ curl -X POST http://localhost:3000/api/restart-script/myScript \
 
 - `/login` asks for the dashboard password. A wrong password is refused; after 5
   different wrong passwords from one address, further attempts get `429` for a
-  growing pause. Each failure logs `TaskServer login refused: POST /login from <address>`
+  growing pause, **even with the right password**, because each check is costly. The
+  count is per address, so everyone who reaches TaskServer through the same address
+  (a reverse proxy or tunnel) shares it: one person typing the wrong password
+  repeatedly can briefly lock the others out of the login page. Repeating the same
+  wrong password counts too, 20 times as many being allowed, and only a few
+  password checks run at the same time (the others get `429`). Each failure logs `TaskServer login refused: POST /login from <address>`
   (never the password).
 - A successful login sets a session cookie: random 256-bit id, `HttpOnly`,
   `SameSite=Strict`, `Path=/`, and `Secure` when the request came over HTTPS (or a
@@ -340,17 +361,19 @@ locked down in layers. [Authentication](#authentication) is the main one; these
 are the others, and the details of how it behaves.
 
 - `auth.required` must be `true` or `false` (not `"true"` or `yes`). With it on,
-  `auth.apiKey` must be a string of at least 32 characters (`npm run set-api-key`
-  makes a 43-character one) and `auth.dashboardPasswordHash` must be a hash made by
-  `npm run set-dashboard-password`.
-- After 5 *different* wrong keys from one address, requests from it are refused with
-  `429` for a pause that doubles from 1 s up to 30 s, even with the right key
-  (otherwise 429 against 200 would tell a guesser which key is right). Wrong
-  passwords at `/login` are counted the same way, separately, so a locked-out login
-  never stops the programs that use the API from the same address. The same wrong
-  key sent again counts for nothing, so a client with an out-of-date key cannot
-  lock anyone else out. A right key outside a pause starts the count again, and
-  failures are forgotten after 10 quiet minutes. Clients on the loopback interface
+  `auth.apiKey` must be at least 32 printable characters without spaces
+  (`npm run set-api-key` makes a 43-character one) and `auth.dashboardPasswordHash`
+  must be a hash made by `npm run set-dashboard-password` (scrypt, N=2^16; the cost
+  travels with the hash, so hashes made with other costs keep working).
+- After 5 *different* wrong keys from one address, further wrong keys from it are
+  refused with `429` for a pause that doubles from 1 s up to 30 s. The key is
+  compared first and a correct one is always accepted, so a pause never locks out a
+  client that has the right key (a stale key sent over and over counts for nothing).
+  Wrong passwords at `/login` are counted the same way, separately, so a locked-out
+  login never stops the programs that use the API from the same address; but a login
+  during its pause is refused whatever the password, and the count is per address,
+  shared by everyone behind the same proxy. A right try outside a pause starts the
+  count again, and failures are forgotten after 10 quiet minutes. Clients on the loopback interface
   (scripts and consoles on the same machine) get a pause of at most 2 s, unless
   `server.publicOrigins` is set or the request carries proxy headers
   (`X-Forwarded-For` and similar): behind a proxy or tunnel every client has the
@@ -364,7 +387,9 @@ are the others, and the details of how it behaves.
   `auth.required: false`, which also ends every session). Config writes are
   atomic (temporary file, flush, rename, flush the folder; a symbolic link is
   followed), always mode `600`, and a write that fails is an error response, never
-  a reported success.
+  a reported success. Every request that writes `config.yaml` reads it strictly
+  first: if the file cannot be read or parsed, the request fails with a `500` and the
+  file is left alone, instead of being replaced by the defaults.
 
 **Requests from other web pages.** A page open in the same browser cannot make
 TaskServer do anything:
@@ -398,13 +423,16 @@ Dashboard pages that were open when TaskServer restarted carry an old CSRF token
 reload them before submitting a form.
 
 **Start-up checks.** TaskServer exits instead of starting when `config.yaml`
-cannot be parsed, when it still has `api.authEnabled`, `api.apiKey` or
-`api.dashboardAuth`, when `auth.required` is not a boolean, when `auth.apiKey` or
+cannot be parsed, when it still has an old `api.authEnabled`, `api.apiKey` or
+`api.dashboardAuth` setting (other than an `api` block that only says "off"), when `auth.required` is not a boolean, when `auth.apiKey` or
 `auth.dashboardPasswordHash` is not a string (or the hash is not one made by the
 helper), when `auth.required` is true without a key of at least 32 characters and a
 password hash, when `server.publicOrigins` or `server.allowedHosts` are malformed, or
 when `server.host` is not a loopback address or `cloudflare.enabled` is true while
-`auth.required` is off. The message names the config key and the reason.
+`auth.required` is off. The message names the config key and the reason, and all
+the problems are listed together. `npm run check-config` runs exactly these checks
+on `config.yaml` without starting anything (use `TASKSERVER_CONFIG=/path/to/config.yaml`
+for another file) and exits 1 when it finds a problem, so you can run it before a restart.
 
 ### Recovering from a startup refusal
 
@@ -914,11 +942,12 @@ TaskServer/
 │   └── *.js              # Dashboard scripts (no inline scripts: the CSP forbids them)
 ├── routes/               # Express routes
 │   └── scripts.js        # Script management routes
-├── scripts/              # Your scripts go here, and the set-api-key / set-dashboard-password commands
+├── scripts/              # Your scripts go here, and the set-api-key / set-dashboard-password / check-config commands
 │   ├── exampleForever.js
 │   ├── exampleCron.py
 │   ├── set-api-key.js
-│   └── set-dashboard-password.js
+│   ├── set-dashboard-password.js
+│   └── check-config.js
 ├── utils/                # Utility modules
 │   ├── configHandler.js  # Config loading/saving (TASKSERVER_CONFIG overrides the path)
 │   ├── processService.js # The one PM2 client: queue, timeouts, reconnect

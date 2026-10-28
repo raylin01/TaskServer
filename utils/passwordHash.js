@@ -10,7 +10,7 @@ const { promisify } = require('util');
 
 const scrypt = promisify(crypto.scrypt);
 
-const DEFAULT_PARAMS = { N: 32768, r: 8, p: 1 };
+const DEFAULT_PARAMS = { N: 65536, r: 8, p: 1 };
 const SALT_BYTES = 16;
 const KEY_BYTES = 64;
 const MIN_N = 1024;
@@ -27,6 +27,7 @@ function parseHash(stored) {
   if (typeof stored !== 'string') return null;
   const parts = stored.split('$');
   if (parts.length !== 6 || parts[0] !== 'scrypt') return null;
+  if (!parts.slice(1, 4).every(part => /^\d+$/.test(part))) return null;
   const [N, r, p] = parts.slice(1, 4).map(Number);
   const salt = Buffer.from(parts[4], 'base64url');
   const hash = Buffer.from(parts[5], 'base64url');

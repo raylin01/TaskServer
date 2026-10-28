@@ -45,8 +45,8 @@ async function main({ stdin = process.stdin, stdout = process.stdout, stderr = p
   }
 
   const key = crypto.randomBytes(32).toString('base64url');
-  config.auth = { ...(config.auth || {}), apiKey: key };
-  configHandler.writeConfig(config);
+  // Re-read the file now: it may have changed while the question was open.
+  configHandler.setAuthValues({ apiKey: key });
 
   // The key goes to the terminal and nowhere else, and only here.
   stdout.write(`

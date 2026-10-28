@@ -35,7 +35,7 @@
 const crypto = require('crypto');
 const express = require('express');
 const configHandler = require('./configHandler');
-const { asyncHandler } = require('./httpErrors');
+const { asyncHandler, isApiPath } = require('./httpErrors');
 const { parseHash, verifyPassword, MAX_PASSWORD_LENGTH } = require('./passwordHash');
 
 const SESSION_COOKIE = 'taskserver_session';
@@ -44,20 +44,34 @@ const MAX_SESSIONS = 200;
 const MIN_KEY_LENGTH = 32;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
-const API_PATH = /^\/api(?:\/|$)/i;
-// Settings that used to live under `api`, replaced by `auth`.
-const OLD_API_KEYS = { authEnabled: 'auth.required', apiKey: 'auth.apiKey', dashboardAuth: null };
+// An API key is printable ASCII without spaces: that is what an HTTP header can
+// carry unchanged, so the length check and the comparison see the same text.
+const KEY_PATTERN = new RegExp(`^[\\x21-\\x7e]{${MIN_KEY_LENGTH},}$`);
+// At most this many password checks (scrypt is slow and memory hungry) run at once.
+const MAX_VERIFYING = 2;
+// Settings that used to live under `api`, replaced by `auth`. A block that only
+// says "off" (the old example config) is harmless and counts as absent; anything
+// else is refused by name.
+const OLD_API_KEYS = {
+  authEnabled: { now: 'auth.required', inert: value => value === undefined || value === false },
+  apiKey: { now: 'auth.apiKey', inert: value => value === undefined || value === null || value === '' },
+  dashboardAuth: { now: null, inert: value => value === undefined || value === true },
+};
 
 // Wrong keys (and, separately, wrong passwords): after FREE_FAILURES different
-// wrong tries from one address, further requests from it are refused for a pause
-// that doubles up to MAX_PAUSE_MS. The same wrong try again counts for nothing (a
-// client that forgot to update its key must not lock everyone else out). A right
-// one outside a pause starts the count again. Failures are forgotten after
-// FORGET_MS without a new one.
+// wrong tries from one address, further wrong tries from it are refused for a
+// pause that doubles up to MAX_PAUSE_MS. For the API a right key is always
+// accepted (the pause only silences wrong ones); a login is refused during the
+// pause whatever the password, because each check costs a lot. The same wrong
+// try again counts for nothing against the API (a client that forgot to update
+// its key must not be a problem for anyone else), and for logins counts
+// REPEAT_FACTOR times less. A right try outside a pause starts the count again.
+// Failures are forgotten after FORGET_MS without a new one.
 // Clients on the loopback interface (the scripts and the console on the same
 // machine, all sharing one address) get a short pause, LOOPBACK_PAUSE_MS, unless a
 // proxy or tunnel is configured or announced by its headers.
 const FREE_FAILURES = 5;
+const REPEAT_FACTOR = 4;
 const BASE_PAUSE_MS = 1000;
 const MAX_PAUSE_MS = 30000;
 const LOOPBACK_PAUSE_MS = 2000;
@@ -109,82 +123,102 @@ function hostNameOf(header) {
 
 const isMapping = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+// The old `api` settings in a config that are not just "off", as names, or []
+// when there are none (or the block is the harmless old default).
+function oldSettingsIn(config) {
+  if (config.api === undefined || config.api === null) return [];
+  if (!isMapping(config.api)) return ['api'];
+  return Object.entries(OLD_API_KEYS)
+    .filter(([key, { inert }]) => !inert(config.api[key]))
+    .map(([key]) => `api.${key}`);
+}
+
+function oldSettingsProblem(names) {
+  const moves = names.map(name => {
+    const { now } = OLD_API_KEYS[name.slice(4)] || {};
+    return now ? `${name} is now ${now}` : `${name} is gone`;
+  });
+  return `config.yaml still has the old settings ${names.join(', ')}; they were replaced by the auth section `
+    + `(${moves.join('; ')}). Move them, and note that auth.required: true also needs auth.dashboardPasswordHash `
+    + '(run "npm run set-dashboard-password") and an auth.apiKey of at least '
+    + `${MIN_KEY_LENGTH} characters. See "Before you update" in the README`;
+}
+
 // The security settings in a config (as YAML gave it, or merged with defaults).
-// Returns { settings } or { problem } where the problem names the config key and
-// carries nothing from the file. `previous` is what was read last time, if
-// anything: settings may not quietly lose their `auth` block.
+// Returns { settings } or { problem, problems } where each problem names the
+// config key and carries nothing from the file. `previous` is what was read last
+// time, if anything: settings may not quietly lose their `auth` block.
 function parseSettings(config, previous = null) {
+  const refuse = problems => ({ problem: problems.join('; '), problems });
   if (config === undefined || config === null) {
     return previous
-      ? { problem: 'config.yaml is missing or empty' }
+      ? refuse(['config.yaml is missing or empty'])
       : { settings: settingsOf({}, {}, false) };
   }
-  if (!isMapping(config)) return { problem: 'config.yaml must be a mapping of settings' };
+  if (!isMapping(config)) return refuse(['config.yaml must be a mapping of settings']);
 
+  const problems = [];
   // The old `api.authEnabled` / `api.apiKey` settings are gone. Ignoring them
   // would quietly leave a server that someone thinks is protected open.
-  if (isMapping(config.api)) {
-    for (const [oldKey, newKey] of Object.entries(OLD_API_KEYS)) {
-      if (config.api[oldKey] !== undefined) {
-        return { problem: newKey
-          ? `api.${oldKey} in config.yaml is no longer used: it is now ${newKey} (see "Authentication" in the README)`
-          : `api.${oldKey} in config.yaml is no longer used: remove it (see "Authentication" in the README)` };
-      }
-    }
-  }
+  const old = oldSettingsIn(config);
+  if (old.length) problems.push(oldSettingsProblem(old));
 
   const hasAuth = config.auth !== undefined;
-  if (previous?.hasAuth && !hasAuth) return { problem: 'config.yaml no longer has the auth section' };
-  if (hasAuth && !isMapping(config.auth)) return { problem: 'auth in config.yaml must be a mapping' };
-  const auth = hasAuth ? config.auth : {};
+  let auth = {};
+  if (previous?.hasAuth && !hasAuth) problems.push('config.yaml no longer has the auth section');
+  if (hasAuth && !isMapping(config.auth)) problems.push('auth in config.yaml must be a mapping');
+  else if (hasAuth) auth = config.auth;
   if (previous?.required && auth.required === undefined) {
-    return { problem: 'auth.required in config.yaml is missing (it was on); set it to false to turn authentication off' };
+    problems.push('auth.required in config.yaml is missing (it was on); set it to false to turn authentication off');
   }
-  if (auth.required !== undefined && typeof auth.required !== 'boolean') {
-    return { problem: 'auth.required in config.yaml must be true or false' };
-  }
+  const requiredOk = auth.required === undefined || typeof auth.required === 'boolean';
+  if (!requiredOk) problems.push('auth.required in config.yaml must be true or false');
+  const typeOk = {};
   for (const key of ['apiKey', 'dashboardPasswordHash']) {
-    if (auth[key] !== undefined && auth[key] !== null && typeof auth[key] !== 'string') {
-      return { problem: `auth.${key} in config.yaml must be a string` };
-    }
+    typeOk[key] = auth[key] === undefined || auth[key] === null || typeof auth[key] === 'string';
+    if (!typeOk[key]) problems.push(`auth.${key} in config.yaml must be a string`);
   }
   const required = auth.required === true;
-  const apiKey = auth.apiKey ?? '';
-  const storedHash = auth.dashboardPasswordHash ?? '';
+  const apiKey = typeof auth.apiKey === 'string' ? auth.apiKey : '';
+  const storedHash = typeof auth.dashboardPasswordHash === 'string' ? auth.dashboardPasswordHash : '';
   const hashValid = parseHash(storedHash) !== null;
   if (storedHash !== '' && !hashValid) {
-    return { problem: 'auth.dashboardPasswordHash in config.yaml is not a hash made by "npm run set-dashboard-password"' };
+    problems.push('auth.dashboardPasswordHash in config.yaml is not a hash made by "npm run set-dashboard-password"');
   }
   if (required) {
     const missing = [];
-    if (apiKey.trim().length < MIN_KEY_LENGTH) {
-      missing.push(`auth.apiKey (at least ${MIN_KEY_LENGTH} characters; run "npm run set-api-key")`);
+    if (typeOk.apiKey && !KEY_PATTERN.test(apiKey)) {
+      missing.push(`auth.apiKey (at least ${MIN_KEY_LENGTH} printable characters without spaces; run "npm run set-api-key")`);
     }
-    if (!hashValid) missing.push('auth.dashboardPasswordHash (run "npm run set-dashboard-password")');
-    if (missing.length) {
-      return { problem: `auth.required is true in config.yaml but it needs ${missing.join(' and ')}` };
+    if (typeOk.dashboardPasswordHash && storedHash === '') {
+      missing.push('auth.dashboardPasswordHash (run "npm run set-dashboard-password")');
     }
+    if (missing.length) problems.push(`auth.required is true in config.yaml but it needs ${missing.join(' and ')}`);
   }
 
   if (config.server !== undefined && config.server !== null && !isMapping(config.server)) {
-    return { problem: 'server in config.yaml must be a mapping' };
+    problems.push('server in config.yaml must be a mapping');
   }
-  const server = config.server || {};
+  const server = isMapping(config.server) ? config.server : {};
   for (const key of ['allowedHosts', 'publicOrigins']) {
     if (server[key] !== undefined && (!Array.isArray(server[key]) || server[key].some(item => typeof item !== 'string'))) {
-      return { problem: `server.${key} in config.yaml must be a list of strings` };
+      problems.push(`server.${key} in config.yaml must be a list of strings`);
     }
   }
   const publicOrigins = [];
-  for (const entry of server.publicOrigins || []) {
-    try {
-      const url = new URL(entry);
-      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('protocol');
-      publicOrigins.push(url.origin);
-    } catch (error) {
-      return { problem: 'server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com' };
+  if (Array.isArray(server.publicOrigins)) {
+    for (const entry of server.publicOrigins.filter(item => typeof item === 'string')) {
+      try {
+        const url = new URL(entry);
+        if (!['http:', 'https:'].includes(url.protocol)) throw new Error('protocol');
+        publicOrigins.push(url.origin);
+      } catch (error) {
+        problems.push('server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com');
+        break;
+      }
     }
   }
+  if (problems.length) return refuse(problems);
   return { settings: {
     ...settingsOf(auth, server, hasAuth),
     required,
@@ -247,7 +281,7 @@ function createAuthSource({ read = configHandler.readRawConfig, logger = console
 function listenProblems(config) {
   const parsed = parseSettings(config);
   const problems = [];
-  if (parsed.problem) problems.push(parsed.problem);
+  problems.push(...(parsed.problems || []));
   const required = Boolean(parsed.settings?.required);
   const exposure = [];
   if (!isLoopbackHost(config.server?.host)) exposure.push(`server.host is ${config.server?.host}, not a loopback address`);
@@ -257,6 +291,19 @@ function listenProblems(config) {
       + 'turn on authentication with auth.required: true (see "Authentication" in the README)');
   }
   return problems;
+}
+
+// What start-up checks before it listens or touches PM2: the config file loaded
+// strictly, then listenProblems. `config` is null when the file could not be
+// used. Also behind "npm run check-config", so the two cannot disagree.
+function startupCheck(load = configHandler.loadConfigStrict) {
+  let config;
+  try {
+    config = load();
+  } catch (error) {
+    return { config: null, problems: [error.message] };
+  }
+  return { config, problems: listenProblems(config) };
 }
 
 function parseCookies(header) {
@@ -281,7 +328,7 @@ const isLoopbackAddress = address => /^(127(\.\d{1,3}){3}|::1|::ffff:127(\.\d{1,
 // where `seen` holds short hashes of the last few wrong tries. The table is
 // capped: the entry touched longest ago goes first (an update re-inserts the
 // entry at the end), and stale entries are swept at most once a minute.
-function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS } = {}) {
+function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS, repeatLimit = Infinity } = {}) {
   const clients = new Map();
   let swept = now();
   const sweep = time => {
@@ -295,21 +342,25 @@ function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS } = {}) {
       const entry = clients.get(client);
       return entry && entry.blockedUntil > now() ? Math.ceil((entry.blockedUntil - now()) / 1000) : 0;
     },
-    // A wrong try. `maxPauseMs` caps the pause for this client.
+    // A wrong try. `maxPauseMs` caps the pause for this client. The same wrong
+    // try again counts toward `repeatLimit` (never, by default).
     fail(client, key, maxPauseMs = MAX_PAUSE_MS) {
       const time = now();
       sweep(time);
       let entry = clients.get(client);
-      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, last: time, blockedUntil: 0, seen: new Set() };
+      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, repeats: 0, last: time, blockedUntil: 0, seen: new Set() };
       const tag = sha256(key).toString('hex').slice(0, 16);
-      if (entry.seen.has(tag)) return; // the same wrong try again: nothing new was guessed
-      entry.seen.add(tag);
-      if (entry.seen.size > REMEMBERED_WRONG_KEYS) entry.seen.delete(entry.seen.values().next().value);
-      entry.count += 1;
-      entry.last = time;
-      if (entry.count >= freeFailures) {
-        entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** (entry.count - freeFailures), maxPauseMs);
+      if (entry.seen.has(tag)) {
+        if (repeatLimit === Infinity) return; // nothing new was guessed
+        entry.repeats += 1;
+      } else {
+        entry.seen.add(tag);
+        if (entry.seen.size > REMEMBERED_WRONG_KEYS) entry.seen.delete(entry.seen.values().next().value);
+        entry.count += 1;
       }
+      entry.last = time;
+      const over = Math.max(entry.count - freeFailures, entry.repeats - repeatLimit);
+      if (over >= 0) entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** over, maxPauseMs);
       clients.delete(client);
       clients.set(client, entry);
       while (clients.size > maxClients) clients.delete(clients.keys().next().value);
@@ -319,6 +370,7 @@ function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS } = {}) {
       const entry = clients.get(client);
       if (entry && entry.blockedUntil <= now()) {
         entry.count = 0;
+        entry.repeats = 0;
         entry.blockedUntil = 0;
       }
     },
@@ -332,11 +384,13 @@ function createSecurity({
   now = Date.now,
   freeFailures = FREE_FAILURES,
   logger = console,
+  verify = verifyPassword,
 } = {}) {
-  // Keys and passwords are counted apart: a locked-out login must not stop the
-  // scripts that call the API from the same address, or the other way round.
+  // Keys and passwords are counted apart: a locked-out login must not slow down
+  // the scripts that call the API from the same address, or the other way round.
   const keyThrottle = createThrottle(now, freeFailures);
-  const loginThrottle = createThrottle(now, freeFailures);
+  const loginThrottle = createThrottle(now, freeFailures, { repeatLimit: freeFailures * REPEAT_FACTOR });
+  let verifying = 0; // password checks running now
   const clientOf = req => req.socket?.remoteAddress || 'unknown';
   const pauseCapFor = (req, auth) => (isLoopbackAddress(clientOf(req)) && auth.publicOrigins.length === 0
     && !hasProxyHeader(req) ? LOOPBACK_PAUSE_MS : MAX_PAUSE_MS);
@@ -412,7 +466,7 @@ function createSecurity({
     next();
   }
 
-  const wantsPage = req => req.method === 'GET' && !API_PATH.test(req.path)
+  const wantsPage = req => req.method === 'GET' && !isApiPath(req.path)
     && String(req.headers.accept || '').includes('text/html');
 
   const tooMany = (res, seconds, message) => res.set('Retry-After', String(seconds)).status(429)
@@ -422,15 +476,17 @@ function createSecurity({
   function authenticateApi(req, res, next, auth) {
     const given = req.headers['x-api-key'];
     if (given !== undefined) {
-      const seconds = keyThrottle.wait(clientOf(req));
-      if (seconds) {
-        logRefusal('API', req);
-        return tooMany(res, seconds, 'Too many wrong keys; wait and try again');
-      }
+      // The key is checked first and a right one always works. A pause only
+      // silences clients that keep sending wrong keys.
       if (keyMatches(auth, given)) {
         keyThrottle.succeed(clientOf(req));
         req.authMode = 'key';
         return next();
+      }
+      const seconds = keyThrottle.wait(clientOf(req));
+      if (seconds) {
+        logRefusal('API', req);
+        return tooMany(res, seconds, 'Too many wrong keys; wait and try again');
       }
       keyThrottle.fail(clientOf(req), given, pauseCapFor(req, auth));
     }
@@ -444,7 +500,7 @@ function createSecurity({
     res.locals.authRequired = auth.required;
     res.locals.csrfToken = csrfFor('');
     if (!auth.required) return next();
-    if (API_PATH.test(req.path)) return authenticateApi(req, res, next, auth);
+    if (isApiPath(req.path)) return authenticateApi(req, res, next, auth);
 
     // The dashboard: a session, never the API key.
     const id = parseCookies(req.headers.cookie)[SESSION_COOKIE];
@@ -528,8 +584,22 @@ function createSecurity({
         .render('login', { next, error: `Too many wrong passwords. Wait ${seconds} s and try again.` });
     }
     const given = req.body?.password;
-    const ok = typeof given === 'string' && given.length <= MAX_PASSWORD_LENGTH
-      && await verifyPassword(given, auth.passwordHash);
+    let ok = false;
+    if (typeof given === 'string' && given.length <= MAX_PASSWORD_LENGTH) {
+      // Each check takes a lot of CPU and memory: only a few at a time, so a flood
+      // of attempts cannot starve the server.
+      if (verifying >= MAX_VERIFYING) {
+        logRefusal('login', req);
+        return res.set('Retry-After', '1').status(429)
+          .render('login', { next, error: 'Too many sign-in attempts at once. Try again in a moment.' });
+      }
+      verifying += 1;
+      try {
+        ok = await verify(given, auth.passwordHash);
+      } finally {
+        verifying -= 1;
+      }
+    }
     if (!ok) {
       loginThrottle.fail(client, String(given ?? ''), pauseCapFor(req, auth));
       logRefusal('login', req);
@@ -558,6 +628,7 @@ module.exports = {
   createThrottle,
   parseSettings,
   listenProblems,
+  startupCheck,
   isLoopbackHost,
   localPath,
   PROXY_HEADERS,

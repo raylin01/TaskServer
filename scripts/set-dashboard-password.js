@@ -30,8 +30,9 @@ async function main({ prompt = readHidden, stdout = process.stdout, stderr = pro
     return 1;
   }
 
-  config.auth = { ...(config.auth || {}), dashboardPasswordHash: await hashPassword(password) };
-  configHandler.writeConfig(config);
+  const dashboardPasswordHash = await hashPassword(password);
+  // Re-read the file now: it may have changed while the prompts were open.
+  configHandler.setAuthValues({ dashboardPasswordHash });
   stdout.write(`Dashboard password saved to ${configHandler.getConfigPath()}. Everyone signed in to the dashboard has to sign in again.\n`);
   return 0;
 }

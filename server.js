@@ -13,8 +13,8 @@ const createCronManager = require('./utils/cronManager');
 const { createProcessService, errorText } = require('./utils/processService');
 const { createJobControl } = require('./utils/jobControl');
 const { reconcileWithRetry, checkPm2Versions } = require('./utils/reconcile');
-const { errorMiddleware, installProcessHandlers } = require('./utils/httpErrors');
-const { createSecurity, createAuthSource, listenProblems } = require('./utils/security');
+const { errorMiddleware, installProcessHandlers, isApiPath } = require('./utils/httpErrors');
+const { createSecurity, createAuthSource, startupCheck } = require('./utils/security');
 const scriptsRouter = require('./routes/scripts');
 
 function createApp({ processService, jobControl, cronManager, security = createSecurity() } = {}) {
@@ -32,7 +32,7 @@ function createApp({ processService, jobControl, cronManager, security = createS
   app.use(security.authenticate);
   // Forms are only for the dashboard pages; /api takes JSON.
   const forms = bodyParser.urlencoded({ extended: true });
-  app.use((req, res, next) => (req.path.startsWith('/api/') ? next() : forms(req, res, next)));
+  app.use((req, res, next) => (isApiPath(req.path) ? next() : forms(req, res, next)));
   app.use(bodyParser.json());
   app.use(security.csrfGuard);
   app.use(security.sessionRouter);
@@ -103,14 +103,8 @@ function refuseToStart(problems, selfName) {
 async function main() {
   // Do not start with settings that cannot be read, or that would expose the
   // dashboard without a key.
-  let config;
-  try {
-    config = configHandler.loadConfigStrict();
-  } catch (error) {
-    refuseToStart([error.message], configHandler.getSelfName({}));
-  }
-  const problems = listenProblems(config);
-  if (problems.length) refuseToStart(problems, configHandler.getSelfName(config));
+  const { config, problems } = startupCheck();
+  if (problems.length) refuseToStart(problems, configHandler.getSelfName(config || {}));
   let closing = false;
 
   // Setup automatic log cleanup if enabled

@@ -464,8 +464,8 @@ test('TaskServer refuses to turn authentication on without both an API key and a
   const problems = auth => listenProblems({ server: { host: '127.0.0.1' }, auth });
   const both = problems({ required: true });
   assert.equal(both.length, 1);
-  assert.match(both[0], /auth\.required is true .*auth\.apiKey .*at least 32 characters.* and auth\.dashboardPasswordHash/);
-  assert.match(problems({ required: true, dashboardPasswordHash: HASH })[0], /auth\.apiKey .*at least 32 characters/);
+  assert.match(both[0], /auth\.required is true .*auth\.apiKey .*at least 32.* and auth\.dashboardPasswordHash/);
+  assert.match(problems({ required: true, dashboardPasswordHash: HASH })[0], /auth\.apiKey .*at least 32/);
   assert.doesNotMatch(problems({ required: true, dashboardPasswordHash: HASH })[0], /dashboardPasswordHash/);
   assert.match(problems({ required: true, apiKey: KEY })[0], /needs auth\.dashboardPasswordHash/);
   assert.match(problems({ required: true, apiKey: '   ', dashboardPasswordHash: HASH })[0], /at least 32/);
@@ -492,13 +492,27 @@ test('TaskServer refuses to start with auth settings it cannot trust, naming the
   assert.doesNotMatch(JSON.stringify(problems({ required: true, apiKey: 'short-secret', dashboardPasswordHash: HASH })), /short-secret|\b12\b/, 'neither the key nor its length');
 });
 
-test('the old api.authEnabled, api.apiKey and api.dashboardAuth settings are refused, not ignored', () => {
-  const problems = api => listenProblems({ server: { host: '127.0.0.1' }, api });
-  assert.match(problems({ authEnabled: true })[0], /api\.authEnabled .*no longer used.*auth\.required/);
-  assert.match(problems({ authEnabled: false })[0], /api\.authEnabled .*auth\.required/);
-  assert.match(problems({ apiKey: 'x' })[0], /api\.apiKey .*auth\.apiKey/);
-  assert.match(problems({ dashboardAuth: false })[0], /api\.dashboardAuth .*remove it/);
-  assert.deepEqual(problems({}), []);
+test('the old api settings are refused by name, all in one message, unless the block only says "off"', () => {
+  const problems = (api, extra = {}) => listenProblems({ server: { host: '127.0.0.1' }, api, ...extra });
+  const one = problems({ authEnabled: true, apiKey: 'old-secret-value-0123456789', dashboardAuth: false });
+  assert.equal(one.length, 1);
+  assert.match(one[0], /old settings api\.authEnabled, api\.apiKey, api\.dashboardAuth;/);
+  assert.match(one[0], /api\.authEnabled is now auth\.required; api\.apiKey is now auth\.apiKey; api\.dashboardAuth is gone/);
+  assert.match(one[0], /auth\.required: true also needs auth\.dashboardPasswordHash/);
+  assert.match(one[0], /"Before you update"/);
+  assert.doesNotMatch(one[0], /old-secret-value/, 'names only, never values');
+  assert.match(problems({ apiKey: 'x' })[0], /old settings api\.apiKey;/);
+  assert.match(problems({ authEnabled: false, apiKey: 'x' })[0], /old settings api\.apiKey;/, 'a key left behind is not inert');
+  assert.match(problems({ authEnabled: 'false' })[0], /old settings api\.authEnabled;/);
+  assert.match(problems({ dashboardAuth: false })[0], /old settings api\.dashboardAuth;/);
+  assert.match(problems('on')[0], /old settings api;/);
+  // Several problems are all reported, not just the first.
+  assert.equal(problems({ authEnabled: true }, { auth: { required: 'yes' }, server: { host: '0.0.0.0' } }).length, 3);
+  // The old example block, switched off, changes nothing.
+  for (const inert of [{ authEnabled: false, apiKey: '' }, { authEnabled: false }, { apiKey: null }, { dashboardAuth: true }, {}, null, undefined]) {
+    assert.deepEqual(problems(inert), [], JSON.stringify(inert));
+  }
+  assert.deepEqual(problems({ authEnabled: false, apiKey: '' }, AUTH), [], 'also next to the new settings');
 });
 
 test('starting the server with an unsafe or unreadable config exits before it listens or touches PM2', t => {
@@ -530,7 +544,7 @@ test('starting the server with an unsafe or unreadable config exits before it li
 
   const oldSettings = start('api:\n  authEnabled: true\n  apiKey: old-style-secret-value-0123456789\n');
   assert.equal(oldSettings.status, 1);
-  assert.match(oldSettings.stderr, /api\.authEnabled in config\.yaml is no longer used: it is now auth\.required/);
+  assert.match(oldSettings.stderr, /Refusing to start: config\.yaml still has the old settings api\.authEnabled, api\.apiKey;/);
   assert.doesNotMatch(oldSettings.stderr + oldSettings.stdout, /old-style-secret-value/);
 
   const broken = start('auth:\n  apiKey: super-secret-value\n  bad: [unclosed\n');
@@ -566,7 +580,7 @@ test('config.yaml going missing, empty, cut off or odd while running never switc
     'a key that is a number': () => write({ ...config, ...authWith({ apiKey: 1234567890123456 }) }),
     'a key that is too short': () => write({ ...config, ...authWith({ apiKey: 'short' }) }),
     'auth section not a mapping': () => write({ ...config, auth: 'on' }),
-    'the old api settings added': () => write({ ...config, ...AUTH, api: { authEnabled: false } }),
+    'the old api settings added': () => write({ ...config, ...AUTH, api: { authEnabled: true, apiKey: 'old-value' } }),
     'a hash that is not one': () => write({ ...config, ...authWith({ dashboardPasswordHash: 'hunter2' }) }),
     'the password hash removed': () => write({ ...config, ...authWith({ dashboardPasswordHash: '' }) }),
     'broken yaml': () => fs.writeFileSync(file, 'auth: {{{'),
@@ -576,7 +590,10 @@ test('config.yaml going missing, empty, cut off or odd while running never switc
     assert.equal((await request(base, 'GET', '/api/scripts')).status, 401, `${what}: no key`);
     assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'wrong' } })).status, 401, `${what}: wrong key`);
     assert.equal((await request(base, 'GET', '/scripts')).status, 401, `${what}: dashboard`);
-    assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200, `${what}: the key still works`);
+    // The key still opens the door. What is behind it may be a 500 when the file
+    // cannot be read (a request never works from a config it could not read).
+    const keyed = (await request(base, 'GET', '/api/scripts', { headers: withKey() })).status;
+    assert.ok(keyed === 200 || keyed === 500, `${what}: the key still works (${keyed})`);
     fs.writeFileSync(file, good);
   }
   assert.ok(logged.some(l => l.includes('[Security]') && l.includes('keeping the last good')));
@@ -657,8 +674,8 @@ test('different wrong keys from one address are slowed down, doubling up to a li
   assert.equal(blocked.status, 429);
   assert.equal(blocked.headers['retry-after'], '1');
   assert.deepEqual(blocked.json(), { error: 'Too Many Requests', message: 'Too many wrong keys; wait and try again' });
-  // Even the right key waits out the pause: otherwise 429 against 200 would tell a guesser which key is right.
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
+  // The right key is always accepted: the pause only silences wrong ones.
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
   clock += 1001;
   assert.equal((await wrong()).status, 401);
   assert.equal((await wrong()).headers['retry-after'], '2', 'doubled');
@@ -686,13 +703,14 @@ test('one stale key sent over and over never locks anyone out', async t => {
   assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } })).status, 302);
 });
 
-test('twenty different wrong keys get 429, and the right key is refused during the pause', async t => {
+test('twenty different wrong keys get 429, and the right key still gets 200 during the pause', async t => {
   const { base } = await boot(t, { extra: AUTH });
   const statuses = [];
   for (let i = 0; i < 20; i += 1) statuses.push((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': `guess-${i}` } })).status);
   assert.deepEqual(statuses.slice(0, 5), [401, 401, 401, 401, 401]);
   assert.ok(statuses.slice(5).every(status => status === 429), statuses.join());
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
   // A key already tried also gets the pause, not a different answer.
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'guess-0' } })).status, 429);
 });

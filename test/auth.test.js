@@ -232,3 +232,187 @@ test('the hidden prompt does not echo, handles backspace, and needs a terminal',
   await assert.rejects(cancelled, /Cancelled/);
   await assert.rejects(readHidden('x', { input: { isTTY: false }, output }), /needs a terminal/);
 });
+
+// ---------------------------------------------------------------------------
+// Upgrade path: check-config, the old settings, the commands on a live config
+// ---------------------------------------------------------------------------
+
+const checkConfig = require('../scripts/check-config');
+
+function runCheck() {
+  const [stdout, stderr] = [fakeTerminal(), fakeTerminal()];
+  const code = checkConfig.main({ stdout, stderr });
+  return { code, stdout: stdout.text, stderr: stderr.text };
+}
+
+test('check-config says OK or lists every problem by key name, never a value, and does not change the file', t => {
+  const { file } = withConfig(t, { server: { host: '127.0.0.1' }, auth: { required: true, apiKey: KEY, dashboardPasswordHash: AUTH.auth.dashboardPasswordHash } });
+  const before = fs.readFileSync(file, 'utf8');
+  const ok = runCheck();
+  assert.equal(ok.code, 0);
+  assert.match(ok.stdout, /^OK: /);
+  assert.equal(ok.stderr, '');
+
+  // The old block next to missing new settings: one run shows everything to fix.
+  fs.writeFileSync(file, yaml.dump({ server: { host: '0.0.0.0' }, api: { authEnabled: true, apiKey: 'old-secret-value-0123456789' }, auth: { required: 'yes' } }));
+  const bad = runCheck();
+  assert.equal(bad.code, 1);
+  assert.match(bad.stderr, /Problem: config\.yaml still has the old settings api\.authEnabled, api\.apiKey;/);
+  assert.match(bad.stderr, /Problem: auth\.required in config\.yaml must be true or false/);
+  assert.match(bad.stderr, /Problem: server\.host is 0\.0\.0\.0/);
+  assert.match(bad.stderr, /3 problems in /);
+  assert.doesNotMatch(bad.stderr + bad.stdout, /old-secret-value/);
+
+  fs.writeFileSync(file, 'auth: {{{ super-secret-text');
+  const broken = runCheck();
+  assert.equal(broken.code, 1);
+  assert.match(broken.stderr, /config\.yaml is not valid YAML/);
+  assert.doesNotMatch(broken.stderr, /super-secret-text/);
+
+  // The old example block, switched off, is fine; so is no file at all.
+  fs.writeFileSync(file, yaml.dump({ api: { authEnabled: false, apiKey: '' } }));
+  assert.equal(runCheck().code, 0);
+  fs.unlinkSync(file);
+  assert.match(runCheck().stdout, /^OK: there is no /);
+  assert.equal(before.length > 0, true);
+});
+
+test('the set-* commands work on a live config that still has the old api block, and change only auth', async t => {
+  const old = { api: { authEnabled: true, apiKey: 'old-key-0123456789' }, scripts: [{ name: 'Keep', type: 'forever', command: 'echo hi' }] };
+  const { read } = withConfig(t, old);
+  const terminal = () => ({ stdin: { isTTY: true }, stdout: fakeTerminal(), stderr: fakeTerminal(), confirm: async () => true });
+  assert.equal(await setApiKey.main(terminal()), 0);
+  assert.equal(await setDashboardPassword.main({ prompt: async () => 'a long enough password', stdout: fakeTerminal(), stderr: fakeTerminal() }), 0);
+  const after = read();
+  assert.deepEqual(after.api, old.api, 'the old block is left exactly as it was for the running version');
+  assert.deepEqual(after.scripts, old.scripts);
+  assert.deepEqual(Object.keys(after.auth).sort(), ['apiKey', 'dashboardPasswordHash']);
+  assert.equal(after.auth.required, undefined, 'turning it on is a separate step');
+});
+
+test('the set-* commands re-read the file just before writing, so a change made while they waited is kept', async t => {
+  const { file, read } = withConfig(t, { scripts: [] });
+  const addScript = () => fs.writeFileSync(file, yaml.dump({ ...read(), scripts: [{ name: 'AddedMeanwhile' }] }));
+  assert.equal(await setApiKey.main({ stdin: { isTTY: true }, stdout: fakeTerminal(), stderr: fakeTerminal(), confirm: async () => true }), 0);
+  const calls = [];
+  const prompt = async () => { calls.push(1); if (calls.length === 2) addScript(); return 'a long enough password'; };
+  assert.equal(await setDashboardPassword.main({ prompt, stdout: fakeTerminal(), stderr: fakeTerminal() }), 0);
+  assert.equal(read().scripts[0].name, 'AddedMeanwhile');
+  assert.ok(read().auth.apiKey && read().auth.dashboardPasswordHash);
+});
+
+test('the set-* commands never replace a config.yaml they cannot read', async t => {
+  const { file } = withConfig(t);
+  fs.writeFileSync(file, 'scripts: [unclosed\n');
+  await assert.rejects(setApiKey.main({ stdin: { isTTY: true }, stdout: fakeTerminal(), stderr: fakeTerminal() }), /not valid YAML/);
+  await assert.rejects(setDashboardPassword.main({ prompt: async () => 'a long enough password', stdout: fakeTerminal(), stderr: fakeTerminal() }), /not valid YAML/);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'scripts: [unclosed\n');
+});
+
+// ---------------------------------------------------------------------------
+// Unreadable config on write paths, shared defaults
+// ---------------------------------------------------------------------------
+
+test('a request that would write config.yaml fails with a 500 when the file cannot be read, and leaves it alone', async t => {
+  const { base, file } = await boot(t, { scripts: [job('Alpha')] });
+  t.mock.method(console, 'error', () => {});
+  assert.equal((await request(base, 'GET', '/scripts')).status, 200); // the security settings have been read once
+  fs.writeFileSync(file, 'scripts: [unclosed secret-text\n');
+  const results = [
+    await request(base, 'POST', '/settings', { form: { retentionDays: '5' } }),
+    await request(base, 'POST', '/add-script', { form: { name: 'New', type: 'forever', command: 'echo hi' } }),
+    await request(base, 'POST', '/delete-script/Alpha'),
+    await request(base, 'POST', '/api/add-script', { json: { name: 'New', type: 'forever', command: 'echo hi' } }),
+    await request(base, 'POST', '/api/delete-script/Alpha'),
+    await request(base, 'POST', '/stop-script/Alpha'),
+  ];
+  for (const res of results) {
+    assert.equal(res.status, 500);
+    assert.match(res.text, /config\.yaml is not valid YAML/);
+    assert.doesNotMatch(res.text, /secret-text/);
+  }
+  assert.equal(fs.readFileSync(file, 'utf8'), 'scripts: [unclosed secret-text\n');
+});
+
+test('the defaults are never shared: changing a loaded config does not change the next one', t => {
+  const { file } = withConfig(t);
+  const configHandler = require('../utils/configHandler');
+  for (const load of [configHandler.loadConfig, configHandler.loadConfigStrict]) {
+    fs.rmSync(file, { force: true });
+    const first = load();
+    first.scripts.push({ name: 'Leak' });
+    first.logManagement.autoDelete = true;
+    first.server.port = 1;
+    const second = load();
+    assert.deepEqual(second.scripts, []);
+    assert.equal(second.logManagement.autoDelete, false);
+    assert.equal(second.server.port, 3000);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Throttles, limits, odd paths
+// ---------------------------------------------------------------------------
+
+test('the same wrong password sent again and again is limited too, at a higher count', async t => {
+  let clock = 1_000_000;
+  const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
+  const wrong = () => request(base, 'POST', '/login', { headers: { origin: base }, form: { password: 'the-same-wrong-password' } });
+  for (let i = 0; i < 15; i += 1) assert.equal((await wrong()).status, 401, `repeat ${i + 1}`);
+  const statuses = [];
+  for (let i = 0; i < 10; i += 1) statuses.push((await wrong()).status);
+  assert.ok(statuses.includes(429), statuses.join());
+  // During the pause not even the right password is checked.
+  assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } })).status, 429);
+  clock += 40_000;
+  assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } })).status, 302);
+});
+
+test('only a few password checks run at once; the rest get 429 without being checked', async t => {
+  let running = 0;
+  let peak = 0;
+  const verify = async () => {
+    running += 1;
+    peak = Math.max(peak, running);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    running -= 1;
+    return false;
+  };
+  const { base } = await boot(t, { extra: AUTH, securityOptions: { verify, freeFailures: Infinity } });
+  const results = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+    request(base, 'POST', '/login', { headers: { origin: base }, form: { password: `wrong-${i}` } })));
+  const statuses = results.map(r => r.status).sort();
+  assert.deepEqual(statuses, [401, 401, 429, 429, 429, 429]);
+  assert.equal(peak, 2);
+  assert.equal(results.find(r => r.status === 429).headers['retry-after'], '1');
+});
+
+test('an API key must be printable characters without spaces, and the same text is what gets compared', () => {
+  const problems = apiKey => listenProblems({ server: { host: '127.0.0.1' }, auth: { ...AUTH.auth, apiKey } });
+  assert.deepEqual(problems(KEY), []);
+  assert.match(problems(` ${KEY}`)[0], /auth\.apiKey/);
+  assert.match(problems(`${KEY} `)[0], /auth\.apiKey/);
+  assert.match(problems('a'.repeat(16) + ' ' + 'a'.repeat(16))[0], /auth\.apiKey/);
+  assert.match(problems(' '.repeat(40))[0], /auth\.apiKey/);
+  assert.match(problems(`${KEY}é`)[0], /auth\.apiKey/);
+});
+
+test('a hash with cost numbers that are not plain digits is refused', async () => {
+  const good = await hashPassword('correct horse battery', { N: 1024, r: 8, p: 1 });
+  assert.notEqual(parseHash(good), null);
+  for (const [from, to] of [['$1024$', '$0x400$'], ['$1024$', '$1e3$'], ['$1024$', '$ 1024$'], ['$1024$', '$+1024$'], ['$1024$', '$1024.0$']]) {
+    assert.equal(parseHash(good.replace(from, to)), null, to);
+  }
+});
+
+test('HEAD, OPTIONS and a trailing slash do not get around the check on /api', async t => {
+  const { base } = await boot(t, { scripts: [job('Alpha')], extra: AUTH });
+  for (const method of ['HEAD', 'OPTIONS']) {
+    assert.equal((await request(base, method, '/api/scripts')).status, 401, `${method} /api`);
+    assert.equal((await request(base, method, '/scripts')).status, 401, `${method} dashboard`);
+  }
+  assert.equal((await request(base, 'GET', '/api/scripts/')).status, 401);
+  assert.equal((await request(base, 'GET', '/api/')).status, 401);
+  assert.equal((await request(base, 'GET', '/api')).status, 401);
+  assert.equal((await request(base, 'GET', '/api/scripts/', { headers: withKey() })).status, 200);
+});
