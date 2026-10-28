@@ -7,15 +7,17 @@
 
 ## Before you update
 
-**If your `config.yaml` has `api.authEnabled`, `api.apiKey` or `api.dashboardAuth`, read this first.** Those settings were replaced by an `auth` section (see [Authentication](#authentication)), and TaskServer refuses to start while it still sees the old ones, so a server you thought was protected cannot quietly become open. Do the settings part **while the old version is still running**, so the restart is the only moment anything changes:
+**If your `config.yaml` has `api.authEnabled`, `api.apiKey` or `api.dashboardAuth`, read this first.** Those settings were replaced by an `auth` section (see [Authentication](#authentication)), and TaskServer refuses to start while it still sees the old ones, so a server you thought was protected cannot quietly become open. Follow these steps in this order, so that TaskServer is never running without the protection you expect:
 
-1. **Get the new version into a separate folder** (a fresh clone and `npm install`), without touching the running one. Run the commands below from that folder and point them at the live file: `TASKSERVER_CONFIG=/path/to/the/running/config.yaml`. They work against the old version's `config.yaml`: they add only the `auth` settings and leave `api` and everything else alone.
-2. **Make the secrets**: `npm run set-dashboard-password`, and `npm run set-api-key` (it prints the key once). Programs keep using the old key until step 5. If the old key is already 32 or more printable characters you may instead copy it into `auth.apiKey` by hand and skip `set-api-key`, so programs need no change.
-3. **Move the settings** in `config.yaml`: add `auth.required: true` (the old `api.authEnabled: true` becomes this), and remove the `api` section. Do not set `api.authEnabled: false` on the way: that turns the old version's protection off. The old version ignores the `auth` section, and when the `api` section disappears it logs `config.yaml no longer has the api section; keeping the last good security settings` and keeps requiring the old key (checked against the previous release). An `api` block that only says "off" (`authEnabled: false`, `apiKey: ""`) is harmless and may stay.
+1. **Make the secrets, with the new version's commands, before touching anything that runs.** Get the new version into a separate folder (a fresh clone and `npm install`) and run its commands from there. Point them at your live file with `TASKSERVER_CONFIG=/path/to/the/running/config.yaml`, or at a copy of it if you prefer: `npm run set-dashboard-password`, then `npm run set-api-key` (it prints the key once). They add only the `auth` secrets and leave `api` and everything else alone, and the old version ignores the `auth` section, so it keeps running exactly as before. If the old key is already a generated one of 32 or more characters you may copy it into `auth.apiKey` by hand and skip `set-api-key`, so programs need no change.
+2. **Stop the old TaskServer** (for example `pm2 stop taskserver`). Stopping TaskServer does not stop its jobs: on shutdown it only closes its own listener, its cron schedules and its tunnel, and never stops a job, and the jobs belong to PM2, a separate process. So **forever jobs keep running**, and a cron run that has already started carries on. What does not happen while TaskServer is stopped is anything that TaskServer does itself: **scheduled cron jobs do not start** (their schedules live inside TaskServer, and missed runs are not made up), and the dashboard and API are down, so nothing can be started, stopped or changed through them.
+3. **Edit `config.yaml`**: add `auth.required: true` (the old `api.authEnabled: true` becomes this) and remove the `api` section. An `api` block that only says "off" (`authEnabled: false`, `apiKey: ""`) is harmless and may stay.
 4. **Check the file**: `TASKSERVER_CONFIG=... npm run check-config` prints `OK`, or every problem by key name, and exits 1 on a problem. It does not start anything. Fix what it lists and run it again until it says `OK`.
-5. **Update and restart** straight away (`git pull`, install, restart). Then change programs that call `/api/*` to send the new key if it changed.
+5. **Update and start the new version** (`git pull`, install, `pm2 start taskserver` or `pm2 restart taskserver`). It adopts the jobs PM2 is already running and resumes the cron schedules. Then change programs that call `/api/*` to send the new key if it changed. A dashboard that used to be keyless (`api.dashboardAuth: false`) will now show the login page: sign in with the dashboard password from step 1.
 
-Until the restart, do not restart the old version: with the `api` section gone it would start with authentication **off** (it only refuses to start when `server.host` is not a loopback address or the Cloudflare tunnel is on).
+*If you cannot stop TaskServer* and edit the file while the old version runs, you can: the old version ignores `auth`, and when the `api` section disappears it logs `config.yaml no longer has the api section; keeping the last good security settings` and keeps requiring the old key (checked against the previous release). Never set `api.authEnabled: false` on the way, which turns the old version's protection off. But **a crash, a reboot or a remote restart in that window (including a deploy tool calling `POST /api/restart-script/taskserver`) starts the old version with authentication OFF**, because with no `api` section it has nothing to enforce; it only refuses to start when `server.host` is not a loopback address or the Cloudflare tunnel is on. Keep that window as short as you can, and run `check-config` before it starts.
+
+Keep a copy of your `config.yaml` first: TaskServer and these commands write the file back from its parsed contents, so comments in it are lost (see [Authentication](#authentication)).
 
 ## Features
 
@@ -282,9 +284,10 @@ Do these in order, on the machine TaskServer runs on:
 
 Both helper commands write `config.yaml` atomically (a temporary file in the same
 folder, then a rename) with mode `600`, never print a secret in a log or put it
-on a command line, and leave `auth.required` alone. They rewrite the file from its
-parsed contents, so comments in `config.yaml` are not kept (the dashboard's
-Settings page already did the same).
+on a command line, and leave `auth.required` alone. **Comments in `config.yaml` are
+lost** whenever the file is rewritten from its parsed contents: by these commands, and
+by TaskServer itself when you use the Settings page or add, edit or delete a script
+(through the dashboard or the API).
 
 TaskServer **refuses to turn authentication on** unless both secrets exist: with
 `auth.required: true` and no `auth.apiKey` (at least 32 characters) or no valid
@@ -318,6 +321,9 @@ curl -X POST http://localhost:3000/api/restart-script/myScript \
   `{"error":"Unauthorized","message":"Valid API key required"}`, whatever was wrong.
   Each refusal logs one line, `TaskServer API refused: <METHOD> <path> from <address>`,
   with no key, query string or headers.
+- **Use the key that `npm run set-api-key` generates, never one you make up.** A
+  correct key is always accepted, even during a pause, so the key's randomness is
+  the only defence against someone guessing it; the generated one has 256 bits.
 - The key is compared in constant time. A correct key is always accepted. After 5
   *different* wrong keys from one address, further wrong keys from it get `429` for
   a growing pause (see [Security](#security)).
@@ -331,9 +337,11 @@ curl -X POST http://localhost:3000/api/restart-script/myScript \
   growing pause, **even with the right password**, because each check is costly. The
   count is per address, so everyone who reaches TaskServer through the same address
   (a reverse proxy or tunnel) shares it: one person typing the wrong password
-  repeatedly can briefly lock the others out of the login page. Repeating the same
-  wrong password counts too, 20 times as many being allowed, and only a few
-  password checks run at the same time (the others get `429`). Each failure logs `TaskServer login refused: POST /login from <address>`
+  repeatedly can lock the others out of the login page, possibly for as long as
+  someone keeps trying. Restarting TaskServer clears the count (it is kept in
+  memory). Repeating the same wrong password counts too: 20 repeats are allowed (4
+  times the 5 different tries), and only a few password checks run at the same time
+  (the others get `429`). Each failure logs `TaskServer login refused: POST /login from <address>`
   (never the password).
 - A successful login sets a session cookie: random 256-bit id, `HttpOnly`,
   `SameSite=Strict`, `Path=/`, and `Secure` when the request came over HTTPS (or a

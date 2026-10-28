@@ -275,6 +275,10 @@ async function deleteScript(req, name) {
   // A forever job is stopped and removed from PM2 first. If that fails the
   // script stays in the config, so it is not left running with nothing in
   // charge of it.
+  // The other way round heals itself: if PM2 has let go of the job but the
+  // config cannot be rewritten below (unreadable or unwritable file), the
+  // script is still in the config, and boot reconcile starts a configured job
+  // that PM2 does not have (utils/reconcile.js). The config is what counts.
   if (found.type === 'forever') {
     await jobControl(req).removeJob(name, found);
   }
