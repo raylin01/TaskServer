@@ -7,8 +7,8 @@ const router = require('../routes/scripts');
 const { boot, request, job } = require('../test-support/httpApp');
 const { listenProblems, localPath } = require('../utils/security');
 
-const KEY = 'example-key-0123456789';
-const AUTH = { api: { authEnabled: true, apiKey: KEY } };
+const { KEY, PASSWORD, HASH, AUTH, lowCostHash } = require('../test-support/authFixture');
+const authWith = (more = {}) => ({ auth: { ...AUTH.auth, ...more } });
 const withKey = (extra = {}) => ({ 'x-api-key': KEY, ...extra });
 const EVIL = 'http://evil.example';
 
@@ -22,7 +22,7 @@ async function pageToken(base, headers = {}) {
 
 // Signs in and returns the cookie to send back.
 async function signIn(base) {
-  const res = await request(base, 'POST', '/login', { form: { apiKey: KEY, next: '/scripts' } });
+  const res = await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD, next: '/scripts' } });
   assert.equal(res.status, 302);
   return res.headers['set-cookie'][0].split(';')[0];
 }
@@ -154,7 +154,7 @@ function concretePath(routePath) {
 const routes = () => router.stack.filter(layer => layer.route).flatMap(layer =>
   Object.keys(layer.route.methods).map(method => ({ method: method.toUpperCase(), path: layer.route.path })));
 
-test('with authentication on, every route refuses a request without the key, and changes nothing', async t => {
+test('with authentication on, every route refuses a request without its credential, and changes nothing', async t => {
   const app = await boot(t, { scripts: [job('Example Worker'), job('Example Cron', { type: 'cron', schedule: '0 * * * *' })], extra: AUTH,
     securityOptions: { freeFailures: Infinity },
     setupPm2: (p, c) => p.add({ name: c.scripts[0].name, script: 'x.js', cwd: os.tmpdir() }) });
@@ -164,29 +164,38 @@ test('with authentication on, every route refuses a request without the key, and
 
   const all = routes();
   assert.ok(all.length >= 25, `found ${all.length} routes`);
-  const unauthenticated = [{}, { 'x-api-key': 'wrong' }, { cookie: 'taskserver_session=1.abcd' }, { origin: base, 'sec-fetch-site': 'same-origin' }];
-  for (const headers of unauthenticated) {
-    for (const { method, path: routePath } of all) {
+  // /api takes the key only (a session cookie, a Basic header or the dashboard
+  // password is no use there); the rest takes a session only (not even the right key).
+  const apiTries = [{}, { 'x-api-key': 'wrong' }, { cookie: 'taskserver_session=abcd' }, { authorization: `Basic ${Buffer.from(`user:${KEY}`).toString('base64')}` },
+    { origin: base, 'sec-fetch-site': 'same-origin' }];
+  const dashboardTries = [{}, { 'x-api-key': 'wrong' }, { 'x-api-key': KEY }, { cookie: 'taskserver_session=abcd' }, { origin: base, 'sec-fetch-site': 'same-origin' }];
+  for (const { method, path: routePath } of all) {
+    const isApi = routePath.startsWith('/api/');
+    for (const headers of isApi ? apiTries : dashboardTries) {
       const url = concretePath(routePath) + (routePath.includes('logs') ? '?file=Example%20Worker-out-1.log' : '');
       const res = await request(base, method, url, { headers, json: method === 'POST' ? { name: 'X', type: 'forever', command: 'echo hi' } : undefined });
       assert.equal(res.status, 401, `${method} ${routePath} ${JSON.stringify(headers)} -> ${res.status}`);
-      assert.deepEqual(res.json(), { error: 'Unauthorized', message: 'Valid API key required' });
+      assert.deepEqual(res.json(), { error: 'Unauthorized', message: isApi ? 'Valid API key required' : 'Sign in required' });
     }
   }
   // Paths that match no route are refused too, not answered with a 404.
   assert.equal((await request(base, 'GET', '/nothing-here')).status, 401);
   assert.equal((await request(base, 'POST', '/nothing-here')).status, 401);
+  assert.equal((await request(base, 'GET', '/api/nothing-here')).status, 401);
+  assert.equal((await request(base, 'GET', '/API/scripts', { headers: { cookie: 'taskserver_session=abcd' } })).status, 401);
   assert.equal(fs.readFileSync(app.file, 'utf8'), before);
   assert.deepEqual(pm2.mutations(), []);
   assert.equal(saved().scripts.length, 2);
   assert.ok(fs.existsSync(path.join(app.logsDir, 'Example Worker-out-1.log')));
 });
 
-test('with the key, the same routes answer (none is left out by accident)', async t => {
+test('with the right credential, the same routes answer (none is left out by accident)', async t => {
   const { base } = await boot(t, { scripts: forever(), extra: AUTH });
+  const cookie = await signIn(base);
   for (const { method, path: routePath } of routes().filter(r => r.method === 'GET')) {
     if (routePath.includes('logs') || routePath === '/') continue;
-    const res = await request(base, method, concretePath(routePath), { headers: withKey({ accept: 'application/json' }) });
+    const headers = routePath.startsWith('/api/') ? withKey() : { cookie };
+    const res = await request(base, method, concretePath(routePath), { headers: { ...headers, accept: 'application/json' } });
     assert.notEqual(res.status, 401, `${method} ${routePath}`);
   }
 });
@@ -217,13 +226,13 @@ test('with authentication off nothing asks for a key', async t => {
 
 test('the dashboard works behind the key: sign in, use a form with its token, sign out', async t => {
   const { base, saved, logsDir } = await boot(t, { scripts: forever(), extra: AUTH });
-  const wrong = await request(base, 'POST', '/login', { form: { apiKey: 'wrong', next: '/scripts' } });
+  const wrong = await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: 'wrong', next: '/scripts' } });
   assert.equal(wrong.status, 401);
   assert.equal(wrong.headers['set-cookie'], undefined);
   assert.match(wrong.text, /not correct/);
   assert.doesNotMatch(wrong.text, new RegExp(KEY));
 
-  const login = await request(base, 'POST', '/login', { headers: { origin: base }, form: { apiKey: KEY, next: '/settings' } });
+  const login = await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD, next: '/settings' } });
   assert.equal(login.status, 302);
   assert.equal(login.headers.location, '/settings');
   const cookieHeader = login.headers['set-cookie'][0];
@@ -250,7 +259,7 @@ test('the dashboard works behind the key: sign in, use a form with its token, si
 
   // The log delete button sends the token in a header.
   fs.writeFileSync(path.join(logsDir, 'Example Worker-out-1.log'), 'x');
-  const del = (headers) => request(base, 'DELETE', '/api/logs/Example%20Worker/delete?file=Example%20Worker-out-1.log', { headers: { cookie, origin: base, ...headers } });
+  const del = (headers) => request(base, 'DELETE', '/logs/Example%20Worker/data/delete?file=Example%20Worker-out-1.log', { headers: { cookie, origin: base, ...headers } });
   assert.equal((await del({})).status, 403);
   assert.equal((await del({ 'x-csrf-token': token })).status, 200);
 
@@ -259,24 +268,30 @@ test('the dashboard works behind the key: sign in, use a form with its token, si
   assert.match(out.headers['set-cookie'][0], /Max-Age=0/);
 });
 
-test('a made-up, expired or foreign session cookie is not accepted; the session is not an API key', async t => {
+test('a made-up, expired or foreign session cookie is not accepted; the session is not an API key and the key is not a session', async t => {
   let clock = Date.now();
   const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH, securityOptions: { now: () => clock } });
   const cookie = await signIn(base);
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 200);
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 200);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401, 'a session does not open /api');
+  assert.equal((await request(base, 'GET', '/API/scripts', { headers: { cookie } })).status, 401, 'in any letter case');
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { 'x-api-key': KEY } })).status, 401, 'the key does not open the dashboard');
   const [name, value] = cookie.split('=');
   assert.equal(value.length, 43, 'a random 256-bit id');
   assert.doesNotMatch(value, /\./, 'no expiry or signature to forge');
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${value.slice(0, -1)}${value.endsWith('A') ? 'B' : 'A'}` } })).status, 401, 'altered');
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: `${name}=${'A'.repeat(43)}` } })).status, 401, 'made up');
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: `${name}=${value.slice(0, -1)}${value.endsWith('A') ? 'B' : 'A'}` } })).status, 401, 'altered');
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: `${name}=${'A'.repeat(43)}` } })).status, 401, 'made up');
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': value } })).status, 401);
-  // A new key ends every session.
-  write({ ...config, api: { authEnabled: true, apiKey: 'a-different-key-9876' } });
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401);
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: `${name}=${value}`, 'x-api-key': KEY } })).status, 200);
+  // A new password ends every session; a new key does not touch them.
+  write({ ...config, ...authWith({ apiKey: 'a-different-key-0123456789-0123456789' }) });
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 200);
+  write({ ...config, ...authWith({ dashboardPasswordHash: lowCostHash('a different password') }) });
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 401);
   write({ ...config, ...AUTH });
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 200, 'the old key again: the same session');
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 200, 'the old password again: the same session');
   clock += 8 * 24 * 60 * 60 * 1000;
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401, 'expired after 7 days');
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 401, 'expired after 7 days');
 });
 
 test('signing out ends the session on the server: a copy of the cookie stops working', async t => {
@@ -286,15 +301,15 @@ test('signing out ends the session on the server: a copy of the cookie stops wor
   const token = await pageToken(base, { cookie });
   assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: copy } })).status, 200);
   assert.equal((await request(base, 'POST', '/logout', { headers: { cookie, origin: base }, form: { _csrf: token } })).status, 302);
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: copy } })).status, 401);
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: copy } })).status, 401);
   assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: copy, accept: 'text/html' } })).status, 302);
   // Another sign-in is a different session.
   const second = await signIn(base);
   assert.notEqual(second, cookie);
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie: second } })).status, 200);
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie: second } })).status, 200);
 });
 
-test('the cookie and the CSRF token are not derived from the API key', async t => {
+test('the cookie and the CSRF token are not derived from a credential', async t => {
   const first = await boot(t, { extra: AUTH });
   const second = await boot(t, { extra: AUTH });
   const [a, b] = [await signIn(first.base), await signIn(second.base)];
@@ -306,11 +321,11 @@ test('the cookie and the CSRF token are not derived from the API key', async t =
 test('the sign-in page only sends you on to a path of this site', async t => {
   const { base } = await boot(t, { extra: AUTH });
   for (const next of ['//evil.example', 'https://evil.example', '/\\evil.example', 'javascript:alert(1)', '']) {
-    const res = await request(base, 'POST', '/login', { form: { apiKey: KEY, next } });
+    const res = await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD, next } });
     assert.equal(res.headers.location, '/scripts', JSON.stringify(next));
   }
   assert.equal(localPath('/edit-script/A%20B?x=1'), '/edit-script/A%20B?x=1');
-  const crossSite = await request(base, 'POST', '/login', { headers: { origin: EVIL }, form: { apiKey: KEY } });
+  const crossSite = await request(base, 'POST', '/login', { headers: { origin: EVIL }, form: { password: PASSWORD } });
   assert.equal(crossSite.status, 403);
   assert.equal(crossSite.headers['set-cookie'], undefined);
 });
@@ -321,13 +336,13 @@ test('Origin: null (a same-origin form post under the no-referrer policy) works 
   const refused = headers => [{ ...headers }, { ...headers, 'sec-fetch-site': 'cross-site' }, { ...headers, 'sec-fetch-site': 'same-site' }, { ...headers, 'sec-fetch-site': 'none' }];
 
   // Sign in. A wrong key is a 401 (the request got as far as the key check).
-  assert.equal((await request(base, 'POST', '/login', { headers: same, form: { apiKey: 'wrong' } })).status, 401);
+  assert.equal((await request(base, 'POST', '/login', { headers: same, form: { password: 'wrong' } })).status, 401);
   for (const headers of refused({ origin: 'null' })) {
-    const res = await request(base, 'POST', '/login', { headers, form: { apiKey: KEY } });
+    const res = await request(base, 'POST', '/login', { headers, form: { password: PASSWORD } });
     assert.equal(res.status, 403, JSON.stringify(headers));
     assert.equal(res.headers['set-cookie'], undefined);
   }
-  const login = await request(base, 'POST', '/login', { headers: same, form: { apiKey: KEY, next: '/scripts' } });
+  const login = await request(base, 'POST', '/login', { headers: same, form: { password: PASSWORD, next: '/scripts' } });
   assert.equal(login.status, 302);
   const cookie = login.headers['set-cookie'][0].split(';')[0];
 
@@ -352,7 +367,7 @@ test('pages are sent with Referrer-Policy: same-origin', async t => {
 
 test('the secure flag is set on the session cookie when the request came over https', async t => {
   const { base } = await boot(t, { extra: AUTH });
-  const res = await request(base, 'POST', '/login', { headers: { 'x-forwarded-proto': 'https' }, form: { apiKey: KEY } });
+  const res = await request(base, 'POST', '/login', { headers: { origin: base, 'x-forwarded-proto': 'https' }, form: { password: PASSWORD } });
   assert.match(res.headers['set-cookie'][0], /; Secure/);
 });
 
@@ -421,48 +436,83 @@ test('a config.yaml that was never readable refuses every request', async t => {
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': '' } })).status, 401);
 });
 
-test('an empty api key never matches, even when authentication is on', async t => {
-  const { base } = await boot(t, { extra: { api: { authEnabled: true, apiKey: '' } } });
+test('an empty api key or password never matches, even when authentication is on', async t => {
+  const { base } = await boot(t, { extra: authWith({ apiKey: '' }) });
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': '' } })).status, 401);
-  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: '' } })).status, 401);
+  assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: '' } })).status, 401);
 });
 
 // ---------------------------------------------------------------------------
 // Refusing to start
 // ---------------------------------------------------------------------------
 
-test('TaskServer refuses to start when it is reachable from other machines without a key', () => {
+test('TaskServer refuses to start when it is reachable from other machines without authentication', () => {
   const config = (server, extra = {}) => ({ server, ...extra });
-  const AUTH_ON = { api: { authEnabled: true, apiKey: KEY } };
   assert.deepEqual(listenProblems(config({ host: '127.0.0.1' })), []);
   assert.deepEqual(listenProblems(config({ host: 'localhost' })), []);
   assert.deepEqual(listenProblems(config({ host: '::1' })), []);
-  assert.deepEqual(listenProblems(config({ host: '127.0.0.1' }, AUTH_ON)), []);
+  assert.deepEqual(listenProblems(config({ host: '127.0.0.1' }, AUTH)), []);
 
-  assert.match(listenProblems(config({ host: '0.0.0.0' }))[0], /server\.host is 0\.0\.0\.0, not a loopback address.*api\.authEnabled/);
-  assert.match(listenProblems(config({ host: '192.168.1.20' }, { api: { authEnabled: false, apiKey: KEY } }))[0], /server\.host/);
+  assert.match(listenProblems(config({ host: '0.0.0.0' }))[0], /server\.host is 0\.0\.0\.0, not a loopback address.*auth\.required: true/);
+  assert.match(listenProblems(config({ host: '192.168.1.20' }, { auth: { required: false } }))[0], /server\.host/);
   assert.match(listenProblems(config({ host: '127.0.0.1' }, { cloudflare: { enabled: true, tunnelToken: 'x' } }))[0], /cloudflare\.enabled is true/);
   assert.equal(listenProblems(config({ host: '0.0.0.0' }, { cloudflare: { enabled: true } })).length, 1);
-  assert.deepEqual(listenProblems(config({ host: '0.0.0.0' }, { ...AUTH_ON, cloudflare: { enabled: true } })), []);
+  assert.deepEqual(listenProblems(config({ host: '0.0.0.0' }, { ...AUTH, cloudflare: { enabled: true } })), []);
+});
+
+test('TaskServer refuses to turn authentication on without both an API key and a dashboard password hash', () => {
+  const problems = auth => listenProblems({ server: { host: '127.0.0.1' }, auth });
+  const both = problems({ required: true });
+  assert.equal(both.length, 1);
+  assert.match(both[0], /auth\.required is true .*auth\.apiKey .*at least 32.* and auth\.dashboardPasswordHash/);
+  assert.match(problems({ required: true, dashboardPasswordHash: HASH })[0], /auth\.apiKey .*at least 32/);
+  assert.doesNotMatch(problems({ required: true, dashboardPasswordHash: HASH })[0], /dashboardPasswordHash/);
+  assert.match(problems({ required: true, apiKey: KEY })[0], /needs auth\.dashboardPasswordHash/);
+  assert.match(problems({ required: true, apiKey: '   ', dashboardPasswordHash: HASH })[0], /at least 32/);
+  assert.match(problems({ required: true, apiKey: 'thirty-one-characters-xxxxxxxxx', dashboardPasswordHash: HASH })[0], /at least 32/);
+  assert.deepEqual(problems({ required: true, apiKey: KEY, dashboardPasswordHash: HASH }), []);
+  // Off needs neither.
+  assert.deepEqual(problems({ required: false }), []);
+  assert.deepEqual(problems(undefined), []);
 });
 
 test('TaskServer refuses to start with auth settings it cannot trust, naming the key', () => {
-  const problems = api => listenProblems({ server: { host: '127.0.0.1' }, api });
-  assert.match(problems({ authEnabled: true, apiKey: '' })[0], /api\.apiKey .*at least 16 characters/);
-  assert.match(problems({ authEnabled: true })[0], /api\.apiKey .*at least 16 characters/);
-  assert.match(problems({ authEnabled: true, apiKey: '   ' })[0], /at least 16/);
-  assert.match(problems({ authEnabled: true, apiKey: 'fifteen-chars-x' })[0], /at least 16/);
-  assert.deepEqual(problems({ authEnabled: true, apiKey: 'sixteen-chars-xxx' }), []);
+  const problems = auth => listenProblems({ server: { host: '127.0.0.1' }, auth });
   // Truthy words used to turn auth on; now they are an error, not "off".
   for (const value of ['true', 'yes', 'on', 1, 'false', null, [], {}]) {
-    assert.match(problems({ authEnabled: value, apiKey: KEY })[0], /api\.authEnabled .*must be true or false/, JSON.stringify(value));
+    assert.match(problems({ ...AUTH.auth, required: value })[0], /auth\.required .*must be true or false/, JSON.stringify(value));
   }
-  assert.match(problems({ authEnabled: true, apiKey: 1234567890123456 })[0], /api\.apiKey in config\.yaml must be a string/);
-  assert.match(problems({ authEnabled: false, apiKey: 12345 })[0], /must be a string/);
-  assert.match(problems('on')[0], /api in config\.yaml must be a mapping/);
+  assert.match(problems({ ...AUTH.auth, apiKey: 12345678901234567890123456789012 })[0], /auth\.apiKey in config\.yaml must be a string/);
+  assert.match(problems({ required: false, dashboardPasswordHash: 12345 })[0], /auth\.dashboardPasswordHash .*must be a string/);
+  assert.match(problems({ ...AUTH.auth, dashboardPasswordHash: 'hunter2' })[0], /auth\.dashboardPasswordHash .*not a hash made by/);
+  assert.match(problems({ required: false, dashboardPasswordHash: 'hunter2' })[0], /not a hash made by/);
+  assert.match(problems('on')[0], /auth in config\.yaml must be a mapping/);
   assert.match(listenProblems({ server: { host: '127.0.0.1', publicOrigins: ['not an origin'] } })[0], /server\.publicOrigins/);
   assert.match(listenProblems({ server: { host: '127.0.0.1', allowedHosts: 'dash' } })[0], /server\.allowedHosts .*list of strings/);
-  assert.doesNotMatch(JSON.stringify(problems({ authEnabled: true, apiKey: 'short' })), /short|\b5\b/, 'neither the key nor its length');
+  assert.doesNotMatch(JSON.stringify(problems({ required: true, apiKey: 'short-secret', dashboardPasswordHash: HASH })), /short-secret|\b12\b/, 'neither the key nor its length');
+});
+
+test('the old api settings are refused by name, all in one message, unless the block only says "off"', () => {
+  const problems = (api, extra = {}) => listenProblems({ server: { host: '127.0.0.1' }, api, ...extra });
+  const one = problems({ authEnabled: true, apiKey: 'old-secret-value-0123456789', dashboardAuth: false });
+  assert.equal(one.length, 1);
+  assert.match(one[0], /old settings api\.authEnabled, api\.apiKey, api\.dashboardAuth;/);
+  assert.match(one[0], /api\.authEnabled is now auth\.required; api\.apiKey is now auth\.apiKey; api\.dashboardAuth is gone/);
+  assert.match(one[0], /auth\.required: true also needs auth\.dashboardPasswordHash/);
+  assert.match(one[0], /"Before you update"/);
+  assert.doesNotMatch(one[0], /old-secret-value/, 'names only, never values');
+  assert.match(problems({ apiKey: 'x' })[0], /old settings api\.apiKey;/);
+  assert.match(problems({ authEnabled: false, apiKey: 'x' })[0], /old settings api\.apiKey;/, 'a key left behind is not inert');
+  assert.match(problems({ authEnabled: 'false' })[0], /old settings api\.authEnabled;/);
+  assert.match(problems({ dashboardAuth: false })[0], /old settings api\.dashboardAuth;/);
+  assert.match(problems('on')[0], /old settings api;/);
+  // Several problems are all reported, not just the first.
+  assert.equal(problems({ authEnabled: true }, { auth: { required: 'yes' }, server: { host: '0.0.0.0' } }).length, 3);
+  // The old example block, switched off, changes nothing.
+  for (const inert of [{ authEnabled: false, apiKey: '' }, { authEnabled: false }, { apiKey: null }, { dashboardAuth: true }, {}, null, undefined]) {
+    assert.deepEqual(problems(inert), [], JSON.stringify(inert));
+  }
+  assert.deepEqual(problems({ authEnabled: false, apiKey: '' }, AUTH), [], 'also next to the new settings');
 });
 
 test('starting the server with an unsafe or unreadable config exits before it listens or touches PM2', t => {
@@ -487,7 +537,17 @@ test('starting the server with an unsafe or unreadable config exits before it li
   assert.match(tunnel.stderr, /cloudflare\.enabled is true/);
   assert.doesNotMatch(tunnel.stderr + tunnel.stdout, /tunnel-secret-value/);
 
-  const broken = start('api:\n  apiKey: super-secret-value\n  bad: [unclosed\n');
+  const noSecrets = start('auth:\n  required: true\n');
+  assert.equal(noSecrets.status, 1);
+  assert.match(noSecrets.stderr, /Refusing to start: auth\.required is true .*auth\.apiKey .* and auth\.dashboardPasswordHash/);
+  assert.doesNotMatch(noSecrets.stdout, /TaskServer running/);
+
+  const oldSettings = start('api:\n  authEnabled: true\n  apiKey: old-style-secret-value-0123456789\n');
+  assert.equal(oldSettings.status, 1);
+  assert.match(oldSettings.stderr, /Refusing to start: config\.yaml still has the old settings api\.authEnabled, api\.apiKey;/);
+  assert.doesNotMatch(oldSettings.stderr + oldSettings.stdout, /old-style-secret-value/);
+
+  const broken = start('auth:\n  apiKey: super-secret-value\n  bad: [unclosed\n');
   assert.equal(broken.status, 1);
   assert.match(broken.stderr, /Refusing to start: config\.yaml is not valid YAML: .* at line \d+, column \d+/);
   assert.doesNotMatch(broken.stderr + broken.stdout, /super-secret-value|unclosed/);
@@ -510,24 +570,30 @@ test('config.yaml going missing, empty, cut off or odd while running never switc
     'missing': () => fs.unlinkSync(file),
     'empty': () => fs.writeFileSync(file, ''),
     'only a comment': () => fs.writeFileSync(file, '# nothing\n'),
-    'cut off before the api section': () => fs.writeFileSync(file, good.slice(0, good.indexOf('api:'))),
-    'cut off inside the api section': () => fs.writeFileSync(file, good.slice(0, good.indexOf('apiKey:') + 'apiKey: examp'.length)),
-    'cut off in the middle of a word': () => fs.writeFileSync(file, `${good.slice(0, good.indexOf('authEnabled:'))}authEnabled: tr`),
+    'cut off before the auth section': () => fs.writeFileSync(file, good.slice(0, good.indexOf('auth:'))),
+    'cut off inside the auth section': () => fs.writeFileSync(file, good.slice(0, good.indexOf('apiKey:') + 'apiKey: examp'.length)),
+    'cut off in the middle of a word': () => fs.writeFileSync(file, `${good.slice(0, good.indexOf('required:'))}required: tr`),
     'a list': () => fs.writeFileSync(file, '- a\n- b\n'),
     'a plain word': () => fs.writeFileSync(file, 'hello\n'),
-    'auth switched to a word': () => write({ ...config, api: { authEnabled: 'true', apiKey: KEY } }),
-    'auth switched to a number': () => write({ ...config, api: { authEnabled: 1, apiKey: KEY } }),
-    'a key that is a number': () => write({ ...config, api: { authEnabled: true, apiKey: 1234567890123456 } }),
-    'a key that is too short': () => write({ ...config, api: { authEnabled: true, apiKey: 'short' } }),
-    'api section not a mapping': () => write({ ...config, api: 'on' }),
-    'broken yaml': () => fs.writeFileSync(file, 'api: {{{'),
+    'auth switched to a word': () => write({ ...config, ...authWith({ required: 'true' }) }),
+    'auth switched to a number': () => write({ ...config, ...authWith({ required: 1 }) }),
+    'a key that is a number': () => write({ ...config, ...authWith({ apiKey: 1234567890123456 }) }),
+    'a key that is too short': () => write({ ...config, ...authWith({ apiKey: 'short' }) }),
+    'auth section not a mapping': () => write({ ...config, auth: 'on' }),
+    'the old api settings added': () => write({ ...config, ...AUTH, api: { authEnabled: true, apiKey: 'old-value' } }),
+    'a hash that is not one': () => write({ ...config, ...authWith({ dashboardPasswordHash: 'hunter2' }) }),
+    'the password hash removed': () => write({ ...config, ...authWith({ dashboardPasswordHash: '' }) }),
+    'broken yaml': () => fs.writeFileSync(file, 'auth: {{{'),
   };
   for (const [what, damage] of Object.entries(bad)) {
     damage();
     assert.equal((await request(base, 'GET', '/api/scripts')).status, 401, `${what}: no key`);
     assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'wrong' } })).status, 401, `${what}: wrong key`);
     assert.equal((await request(base, 'GET', '/scripts')).status, 401, `${what}: dashboard`);
-    assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200, `${what}: the key still works`);
+    // The key still opens the door. What is behind it may be a 500 when the file
+    // cannot be read (a request never works from a config it could not read).
+    const keyed = (await request(base, 'GET', '/api/scripts', { headers: withKey() })).status;
+    assert.ok(keyed === 200 || keyed === 500, `${what}: the key still works (${keyed})`);
     fs.writeFileSync(file, good);
   }
   assert.ok(logged.some(l => l.includes('[Security]') && l.includes('keeping the last good')));
@@ -547,9 +613,9 @@ test('a change that really turns auth on or rotates the key is still picked up',
   assert.equal((await request(base, 'GET', '/api/scripts')).status, 200);
   write({ ...config, ...AUTH });
   assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
-  write({ ...config, api: { authEnabled: true, apiKey: 'rotated-key-0123456789' } });
+  write({ ...config, ...authWith({ apiKey: 'rotated-key-0123456789-0123456789-abc' }) });
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 401);
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'rotated-key-0123456789' } })).status, 200);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'rotated-key-0123456789-0123456789-abc' } })).status, 200);
 });
 
 test('config.yaml is replaced atomically: temp file in the same folder, flushed, then renamed', t => {
@@ -608,8 +674,8 @@ test('different wrong keys from one address are slowed down, doubling up to a li
   assert.equal(blocked.status, 429);
   assert.equal(blocked.headers['retry-after'], '1');
   assert.deepEqual(blocked.json(), { error: 'Too Many Requests', message: 'Too many wrong keys; wait and try again' });
-  // Even the right key waits out the pause: otherwise 429 against 200 would tell a guesser which key is right.
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
+  // The right key is always accepted: the pause only silences wrong ones.
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
   clock += 1001;
   assert.equal((await wrong()).status, 401);
   assert.equal((await wrong()).headers['retry-after'], '2', 'doubled');
@@ -632,18 +698,19 @@ test('one stale key sent over and over never locks anyone out', async t => {
     assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'stale-key-of-a-poller' } })).status, 401, `repeat ${i + 1}`);
   }
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
-  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
-  for (let i = 0; i < 20; i += 1) assert.equal((await request(base, 'POST', '/login', { form: { apiKey: 'stale-key-of-a-poller' } })).status, 401);
-  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
+  assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } })).status, 302);
+  for (let i = 0; i < 20; i += 1) assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: 'stale-key-of-a-poller' } })).status, 401);
+  assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } })).status, 302);
 });
 
-test('twenty different wrong keys get 429, and the right key is refused during the pause', async t => {
+test('twenty different wrong keys get 429, and the right key still gets 200 during the pause', async t => {
   const { base } = await boot(t, { extra: AUTH });
   const statuses = [];
   for (let i = 0; i < 20; i += 1) statuses.push((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': `guess-${i}` } })).status);
   assert.deepEqual(statuses.slice(0, 5), [401, 401, 401, 401, 401]);
   assert.ok(statuses.slice(5).every(status => status === 429), statuses.join());
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 429);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
   // A key already tried also gets the pause, not a different answer.
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: { 'x-api-key': 'guess-0' } })).status, 429);
 });
@@ -681,19 +748,21 @@ test('a right key outside a pause starts the count again', async t => {
   }
 });
 
-test('the sign-in form is slowed down the same way, and requests without a key count for nothing', async t => {
+test('the sign-in form is slowed down the same way, apart from the API, and requests without a key count for nothing', async t => {
   let clock = 1_000_000;
   const { base } = await boot(t, { extra: AUTH, securityOptions: { now: () => clock } });
   for (let i = 0; i < 20; i += 1) assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
-  for (let i = 0; i < 5; i += 1) assert.equal((await request(base, 'POST', '/login', { form: { apiKey: `wrong-${i}` } })).status, 401);
-  const blocked = await request(base, 'POST', '/login', { form: { apiKey: KEY } });
+  for (let i = 0; i < 5; i += 1) assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: `wrong-${i}` } })).status, 401);
+  const blocked = await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } });
   assert.equal(blocked.status, 429);
   assert.equal(blocked.headers['retry-after'], '1');
   assert.equal(blocked.headers['set-cookie'], undefined);
-  assert.match(blocked.text, /Too many wrong keys/);
-  assert.doesNotMatch(blocked.text, new RegExp(KEY));
+  assert.match(blocked.text, /Too many wrong passwords/);
+  assert.doesNotMatch(blocked.text, new RegExp(PASSWORD));
+  // A locked-out login does not stop the programs that use the API from the same address.
+  assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
   clock += 1500;
-  assert.equal((await request(base, 'POST', '/login', { form: { apiKey: KEY } })).status, 302);
+  assert.equal((await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD } })).status, 302);
 });
 
 test('the table of clients is capped, least recently touched first, and swept at most once a minute', () => {
@@ -762,7 +831,7 @@ test('a log delete with a session needs the token header and this site\'s origin
   const cookie = await signIn(base);
   const token = await pageToken(base, { cookie });
   const file = 'Example%20Worker-out-1.log';
-  const url = `/api/logs/Example%20Worker/delete?file=${file}`;
+  const url = `/logs/Example%20Worker/data/delete?file=${file}`;
   fs.writeFileSync(path.join(logsDir, 'Example Worker-out-1.log'), 'x');
   assert.equal((await request(base, 'DELETE', url, { headers: { cookie } })).status, 403, 'no Origin, no token');
   assert.equal((await request(base, 'DELETE', url, { headers: { cookie, 'x-csrf-token': token } })).status, 403, 'token but no Origin');
@@ -776,7 +845,7 @@ test('a log delete with a session needs the token header and this site\'s origin
 test('the sign-in page does not send you back to itself', async t => {
   const { base } = await boot(t, { extra: AUTH });
   for (const next of ['/login', '/login?next=/scripts', '/login/x']) {
-    const res = await request(base, 'POST', '/login', { form: { apiKey: KEY, next } });
+    const res = await request(base, 'POST', '/login', { headers: { origin: base }, form: { password: PASSWORD, next } });
     assert.equal(res.headers.location, '/scripts', next);
   }
   assert.equal(localPath('/loginfo'), '/scripts');
@@ -796,25 +865,25 @@ test('settings checked at start-up are in force from the first request, even if 
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
 });
 
-test('an api section that drops authEnabled does not turn authentication off; false does', async t => {
+test('an auth section that drops required does not turn authentication off; false does', async t => {
   const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH });
   assert.equal((await request(base, 'GET', '/api/scripts', { headers: withKey() })).status, 200);
-  write({ ...config, api: { apiKey: KEY } });
+  write({ ...config, auth: { apiKey: KEY } });
   assert.equal((await request(base, 'GET', '/api/scripts')).status, 401, 'dropped: the last good settings stay');
-  write({ ...config, api: {} });
+  write({ ...config, auth: {} });
   assert.equal((await request(base, 'GET', '/api/scripts')).status, 401);
-  write({ ...config, api: { authEnabled: false, apiKey: KEY } });
+  write({ ...config, ...authWith({ required: false }) });
   assert.equal((await request(base, 'GET', '/api/scripts')).status, 200, 'an explicit false is a decision');
 });
 
 test('turning authentication off forgets every session, so turning it on again needs a new sign-in', async t => {
   const { base, write, config } = await boot(t, { scripts: forever(), extra: AUTH });
   const cookie = await signIn(base);
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 200);
-  write({ ...config, api: { authEnabled: false, apiKey: KEY } });
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 200);
+  write({ ...config, ...authWith({ required: false }) });
   assert.equal((await request(base, 'GET', '/api/scripts')).status, 200);
   write({ ...config, ...AUTH });
-  assert.equal((await request(base, 'GET', '/api/scripts', { headers: { cookie } })).status, 401);
+  assert.equal((await request(base, 'GET', '/scripts', { headers: { cookie } })).status, 401);
 });
 
 test('a failed config write is an error response, not a reported success', async t => {

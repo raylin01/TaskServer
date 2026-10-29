@@ -13,8 +13,11 @@ function asyncHandler(handler) {
   };
 }
 
+// A path under /api, in any letter case (Express routes are case-insensitive).
+const isApiPath = path => /^\/api(?:\/|$)/i.test(path);
+
 function wantsJson(req) {
-  return req.path.startsWith('/api/');
+  return isApiPath(req.path);
 }
 
 // Must be registered after the routes (four arguments make it an error handler).
@@ -53,4 +56,4 @@ function installProcessHandlers({ logger = console, onFatal } = {}) {
   };
 }
 
-module.exports = { asyncHandler, errorMiddleware, installProcessHandlers, describeError };
+module.exports = { isApiPath, asyncHandler, errorMiddleware, installProcessHandlers, describeError };

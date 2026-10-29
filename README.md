@@ -5,6 +5,20 @@
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)
 
+## Before you update
+
+**If your `config.yaml` has `api.authEnabled`, `api.apiKey` or `api.dashboardAuth`, read this first.** Those settings were replaced by an `auth` section (see [Authentication](#authentication)), and TaskServer refuses to start while it still sees the old ones, so a server you thought was protected cannot quietly become open. Follow these steps in this order, so that TaskServer is never running without the protection you expect:
+
+1. **Make the secrets, with the new version's commands, before touching anything that runs.** Get the new version into a separate folder (a fresh clone and `npm install`) and run its commands from there. Point them at your live file with `TASKSERVER_CONFIG=/path/to/the/running/config.yaml`, or at a copy of it if you prefer: `npm run set-dashboard-password`, then `npm run set-api-key` (it prints the key once). They add only the `auth` secrets and leave `api` and everything else alone, and the old version ignores the `auth` section, so it keeps running exactly as before. If the old key is already a generated one of 32 or more characters you may copy it into `auth.apiKey` by hand and skip `set-api-key`, so programs need no change.
+2. **Stop the old TaskServer** (for example `pm2 stop taskserver`). Stopping TaskServer does not stop its jobs: on shutdown it only closes its own listener, its cron schedules and its tunnel, and never stops a job, and the jobs belong to PM2, a separate process. So **forever jobs keep running**, and a cron run that has already started carries on. What does not happen while TaskServer is stopped is anything that TaskServer does itself: **scheduled cron jobs do not start** (their schedules live inside TaskServer, and missed runs are not made up), and the dashboard and API are down, so nothing can be started, stopped or changed through them.
+3. **Edit `config.yaml`**: add `auth.required: true` (the old `api.authEnabled: true` becomes this) and remove the `api` section. An `api` block that only says "off" (`authEnabled: false`, `apiKey: ""`) is harmless and may stay.
+4. **Check the file**: `TASKSERVER_CONFIG=... npm run check-config` prints `OK`, or every problem by key name, and exits 1 on a problem. It does not start anything. Fix what it lists and run it again until it says `OK`.
+5. **Update and start the new version** (`git pull`, install, `pm2 start taskserver` or `pm2 restart taskserver`). It adopts the jobs PM2 is already running and resumes the cron schedules. Then change programs that call `/api/*` to send the new key if it changed. A dashboard that used to be keyless (`api.dashboardAuth: false`) will now show the login page: sign in with the dashboard password from step 1.
+
+*If you cannot stop TaskServer* and edit the file while the old version runs, you can: the old version ignores `auth`, and when the `api` section disappears it logs `config.yaml no longer has the api section; keeping the last good security settings` and keeps requiring the old key (checked against the previous release). Never set `api.authEnabled: false` on the way, which turns the old version's protection off. But **a crash, a reboot or a remote restart in that window (including a deploy tool calling `POST /api/restart-script/taskserver`) starts the old version with authentication OFF**, because with no `api` section it has nothing to enforce; it only refuses to start when `server.host` is not a loopback address or the Cloudflare tunnel is on. Keep that window as short as you can, and run `check-config` before it starts.
+
+Keep a copy of your `config.yaml` first: TaskServer and these commands write the file back from its parsed contents, so comments in it are lost (see [Authentication](#authentication)).
+
 ## Features
 
 - **Forever Scripts**: Run long-running scripts that automatically restart on failure
@@ -19,9 +33,11 @@
 
 ## Table of Contents
 
+- [Before you update](#before-you-update)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [Authentication](#authentication)
 - [Security](#security)
 - [Script Types](#script-types)
 - [Web Dashboard](#web-dashboard)
@@ -101,7 +117,7 @@ To enable this:
     ```
 3.  **Configure GitSync**: Add TaskServer to your GitSync config (see GitSync docs).
 
-When updated, GitSync calls `POST /api/restart-script/taskserver` (with the `X-API-Key` header when `api.authEnabled` is on; see [Security](#security)). TaskServer answers first, then asks PM2 to restart it, so the caller always gets a clean reply. The PM2 name it restarts is `server.selfName` (default `taskserver`).
+When updated, GitSync calls `POST /api/restart-script/taskserver` (with the `X-API-Key` header when `auth.required` is on; see [Authentication](#authentication)). TaskServer answers first, then asks PM2 to restart it, so the caller always gets a clean reply. The PM2 name it restarts is `server.selfName` (default `taskserver`).
 
 On `SIGINT` or `SIGTERM` TaskServer closes its own listener and exits within a second. It never stops the jobs it manages. If the port is still held by the previous instance it logs that, retries with a growing pause (about 20 s in total), then exits with an error.
 
@@ -172,14 +188,15 @@ server:
   port: 3000                   # Web interface port (default: 3000)
   host: "127.0.0.1"           # Loopback only by default, even when omitted
   logsDir: "./logs"            # Directory to store logs (default: ./logs)
-  allowedHosts: []             # Extra Host names to serve when api.authEnabled is off (see Security)
+  allowedHosts: []             # Extra Host names to serve when auth.required is off (see Security)
   publicOrigins: []            # Exact origins (https://dashboard.example.com) a browser may post from, for a proxy that rewrites Host
 
-# API Authentication (Optional, see Security)
-api:
-  authEnabled: false
-  apiKey: ""
-  # dashboardAuth: true        # false: dashboard pages need no key from this machine (see Security)
+# Authentication (Optional, see Authentication). Use "npm run set-api-key" and
+# "npm run set-dashboard-password" to fill in the two secrets.
+auth:
+  required: false              # true: every route needs its credential
+  apiKey: ""                   # For programs calling /api/*, sent in the X-API-Key header
+  dashboardPasswordHash: ""    # scrypt hash of the dashboard password (never the password itself)
 
 # PM2 Settings (Optional)
 pm2:
@@ -212,73 +229,197 @@ scripts:
 
 TaskServer binds to `127.0.0.1` by default, including existing configurations
 without `server.host`. To allow LAN access, explicitly set `server.host: "0.0.0.0"`
-(all IPv4 interfaces); TaskServer then refuses to start unless `api.authEnabled`
-is on (see [Security](#security)).
+(all IPv4 interfaces); TaskServer then refuses to start unless `auth.required`
+is on (see [Authentication](#authentication)).
+
+## Authentication
+
+Anything that can reach TaskServer can run commands on the machine, so you
+should turn authentication on whenever anyone other than you could reach the
+port. It is **off by default**; with it off, nothing described here applies and
+TaskServer behaves as it always has (and only serves `localhost` names, see
+[Security](#security)).
+
+One switch, `auth.required: true`, protects the whole server. There are two
+credentials, and they are different secrets:
+
+| Who | Where | Credential |
+| --- | --- | --- |
+| Programs (CI, deploy tools, scripts) | `/api/*` | The API key, in the `X-API-Key` header |
+| People | The dashboard (every other page and form) | The dashboard password, at `/login` |
+
+With the switch on, **every** route needs its credential, except the login page,
+the login form post and the static files in `public/`. The API key does not open
+the dashboard and the dashboard password or its session cookie does not open
+`/api/*`.
+
+### Turning it on
+
+Do these in order, on the machine TaskServer runs on:
+
+1. **Make the API key.** Run `npm run set-api-key`. It generates a random key,
+   stores it as `auth.apiKey` in `config.yaml`, and **shows it once** on the
+   terminal. Copy it into your password manager (and into whatever calls the API)
+   now; it cannot be shown again. It needs a real terminal, so it refuses to run
+   through a pipe. Running it again replaces the key (after asking), which stops
+   the old one working.
+2. **Set the dashboard password.** Run `npm run set-dashboard-password`. It asks
+   twice, with no echo, for a password of at least 12 characters, and stores only
+   a salted scrypt hash as `auth.dashboardPasswordHash`. Running it again changes
+   the password and signs everyone out.
+3. **Switch it on.** In `config.yaml`, set `auth.required: true`:
+
+   ```yaml
+   auth:
+     required: true
+     apiKey: "..."                 # written by set-api-key
+     dashboardPasswordHash: "..."  # written by set-dashboard-password
+   ```
+
+4. **Check, then restart TaskServer.** `npm run check-config` prints `OK` or lists
+   what is wrong. Then restart (`pm2 restart taskserver`, or however you run it)
+   and update every program that calls `/api/*` to send the key (below). The
+   setting is also read on every request, so it takes effect without a restart.
+5. Open the dashboard: it sends you to the login page.
+
+Both helper commands write `config.yaml` atomically (a temporary file in the same
+folder, then a rename) with mode `600`, never print a secret in a log or put it
+on a command line, and leave `auth.required` alone. **Comments in `config.yaml` are
+lost** whenever the file is rewritten from its parsed contents: by these commands, and
+by TaskServer itself when you use the Settings page or add, edit or delete a script
+(through the dashboard or the API).
+
+TaskServer **refuses to turn authentication on** unless both secrets exist: with
+`auth.required: true` and no `auth.apiKey` (at least 32 characters) or no valid
+`auth.dashboardPasswordHash`, it exits at start-up naming what is missing, and a
+running server keeps its previous settings. To turn authentication off again, set
+`auth.required: false` (this also ends every dashboard session).
+
+> **Upgrading.** See [Before you update](#before-you-update) for the steps to follow while the old version is still running. `api.authEnabled`, `api.apiKey` and `api.dashboardAuth` are gone,
+> replaced by `auth.required`, `auth.apiKey` and `auth.dashboardPasswordHash`. This
+> is a breaking change: a `config.yaml` that still has any of the old keys makes
+> TaskServer refuse to start (so a server you thought was protected cannot silently
+> become open), with one message that lists every old key and what it became. (An
+> `api` block that only says "off" is accepted and ignored.) The dashboard no longer signs
+> in with the API key, and there is no longer a way to open the dashboard without a
+> credential.
+
+### The API
+
+Send the key in the `X-API-Key` header, and nowhere else:
+
+```bash
+curl -X POST http://localhost:3000/api/restart-script/myScript \
+  -H "X-API-Key: $TASKSERVER_API_KEY"
+```
+
+- Only that header is accepted. A key in the URL (`?apiKey=`), HTTP Basic
+  authentication, and the dashboard's session cookie are all refused, as is the
+  dashboard password. Keep the key out of URLs and command lines (read it from an
+  environment variable or a file, as above), because URLs end up in logs.
+- A request without a valid key gets `401` and the JSON body
+  `{"error":"Unauthorized","message":"Valid API key required"}`, whatever was wrong.
+  Each refusal logs one line, `TaskServer API refused: <METHOD> <path> from <address>`,
+  with no key, query string or headers.
+- **Use the key that `npm run set-api-key` generates, never one you make up.** A
+  correct key is always accepted, even during a pause, so the key's randomness is
+  the only defence against someone guessing it; the generated one has 256 bits.
+- The key is compared in constant time. A correct key is always accepted. After 5
+  *different* wrong keys from one address, further wrong keys from it get `429` for
+  a growing pause (see [Security](#security)).
+- Requests made with the key are not browser requests, so they need no `Origin`
+  header and no CSRF token.
+
+### The dashboard
+
+- `/login` asks for the dashboard password. A wrong password is refused; after 5
+  different wrong passwords from one address, further attempts get `429` for a
+  growing pause, **even with the right password**, because each check is costly. The
+  count is per address, so everyone who reaches TaskServer through the same address
+  (a reverse proxy or tunnel) shares it: one person typing the wrong password
+  repeatedly can lock the others out of the login page, possibly for as long as
+  someone keeps trying. Restarting TaskServer clears the count (it is kept in
+  memory). Repeating the same wrong password counts too: 20 repeats are allowed (4
+  times the 5 different tries), and only a few password checks run at the same time
+  (the others get `429`). Each failure logs `TaskServer login refused: POST /login from <address>`
+  (never the password).
+- A successful login sets a session cookie: random 256-bit id, `HttpOnly`,
+  `SameSite=Strict`, `Path=/`, and `Secure` when the request came over HTTPS (or a
+  proxy said so with `X-Forwarded-Proto: https`). Sessions last 7 days and live in
+  memory only, so restarting TaskServer, changing the password, or setting
+  `auth.required: false` signs everyone out. **Log out** (top right) ends a session
+  at once.
+- A browser asking for a page without a session is sent to `/login` and back
+  afterwards; a form post or data request without a session gets `401`.
+- Every form post (including the login) must come from the dashboard itself: its
+  `Origin` (or, when there is none, its `Referer`) has to be this server's own host
+  or one of `server.publicOrigins`, and it has to carry the page's CSRF token.
+
+If TaskServer sits behind a proxy or tunnel that rewrites the `Host` header, list the
+address people open in `server.publicOrigins` (for example
+`https://dashboard.example.com`), or the dashboard's forms are refused with "Cross-site
+request refused". Authentication does not make plain HTTP safe: use HTTPS (a tunnel
+or a reverse proxy) for any network you do not trust, because the password and the
+key travel in the clear otherwise.
 
 ## Security
 
 Anything that can reach TaskServer can run commands on the machine, so it is
-locked down in layers.
+locked down in layers. [Authentication](#authentication) is the main one; these
+are the others, and the details of how it behaves.
 
-**One check for every route.** With `api.authEnabled: true` every route needs the
-API key, except the sign-in page and the static files in `public/`. Requests that
-do not have it get a `401` (browsers are sent to `/login`).
-
-- `api.authEnabled` must be `true` or `false` (not `"true"` or `yes`), and `api.apiKey`
-  must be a string of at least 16 characters when auth is on. Generate one with
-  `openssl rand -base64 24`.
-- Programs send the key in the `X-API-Key` header. The key is **not** accepted in a
-  URL (`?apiKey=` no longer works) and is compared in constant time.
-- After 5 *different* wrong keys from one address (in the header or at `/login`),
-  requests from it are refused with `429` for a pause that doubles from 1 s up to
-  30 s, even with the right key (otherwise 429 against 200 would tell a guesser
-  which key is right). The same wrong key sent again counts for nothing, so a
-  client with an out-of-date key cannot lock anyone else out. A right key outside
-  a pause starts the count again, and failures are forgotten after 10 quiet
-  minutes. Clients on the loopback interface (scripts and consoles on the same
-  machine) get a pause of at most 2 s, unless `server.publicOrigins` is set or the
-  request carries proxy headers (`X-Forwarded-For` and similar): behind a proxy or
-  tunnel every client has the proxy's address, so they share one count and the
-  full 30 s ladder applies.
-- The dashboard signs in at `/login` with the same key and then uses a random,
-  `HttpOnly`, `SameSite=Strict` session cookie (7 days). Sessions are kept in memory:
-  "Log out" ends one at once, and restarting TaskServer ends all of them. Changing
-  the key ends them too. The cookie and the CSRF token are not derived from the key.
-- `api.dashboardAuth` (default `true`) can switch the key off for the dashboard
-  pages only; see [Dashboard without a key](#dashboard-without-a-key).
+- `auth.required` must be `true` or `false` (not `"true"` or `yes`). With it on,
+  `auth.apiKey` must be at least 32 printable characters without spaces
+  (`npm run set-api-key` makes a 43-character one) and `auth.dashboardPasswordHash`
+  must be a hash made by `npm run set-dashboard-password` (scrypt, N=2^16; the cost
+  travels with the hash, so hashes made with other costs keep working).
+- After 5 *different* wrong keys from one address, further wrong keys from it are
+  refused with `429` for a pause that doubles from 1 s up to 30 s. The key is
+  compared first and a correct one is always accepted, so a pause never locks out a
+  client that has the right key (a stale key sent over and over counts for nothing).
+  Wrong passwords at `/login` are counted the same way, separately, so a locked-out
+  login never stops the programs that use the API from the same address; but a login
+  during its pause is refused whatever the password, and the count is per address,
+  shared by everyone behind the same proxy. A right try outside a pause starts the
+  count again, and failures are forgotten after 10 quiet minutes. Clients on the loopback interface
+  (scripts and consoles on the same machine) get a pause of at most 2 s, unless
+  `server.publicOrigins` is set or the request carries proxy headers
+  (`X-Forwarded-For` and similar): behind a proxy or tunnel every client has the
+  proxy's address, so they share one count and the full 30 s ladder applies.
+- The session cookie and the CSRF token are made from random values, never from the
+  API key or the password. Only a hash of each session id is kept in memory.
 - The security settings TaskServer checked at start-up are in force from the first
   request. If `config.yaml` goes missing, becomes empty, is cut off, drops
-  `api.authEnabled` while auth was on, or gets settings that make no sense while
+  `auth.required` while auth was on, or gets settings that make no sense while
   TaskServer runs, the last good settings stay in force (turn auth off by setting
-  `api.authEnabled: false`, which also ends every session). Config writes are
+  `auth.required: false`, which also ends every session). Config writes are
   atomic (temporary file, flush, rename, flush the folder; a symbolic link is
-  followed), and a write that fails is an error response, never a reported success.
+  followed), always mode `600`, and a write that fails is an error response, never
+  a reported success. Every request that writes `config.yaml` reads it strictly
+  first: if the file cannot be read or parsed, the request fails with a `500` and the
+  file is left alone, instead of being replaced by the defaults.
 
 **Requests from other web pages.** A page open in the same browser cannot make
 TaskServer do anything:
 
 - A state-changing request from a browser must come from the dashboard's own origin
-  (its `Origin` is this server's own `Host`, or is listed in `server.publicOrigins`;
-  `X-Forwarded-Host` is not used) and carry the CSRF token the dashboard pages embed
-  (a hidden `_csrf` form field, or the `X-CSRF-Token` header).
+  (its `Origin`, or its `Referer` when there is no `Origin`, is this server's own
+  `Host`, or is listed in `server.publicOrigins`; `X-Forwarded-Host` is not used)
+  and carry the CSRF token the dashboard pages embed (a hidden `_csrf` form field,
+  or the `X-CSRF-Token` header).
   An `Origin: null` (which some browsers send for same-origin form posts, and
   sandboxed frames and local files always send) counts as no `Origin`: it is only
   accepted when the browser also says `Sec-Fetch-Site: same-origin`. Pages are sent
   with `Referrer-Policy: same-origin`.
 - A request with a valid `X-API-Key` header is exempt: a web page cannot add that
-  header, and scripts such as GitSync send no `Origin`. A program that sends no
-  `Origin` and no cookie is treated as a script and is only let through when
-  authentication is off.
+  header, and scripts such as GitSync send no `Origin`. With authentication off, a
+  program that sends no `Origin` and no cookie is treated as a script and let through.
 - `/api` takes JSON. `POST /api/add-script` answers `415` to anything but
   `application/json`.
 - With authentication off, only `localhost`, `127.0.0.1`, `[::1]` and the names in
   `server.allowedHosts` are served (protection against DNS rebinding).
 - Pages are sent with a Content-Security-Policy that allows scripts only from
   TaskServer itself, plus `X-Frame-Options: DENY` and `X-Content-Type-Options: nosniff`.
-
-If TaskServer is behind a proxy that rewrites the `Host` header, list the address
-people open in `server.publicOrigins` (for example `https://dashboard.example.com`),
-or the dashboard's forms are refused with "Cross-site request refused".
 
 **Logs.** The log viewer only serves files in the logs folder named
 `<job>-out-<stamp>.log` or `<job>-error-<stamp>.log` for the job in the URL.
@@ -290,67 +431,16 @@ Dashboard pages that were open when TaskServer restarted carry an old CSRF token
 reload them before submitting a form.
 
 **Start-up checks.** TaskServer exits instead of starting when `config.yaml`
-cannot be parsed, when `api.authEnabled` is not a boolean, when `api.apiKey` is not
-a string or (with auth on) is shorter than 16 characters, when `server.publicOrigins`
-or `server.allowedHosts` are malformed, or when `server.host` is not a loopback
-address or `cloudflare.enabled` is true while `api.authEnabled` is off, when `api.dashboardAuth`
-is not a boolean, or when `api.dashboardAuth` is `false` with a non-loopback
-`server.host`, `cloudflare.enabled` or a non-empty `server.publicOrigins`. The message
-names the config key and the reason.
-
-### Dashboard without a key
-
-By default the dashboard asks for the key like everything else. If you only open
-it on the machine TaskServer runs on and want the key for programs that call the
-API, set:
-
-```yaml
-api:
-  authEnabled: true
-  apiKey: "a-key-of-16-or-more-characters"
-  dashboardAuth: false
-```
-
-With `api.authEnabled: true` and `api.dashboardAuth: false`:
-
-- The dashboard pages and forms (`/scripts`, `/add-script`, `/edit-script/...`,
-  `/settings`, the log viewer and the buttons on them) open with no key and no
-  sign-in. `/login` just sends you on to the page you asked for.
-- Everything under `/api/` still needs the `X-API-Key` header, exactly as before.
-  The dashboard's own scripts do not call `/api`: the log viewer reads its data
-  from `/logs/<job>/data...`, which follow the dashboard rules above, so no
-  request can reach `/api/` without the key.
-- A request only gets this when it looks unmistakably local: the connection comes
-  from a loopback address, the `Host` header is `localhost`, `127.0.0.1` or `[::1]`
-  (so a page cannot reach it through DNS rebinding), and it carries none of the
-  proxy headers (`X-Forwarded-For`, `-Host`, `-Proto`, `-Port` and `-Server`,
-  `X-Real-IP`, `Forwarded`, `Via`, `CF-Connecting-IP`, `True-Client-IP`,
-  `X-Client-IP`, `X-Original-URL`). Any other request is asked for the key as usual.
-- A state-changing request still needs this site's `Origin` (or `Sec-Fetch-Site:
-  same-origin`) and the CSRF token embedded in the page, even when it sends no
-  `Origin` at all. With no session to bind the token to, it is bound to the running
-  process: a random value made at start-up, different on each start, never derived
-  from the key. Reload a page that was open across a restart.
-- TaskServer refuses to start when `api.dashboardAuth` is not `true` or `false`, and
-  when it is `false` while `server.host` is not a loopback address,
-  `cloudflare.enabled` is true, or `server.publicOrigins` is not empty. Each
-  message names the key and the reason. If such a setting is added to a running
-  server's `config.yaml`, the dashboard goes back to asking for the key.
-
-**Only use this when nothing forwards to TaskServer's port.** TaskServer cannot tell
-a forwarded connection from a local one unless it carries one of the headers above.
-Any reverse proxy or port forward that reaches the port over loopback without such
-headers (nginx with default settings, `ssh -L`, `socat` and the like) bypasses the
-key in this mode and exposes the dashboard, including adding, editing and running
-jobs, to whoever can reach that proxy or forward.
-
-**The trade-off.** The key no longer protects the dashboard from other programs on
-the same machine. Any local program can fetch a page to get the CSRF token and then
-post with its own `Origin` header to add, edit, delete or run jobs (which run
-commands) without the key. The CSRF checks stop other web pages, not local programs.
-So with `dashboardAuth: false` the key mainly protects `/api/*` from programs that
-only use the API. Leave it at the default (`true`) on a machine where you do not
-trust every local user and program.
+cannot be parsed, when it still has an old `api.authEnabled`, `api.apiKey` or
+`api.dashboardAuth` setting (other than an `api` block that only says "off"), when `auth.required` is not a boolean, when `auth.apiKey` or
+`auth.dashboardPasswordHash` is not a string (or the hash is not one made by the
+helper), when `auth.required` is true without a key of at least 32 characters and a
+password hash, when `server.publicOrigins` or `server.allowedHosts` are malformed, or
+when `server.host` is not a loopback address or `cloudflare.enabled` is true while
+`auth.required` is off. The message names the config key and the reason, and all
+the problems are listed together. `npm run check-config` runs exactly these checks
+on `config.yaml` without starting anything (use `TASKSERVER_CONFIG=/path/to/config.yaml`
+for another file) and exits 1 when it finds a problem, so you can run it before a restart.
 
 ### Recovering from a startup refusal
 
@@ -551,8 +641,9 @@ Configure the named tunnel's origin service in Cloudflare as
 the address TaskServer actually bound to: `127.0.0.1` by default, `[::1]` for
 `host: "::1"`, loopback for wildcard binds (`0.0.0.0`, `::`), and the configured
 address otherwise. The default loopback bind works without LAN exposure.
-TaskServer will not start with the tunnel enabled unless `api.authEnabled` is on
-with an `api.apiKey`: visitors then sign in with that key (see [Security](#security)).
+TaskServer will not start with the tunnel enabled unless `auth.required` is on
+(see [Authentication](#authentication)): visitors then sign in with the dashboard
+password.
 Cloudflare Access in front of it is still a good idea.
 
 ### Step 3: Start Your Server
@@ -691,27 +782,20 @@ TaskServer provides REST API endpoints for programmatic access.
 
 ### JSON API (Programmatic Access)
 
-These endpoints return JSON. When `api.authEnabled` is on they, like every other route, need the API key:
+These endpoints return JSON. When `auth.required` is on they need the API key in the `X-API-Key` header (see [Authentication](#authentication)):
 
 - `GET /api/scripts` - List all scripts with status as JSON
 - `POST /api/restart-script/:scriptName` - Restart a forever script
 - `POST /api/stop-script/:scriptName` - Stop a forever script
 - `POST /api/start-script/:scriptName` - Start a forever script
 - `POST /api/add-script` - Add a script (JSON body)
+- `POST /api/delete-script/:scriptName` - Stop (if running) and delete a script; `404` JSON for an unknown name
 
-**Authentication** (optional, see [Security](#security)):
-
-Enable in `config.yaml`:
-```yaml
-api:
-  authEnabled: true
-  apiKey: "your-secret-key"
-```
-
-Send the API key in the `X-API-Key` header (it is not accepted in a URL):
+**Authentication** (optional, see [Authentication](#authentication)): with `auth.required: true`,
+send the API key in the `X-API-Key` header (it is not accepted in a URL):
 ```bash
 curl -X POST http://localhost:3000/api/restart-script/myScript \
-  -H "X-API-Key: your-secret-key"
+  -H "X-API-Key: $TASKSERVER_API_KEY"
 ```
 
 ### Logs
@@ -725,7 +809,7 @@ curl -X POST http://localhost:3000/api/restart-script/myScript \
 
 The log viewer page loads the same data from `/logs/:scriptName/data`, `/data/stats`,
 `/data/chunk`, `/data/download` and `/data/delete` (same parameters). Those are the
-dashboard's own routes, protected like the dashboard pages; programs should use `/api/logs`.
+dashboard's own routes, which take the dashboard session; programs should use `/api/logs` with the API key.
 
 ### Settings
 
@@ -866,9 +950,12 @@ TaskServer/
 │   └── *.js              # Dashboard scripts (no inline scripts: the CSP forbids them)
 ├── routes/               # Express routes
 │   └── scripts.js        # Script management routes
-├── scripts/              # Your scripts go here
+├── scripts/              # Your scripts go here, and the set-api-key / set-dashboard-password / check-config commands
 │   ├── exampleForever.js
-│   └── exampleCron.py
+│   ├── exampleCron.py
+│   ├── set-api-key.js
+│   ├── set-dashboard-password.js
+│   └── check-config.js
 ├── utils/                # Utility modules
 │   ├── configHandler.js  # Config loading/saving (TASKSERVER_CONFIG overrides the path)
 │   ├── processService.js # The one PM2 client: queue, timeouts, reconnect
@@ -877,6 +964,8 @@ TaskServer/
 │   ├── reconcile.js      # Boot-time adoption of running jobs
 │   ├── logViewer.js      # Log listing and reading, limited to the job's own log files
 │   ├── security.js       # Authentication, sign-in, CSRF and Host checks, start-up checks
+│   ├── passwordHash.js   # scrypt hashing of the dashboard password
+│   ├── hiddenPrompt.js   # Password prompt without echo (for the set-* commands)
 │   ├── logCleanup.js     # Automatic log cleanup
 │   └── cloudflareTunnel.js # Cloudflare Tunnel integration
 └── views/                # EJS templates

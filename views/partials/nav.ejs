@@ -4,7 +4,7 @@
     <a href="/scripts">Scripts</a> |
     <a href="/add-script">Add Script</a> |
     <a href="/settings">Settings</a>
-    <% if (typeof authEnabled !== 'undefined' && authEnabled) { %>
+    <% if (typeof authRequired !== 'undefined' && authRequired) { %>
       |
       <form method="post" action="/logout" class="nav-form">
         <%- include('csrf-field') %>

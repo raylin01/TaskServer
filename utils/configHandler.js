@@ -33,13 +33,18 @@ const DEFAULT_CONFIG = {
   scripts: []
 };
 
+// A new copy every time: callers change the config they get (add a script,
+// set a flag), and that must never change the defaults for the next caller.
+const freshDefaults = () => structuredClone(DEFAULT_CONFIG);
+
 function withDefaults(userConfig) {
-  // Deep merge with defaults (simple version for this depth)
-  const config = { ...DEFAULT_CONFIG, ...userConfig };
-  config.logManagement = { ...DEFAULT_CONFIG.logManagement, ...(userConfig.logManagement || {}) };
-  config.server = { ...DEFAULT_CONFIG.server, ...(userConfig.server || {}) };
-  config.server.host = config.server.host || DEFAULT_CONFIG.server.host;
-  config.pm2 = { ...DEFAULT_CONFIG.pm2, ...(userConfig.pm2 || {}) };
+  const defaults = freshDefaults();
+  // Merge with defaults (simple version for this depth)
+  const config = { ...defaults, ...userConfig };
+  config.logManagement = { ...defaults.logManagement, ...(userConfig.logManagement || {}) };
+  config.server = { ...defaults.server, ...(userConfig.server || {}) };
+  config.server.host = config.server.host || defaults.server.host;
+  config.pm2 = { ...defaults.pm2, ...(userConfig.pm2 || {}) };
 
   // Ensure scripts exists
   config.scripts = userConfig.scripts || [];
@@ -47,13 +52,15 @@ function withDefaults(userConfig) {
   return config;
 }
 
+// For reading: a config file that cannot be used is logged (without its text,
+// which can hold secrets) and the defaults are returned. Never use the result
+// to write the file back: use loadConfigStrict for that.
 function loadConfig() {
   try {
-    const file = fs.readFileSync(getConfigPath(), 'utf8');
-    return withDefaults(yaml.load(file) || {});
+    return loadConfigStrict();
   } catch (e) {
-    console.error('Failed to load config.yaml:', e);
-    return DEFAULT_CONFIG;
+    console.error(`Failed to load config.yaml: ${e.message}`);
+    return freshDefaults();
   }
 }
 
@@ -82,13 +89,14 @@ function readRawConfig() {
   }
 }
 
-// Like loadConfig, but a config file that cannot be read or parsed is an error
-// instead of an empty config. A missing or empty file is still the defaults.
-// Start-up uses this, so a typo can never start TaskServer with settings it
-// did not read.
+// A config file that cannot be read or parsed is an error instead of an empty
+// config. A missing or empty file is still the defaults. Start-up uses this, so
+// a typo can never start TaskServer with settings it did not read, and every
+// code path that writes the file back uses it, so a file that could not be read
+// is never replaced with the defaults.
 function loadConfigStrict() {
   const raw = readRawConfig();
-  if (raw === undefined || raw === null) return DEFAULT_CONFIG;
+  if (raw === undefined || raw === null) return freshDefaults();
   if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config.yaml must be a mapping of settings');
   return withDefaults(raw);
 }
@@ -107,9 +115,10 @@ function getLogsDir() {
 
 // Replace the file in one step: the new text goes to a temporary file in the
 // same folder, is flushed to disk, is renamed over the old file, and the folder
-// is flushed too. A reader (this process's auth check, or anything else) sees
-// the whole old file or the whole new one, never a half-written one. If the
-// config path is a symbolic link, the file it points to is the one replaced.
+// is flushed too. The file is always mode 600. A reader (this process's auth
+// check, or anything else) sees the whole old file or the whole new one, never
+// a half-written one. If the config path is a symbolic link, the file it points
+// to is the one replaced.
 //
 // A failed write is logged (without the file's text) and thrown, so a request
 // that changes the config answers with an error instead of reporting a change
@@ -124,13 +133,10 @@ function writeConfig(config) {
   const temp = path.join(path.dirname(target), `.${path.basename(target)}.${process.pid}.${Date.now()}.tmp`);
   let fd;
   try {
-    let mode;
-    try {
-      mode = fs.statSync(target).mode & 0o777;
-    } catch (error) {
-      mode = undefined; // a new file gets the default mode
-    }
-    fd = fs.openSync(temp, 'wx', mode);
+    // config.yaml holds secrets (the API key, the password hash, tunnel token):
+    // owner read/write only, whatever the umask or the old file's mode was.
+    fd = fs.openSync(temp, 'wx', 0o600);
+    fs.fchmodSync(fd, 0o600);
     fs.writeSync(fd, yaml.dump(config));
     fs.fsyncSync(fd);
     fs.closeSync(fd);
@@ -159,6 +165,29 @@ function writeConfig(config) {
   }
 }
 
+// Change the file as it is right now, and only what `change` touches: reads the
+// raw settings (no defaults merged in), lets `change` edit them, and writes them
+// back at once. Nothing is awaited in between, so a change made to the file while
+// a command waited for a password is not lost. An unreadable file is an error.
+function updateRawConfig(change) {
+  const raw = readRawConfig() ?? {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw new Error('config.yaml must be a mapping of settings');
+  change(raw);
+  writeConfig(raw);
+}
+
+// Set values in the auth section of the file as it is right now (see
+// updateRawConfig), leaving everything else, including the rest of auth, alone.
+// The section does not have to exist yet, and an old `api` section is left as it is.
+function setAuthValues(values) {
+  updateRawConfig(raw => {
+    if (raw.auth !== undefined && raw.auth !== null && (typeof raw.auth !== 'object' || Array.isArray(raw.auth))) {
+      throw new Error('auth in config.yaml must be a mapping');
+    }
+    raw.auth = { ...(raw.auth || {}), ...values };
+  });
+}
+
 function ensureLogDir() {
   const logDir = getLogsDir();
   if (!fs.existsSync(logDir)) {
@@ -171,4 +200,4 @@ function getSelfName(config = loadConfig()) {
   return config.server?.selfName || 'taskserver';
 }
 
-module.exports = { loadConfig, loadConfigStrict, readRawConfig, writeConfig, ensureLogDir, getLogsDir, getSelfName };
+module.exports = { getConfigPath, loadConfig, loadConfigStrict, readRawConfig, writeConfig, updateRawConfig, setAuthValues, ensureLogDir, getLogsDir, getSelfName };

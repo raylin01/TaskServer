@@ -1,32 +1,30 @@
-'use strict';
-
 // Who may talk to TaskServer, and from where.
 //
-// One check sits in front of every route (only the login page and the static
-// files in public/ are open):
+// Authentication is opt-in: `auth.required: true` in config.yaml. When it is on,
+// one check sits in front of every route, and there are two kinds of caller:
 //
-//  - With `api.authEnabled: true` a request must carry the API key in the
-//    `X-API-Key` header (scripts and other programs) or a session cookie (the
-//    dashboard, after signing in at /login with the same key). The key is never
-//    accepted in a URL, and is compared in constant time. Repeated wrong keys
-//    from one address are slowed down.
-//  - A session is a random id kept in memory. Signing out removes it, and so does
-//    a restart (everyone signs in again). The cookie and the CSRF token are made
-//    from random per-process secrets, never from the API key.
+//  - Programs call `/api/*` with the API key (`auth.apiKey`) in the `X-API-Key`
+//    header and nothing else: not a URL parameter, not Basic auth, not a session
+//    cookie. The key is compared in constant time. A refused request gets a
+//    fixed 401 and one log line (method, path, address; never the key).
+//  - People use the dashboard (every other route). They sign in at /login with
+//    the dashboard password, which is a different secret from the API key and is
+//    kept in config.yaml only as a scrypt hash (`auth.dashboardPasswordHash`). A
+//    session is a random id kept in memory; the key does not open the dashboard.
+//
+//  Only the login page and the static files in public/ are open. Wrong keys, and
+//  wrong passwords, from one address are slowed down (separately).
+//
+//  - A session is a random 256-bit id kept in memory for 7 days. Signing out
+//    removes it, and so does a restart (everyone signs in again). Changing the
+//    password ends every session. The CSRF token is made from a random
+//    per-process secret and the session, never from a credential.
 //  - A state-changing request from a browser must come from this site: its
-//    Origin has to be this server's own host or one of `server.publicOrigins`
-//    (or, with no Origin or with `Origin: null`, Sec-Fetch-Site has to say
-//    same-origin), and it has to
-//    carry the CSRF token the dashboard pages embed. A request with a valid API
-//    key header is exempt: a web page cannot add that header to a cross-site
-//    request. Programs that send neither an Origin nor a cookie are not
-//    browsers and are only let through when authentication is off.
-//  - Optionally (`api.dashboardAuth: false`, with auth on) the dashboard pages
-//    need no key or session when the request is unmistakably local: the socket,
-//    the Host header and the absence of proxy headers all say loopback, and
-//    `server.publicOrigins` is empty. Anything else is asked for the key as
-//    usual. `/api/*` is never part of this: it always needs the key. Browser
-//    posts to the pages still need this site's Origin and a CSRF token.
+//    Origin (or, when there is none, its Referer) has to be this server's own
+//    host or one of `server.publicOrigins` (with `Origin: null`, Sec-Fetch-Site
+//    has to say same-origin), and it has to carry the CSRF token the dashboard
+//    pages embed. A request with a valid API key header is exempt: a web page
+//    cannot add that header to a cross-site request.
 //  - With authentication off, only loopback host names (and `server.allowedHosts`)
 //    are served, so a page cannot reach TaskServer through DNS rebinding.
 //  - Once settings have been read, a config.yaml that later goes missing, is
@@ -37,23 +35,43 @@
 const crypto = require('crypto');
 const express = require('express');
 const configHandler = require('./configHandler');
+const { asyncHandler, isApiPath } = require('./httpErrors');
+const { parseHash, verifyPassword, MAX_PASSWORD_LENGTH } = require('./passwordHash');
 
 const SESSION_COOKIE = 'taskserver_session';
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS = 200;
-const MIN_KEY_LENGTH = 16;
+const MIN_KEY_LENGTH = 32;
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const LOOPBACK_NAMES = new Set(['localhost', '127.0.0.1', '::1']);
+// An API key is printable ASCII without spaces: that is what an HTTP header can
+// carry unchanged, so the length check and the comparison see the same text.
+const KEY_PATTERN = new RegExp(`^[\\x21-\\x7e]{${MIN_KEY_LENGTH},}$`);
+// At most this many password checks (scrypt is slow and memory hungry) run at once.
+const MAX_VERIFYING = 2;
+// Settings that used to live under `api`, replaced by `auth`. A block that only
+// says "off" (the old example config) is harmless and counts as absent; anything
+// else is refused by name.
+const OLD_API_KEYS = {
+  authEnabled: { now: 'auth.required', inert: value => value === undefined || value === false },
+  apiKey: { now: 'auth.apiKey', inert: value => value === undefined || value === null || value === '' },
+  dashboardAuth: { now: null, inert: value => value === undefined || value === true },
+};
 
-// Wrong keys: after FREE_FAILURES different wrong keys from one address, further
-// requests from it are refused for a pause that doubles up to MAX_PAUSE_MS. The
-// same wrong key again counts for nothing (a client that forgot to update its
-// key must not lock everyone else out). A right key outside a pause starts the
-// count again. Failures are forgotten after FORGET_MS without a new one.
+// Wrong keys (and, separately, wrong passwords): after FREE_FAILURES different
+// wrong tries from one address, further wrong tries from it are refused for a
+// pause that doubles up to MAX_PAUSE_MS. For the API a right key is always
+// accepted (the pause only silences wrong ones); a login is refused during the
+// pause whatever the password, because each check costs a lot. The same wrong
+// try again counts for nothing against the API (a client that forgot to update
+// its key must not be a problem for anyone else), and for logins counts
+// REPEAT_FACTOR times less. A right try outside a pause starts the count again.
+// Failures are forgotten after FORGET_MS without a new one.
 // Clients on the loopback interface (the scripts and the console on the same
 // machine, all sharing one address) get a short pause, LOOPBACK_PAUSE_MS, unless a
 // proxy or tunnel is configured or announced by its headers.
 const FREE_FAILURES = 5;
+const REPEAT_FACTOR = 4;
 const BASE_PAUSE_MS = 1000;
 const MAX_PAUSE_MS = 30000;
 const LOOPBACK_PAUSE_MS = 2000;
@@ -62,30 +80,12 @@ const REMEMBERED_WRONG_KEYS = 8;
 const MAX_CLIENTS = 10000;
 const SWEEP_MS = 60 * 1000;
 // Headers a proxy or tunnel adds. Any one of them means the request did not come
-// straight from a local client: it gets the long pause for wrong keys, and is
-// never served the dashboard without a key. (A proxy or port forward that adds
-// none of them cannot be told apart from a local client; see the README.)
+// straight from a local client: it gets the long pause for wrong keys.
 const PROXY_HEADERS = [
   'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'x-forwarded-port', 'x-forwarded-server',
   'x-real-ip', 'forwarded', 'via', 'cf-connecting-ip', 'true-client-ip', 'x-client-ip', 'x-original-url',
 ];
 const hasProxyHeader = req => PROXY_HEADERS.some(name => req.headers[name] !== undefined);
-
-// The dashboard's own pages, forms and data routes: the only paths that may be
-// served without a key when `api.dashboardAuth` is false. A list of what is
-// allowed (not a test for "/api") so a path that is spelled oddly, or a route
-// added later, asks for the key until it is put here on purpose.
-const DASHBOARD_PATHS = [
-  /^\/$/,
-  /^\/scripts$/,
-  /^\/add-script$/,
-  /^\/settings$/,
-  /^\/logout$/,
-  /^\/(?:edit-script|delete-script|stop-script|start-script|restart-script|suspend-cron|resume-cron|run-cron-now)\/[^/]+$/,
-  /^\/logs\/[^/]+$/,
-  /^\/logs\/[^/]+\/data(?:\/(?:stats|chunk|download|delete))?$/,
-];
-const isDashboardPath = path => DASHBOARD_PATHS.some(pattern => pattern.test(path));
 
 // Scripts and styles only from this site, nothing inline. Inline styles stay
 // allowed because the pages use style attributes.
@@ -123,94 +123,119 @@ function hostNameOf(header) {
 
 const isMapping = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+// The old `api` settings in a config that are not just "off", as names, or []
+// when there are none (or the block is the harmless old default).
+function oldSettingsIn(config) {
+  if (config.api === undefined || config.api === null) return [];
+  if (!isMapping(config.api)) return ['api'];
+  return Object.entries(OLD_API_KEYS)
+    .filter(([key, { inert }]) => !inert(config.api[key]))
+    .map(([key]) => `api.${key}`);
+}
+
+function oldSettingsProblem(names) {
+  const moves = names.map(name => {
+    const { now } = OLD_API_KEYS[name.slice(4)] || {};
+    return now ? `${name} is now ${now}` : `${name} is gone`;
+  });
+  return `config.yaml still has the old settings ${names.join(', ')}; they were replaced by the auth section `
+    + `(${moves.join('; ')}). Move them, and note that auth.required: true also needs auth.dashboardPasswordHash `
+    + '(run "npm run set-dashboard-password") and an auth.apiKey of at least '
+    + `${MIN_KEY_LENGTH} characters. See "Before you update" in the README`;
+}
+
 // The security settings in a config (as YAML gave it, or merged with defaults).
-// Returns { settings } or { problem } where the problem names the config key and
-// carries nothing from the file. `previous` is what was read last time, if
-// anything: settings may not quietly lose their `api` block.
+// Returns { settings } or { problem, problems } where each problem names the
+// config key and carries nothing from the file. `previous` is what was read last
+// time, if anything: settings may not quietly lose their `auth` block.
 function parseSettings(config, previous = null) {
+  const refuse = problems => ({ problem: problems.join('; '), problems });
   if (config === undefined || config === null) {
     return previous
-      ? { problem: 'config.yaml is missing or empty' }
+      ? refuse(['config.yaml is missing or empty'])
       : { settings: settingsOf({}, {}, false) };
   }
-  if (!isMapping(config)) return { problem: 'config.yaml must be a mapping of settings' };
+  if (!isMapping(config)) return refuse(['config.yaml must be a mapping of settings']);
 
-  const hasApi = config.api !== undefined;
-  if (previous?.hasApi && !hasApi) return { problem: 'config.yaml no longer has the api section' };
-  if (hasApi && !isMapping(config.api)) return { problem: 'api in config.yaml must be a mapping' };
-  const api = hasApi ? config.api : {};
-  if (previous?.enabled && api.authEnabled === undefined) {
-    return { problem: 'api.authEnabled in config.yaml is missing (it was on); set it to false to turn authentication off' };
+  const problems = [];
+  // The old `api.authEnabled` / `api.apiKey` settings are gone. Ignoring them
+  // would quietly leave a server that someone thinks is protected open.
+  const old = oldSettingsIn(config);
+  if (old.length) problems.push(oldSettingsProblem(old));
+
+  const hasAuth = config.auth !== undefined;
+  let auth = {};
+  if (previous?.hasAuth && !hasAuth) problems.push('config.yaml no longer has the auth section');
+  if (hasAuth && !isMapping(config.auth)) problems.push('auth in config.yaml must be a mapping');
+  else if (hasAuth) auth = config.auth;
+  if (previous?.required && auth.required === undefined) {
+    problems.push('auth.required in config.yaml is missing (it was on); set it to false to turn authentication off');
   }
-  if (api.authEnabled !== undefined && typeof api.authEnabled !== 'boolean') {
-    return { problem: 'api.authEnabled in config.yaml must be true or false' };
+  const requiredOk = auth.required === undefined || typeof auth.required === 'boolean';
+  if (!requiredOk) problems.push('auth.required in config.yaml must be true or false');
+  const typeOk = {};
+  for (const key of ['apiKey', 'dashboardPasswordHash']) {
+    typeOk[key] = auth[key] === undefined || auth[key] === null || typeof auth[key] === 'string';
+    if (!typeOk[key]) problems.push(`auth.${key} in config.yaml must be a string`);
   }
-  if (api.apiKey !== undefined && typeof api.apiKey !== 'string') {
-    return { problem: 'api.apiKey in config.yaml must be a string' };
+  const required = auth.required === true;
+  const apiKey = typeof auth.apiKey === 'string' ? auth.apiKey : '';
+  const storedHash = typeof auth.dashboardPasswordHash === 'string' ? auth.dashboardPasswordHash : '';
+  const hashValid = parseHash(storedHash) !== null;
+  if (storedHash !== '' && !hashValid) {
+    problems.push('auth.dashboardPasswordHash in config.yaml is not a hash made by "npm run set-dashboard-password"');
   }
-  if (api.dashboardAuth !== undefined && typeof api.dashboardAuth !== 'boolean') {
-    return { problem: 'api.dashboardAuth in config.yaml must be true or false' };
-  }
-  const enabled = api.authEnabled === true;
-  const apiKey = api.apiKey ?? '';
-  if (enabled && apiKey.trim().length < MIN_KEY_LENGTH) {
-    return { problem: `api.apiKey in config.yaml must be at least ${MIN_KEY_LENGTH} characters when api.authEnabled is true` };
+  if (required) {
+    const missing = [];
+    if (typeOk.apiKey && !KEY_PATTERN.test(apiKey)) {
+      missing.push(`auth.apiKey (at least ${MIN_KEY_LENGTH} printable characters without spaces; run "npm run set-api-key")`);
+    }
+    if (typeOk.dashboardPasswordHash && storedHash === '') {
+      missing.push('auth.dashboardPasswordHash (run "npm run set-dashboard-password")');
+    }
+    if (missing.length) problems.push(`auth.required is true in config.yaml but it needs ${missing.join(' and ')}`);
   }
 
   if (config.server !== undefined && config.server !== null && !isMapping(config.server)) {
-    return { problem: 'server in config.yaml must be a mapping' };
+    problems.push('server in config.yaml must be a mapping');
   }
-  const server = config.server || {};
+  const server = isMapping(config.server) ? config.server : {};
   for (const key of ['allowedHosts', 'publicOrigins']) {
     if (server[key] !== undefined && (!Array.isArray(server[key]) || server[key].some(item => typeof item !== 'string'))) {
-      return { problem: `server.${key} in config.yaml must be a list of strings` };
+      problems.push(`server.${key} in config.yaml must be a list of strings`);
     }
   }
   const publicOrigins = [];
-  for (const entry of server.publicOrigins || []) {
-    try {
-      const url = new URL(entry);
-      if (!['http:', 'https:'].includes(url.protocol)) throw new Error('protocol');
-      publicOrigins.push(url.origin);
-    } catch (error) {
-      return { problem: 'server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com' };
+  if (Array.isArray(server.publicOrigins)) {
+    for (const entry of server.publicOrigins.filter(item => typeof item === 'string')) {
+      try {
+        const url = new URL(entry);
+        if (!['http:', 'https:'].includes(url.protocol)) throw new Error('protocol');
+        publicOrigins.push(url.origin);
+      } catch (error) {
+        problems.push('server.publicOrigins in config.yaml must hold origins such as https://dashboard.example.com');
+        break;
+      }
     }
   }
-  // Keyless dashboard pages are only honoured while nothing contradicts them
-  // (start-up refuses such a config; a file edited while running just goes back
-  // to asking for the key). dashboardAuthConflicts relies on configHandler
-  // defaulting server.host to loopback when it is left out.
-  const dashboardAuth = api.dashboardAuth !== false || dashboardAuthConflicts(config).length > 0;
-  return { settings: { ...settingsOf(api, server, hasApi), enabled, apiKey, publicOrigins, dashboardAuth } };
+  if (problems.length) return refuse(problems);
+  return { settings: {
+    ...settingsOf(auth, server, hasAuth),
+    required,
+    apiKey,
+    passwordHash: required ? storedHash : '',
+    passwordTag: required ? sha256(storedHash).toString('hex') : '',
+    publicOrigins,
+  } };
 }
 
-// Reasons `api.dashboardAuth: false` cannot be used with this config, each
-// naming the key. Empty when it is not asked for, or is safe.
-function dashboardAuthConflicts(config) {
-  if (!isMapping(config) || !isMapping(config.api) || config.api.dashboardAuth !== false) return [];
-  const conflicts = [];
-  const host = config.server?.host;
-  if (host && !isLoopbackHost(host)) {
-    conflicts.push(`api.dashboardAuth is false but server.host is ${host}, not a loopback address, `
-      + 'so other machines could open the dashboard without a key: set server.host to 127.0.0.1 or remove api.dashboardAuth');
-  }
-  if (config.cloudflare?.enabled) {
-    conflicts.push('api.dashboardAuth is false but cloudflare.enabled is true, '
-      + 'so visitors through the tunnel could open the dashboard without a key: turn the tunnel off or remove api.dashboardAuth');
-  }
-  if (Array.isArray(config.server?.publicOrigins) && config.server.publicOrigins.length) {
-    conflicts.push('api.dashboardAuth is false but server.publicOrigins is not empty, '
-      + 'so the dashboard is reached through a proxy and anyone behind it could open it without a key: empty server.publicOrigins or remove api.dashboardAuth');
-  }
-  return conflicts;
-}
-
-function settingsOf(api, server, hasApi) {
+function settingsOf(auth, server, hasAuth) {
   return {
-    enabled: false,
+    required: false,
     apiKey: '',
-    dashboardAuth: true,
-    hasApi,
+    passwordHash: '',
+    passwordTag: '',
+    hasAuth,
     host: typeof server.host === 'string' ? server.host : undefined,
     allowedHosts: server.allowedHosts || [],
     publicOrigins: [],
@@ -218,7 +243,7 @@ function settingsOf(api, server, hasApi) {
 }
 
 // Settings that refuse everything: used when config.yaml was never usable.
-const REFUSE_ALL = { enabled: true, apiKey: '', dashboardAuth: true, hasApi: true, host: undefined, allowedHosts: [], publicOrigins: [] };
+const REFUSE_ALL = { required: true, apiKey: '', passwordHash: '', passwordTag: '', hasAuth: true, host: undefined, allowedHosts: [], publicOrigins: [] };
 
 // Reads the settings from config.yaml on each call (the file can change while
 // running). Settings that cannot be used never switch protection off: the last
@@ -256,17 +281,29 @@ function createAuthSource({ read = configHandler.readRawConfig, logger = console
 function listenProblems(config) {
   const parsed = parseSettings(config);
   const problems = [];
-  if (parsed.problem) problems.push(parsed.problem);
-  const enabled = Boolean(parsed.settings?.enabled);
+  problems.push(...(parsed.problems || []));
+  const required = Boolean(parsed.settings?.required);
   const exposure = [];
   if (!isLoopbackHost(config.server?.host)) exposure.push(`server.host is ${config.server?.host}, not a loopback address`);
   if (config.cloudflare?.enabled) exposure.push('cloudflare.enabled is true');
-  if (exposure.length && !enabled) {
+  if (exposure.length && !required) {
     problems.push(`${exposure.join(' and ')}, so the dashboard is reachable from other machines: `
-      + `set api.authEnabled: true and an api.apiKey of at least ${MIN_KEY_LENGTH} characters in config.yaml`);
+      + 'turn on authentication with auth.required: true (see "Authentication" in the README)');
   }
-  problems.push(...dashboardAuthConflicts(config));
   return problems;
+}
+
+// What start-up checks before it listens or touches PM2: the config file loaded
+// strictly, then listenProblems. `config` is null when the file could not be
+// used. Also behind "npm run check-config", so the two cannot disagree.
+function startupCheck(load = configHandler.loadConfigStrict) {
+  let config;
+  try {
+    config = load();
+  } catch (error) {
+    return { config: null, problems: [error.message] };
+  }
+  return { config, problems: listenProblems(config) };
 }
 
 function parseCookies(header) {
@@ -287,11 +324,11 @@ function localPath(value, fallback = '/scripts') {
 
 const isLoopbackAddress = address => /^(127(\.\d{1,3}){3}|::1|::ffff:127(\.\d{1,3}){3})$/.test(String(address || ''));
 
-// Failed-key bookkeeping per client address: { count, last, blockedUntil, seen }
-// where `seen` holds short hashes of the last few wrong keys. The table is
+// Failed-attempt bookkeeping per client address: { count, last, blockedUntil, seen }
+// where `seen` holds short hashes of the last few wrong tries. The table is
 // capped: the entry touched longest ago goes first (an update re-inserts the
 // entry at the end), and stale entries are swept at most once a minute.
-function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS } = {}) {
+function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS, repeatLimit = Infinity } = {}) {
   const clients = new Map();
   let swept = now();
   const sweep = time => {
@@ -305,30 +342,35 @@ function createThrottle(now, freeFailures, { maxClients = MAX_CLIENTS } = {}) {
       const entry = clients.get(client);
       return entry && entry.blockedUntil > now() ? Math.ceil((entry.blockedUntil - now()) / 1000) : 0;
     },
-    // A wrong key. `maxPauseMs` caps the pause for this client.
+    // A wrong try. `maxPauseMs` caps the pause for this client. The same wrong
+    // try again counts toward `repeatLimit` (never, by default).
     fail(client, key, maxPauseMs = MAX_PAUSE_MS) {
       const time = now();
       sweep(time);
       let entry = clients.get(client);
-      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, last: time, blockedUntil: 0, seen: new Set() };
+      if (!entry || time - entry.last > FORGET_MS) entry = { count: 0, repeats: 0, last: time, blockedUntil: 0, seen: new Set() };
       const tag = sha256(key).toString('hex').slice(0, 16);
-      if (entry.seen.has(tag)) return; // the same wrong key again: nothing new was guessed
-      entry.seen.add(tag);
-      if (entry.seen.size > REMEMBERED_WRONG_KEYS) entry.seen.delete(entry.seen.values().next().value);
-      entry.count += 1;
-      entry.last = time;
-      if (entry.count >= freeFailures) {
-        entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** (entry.count - freeFailures), maxPauseMs);
+      if (entry.seen.has(tag)) {
+        if (repeatLimit === Infinity) return; // nothing new was guessed
+        entry.repeats += 1;
+      } else {
+        entry.seen.add(tag);
+        if (entry.seen.size > REMEMBERED_WRONG_KEYS) entry.seen.delete(entry.seen.values().next().value);
+        entry.count += 1;
       }
+      entry.last = time;
+      const over = Math.max(entry.count - freeFailures, entry.repeats - repeatLimit);
+      if (over >= 0) entry.blockedUntil = time + Math.min(BASE_PAUSE_MS * 2 ** over, maxPauseMs);
       clients.delete(client);
       clients.set(client, entry);
       while (clients.size > maxClients) clients.delete(clients.keys().next().value);
     },
-    // A right key outside a pause.
+    // A right try outside a pause.
     succeed(client) {
       const entry = clients.get(client);
       if (entry && entry.blockedUntil <= now()) {
         entry.count = 0;
+        entry.repeats = 0;
         entry.blockedUntil = 0;
       }
     },
@@ -341,17 +383,30 @@ function createSecurity({
   csrfSecret = crypto.randomBytes(32),
   now = Date.now,
   freeFailures = FREE_FAILURES,
+  logger = console,
+  verify = verifyPassword,
 } = {}) {
-  const throttle = createThrottle(now, freeFailures);
+  // Keys and passwords are counted apart: a locked-out login must not slow down
+  // the scripts that call the API from the same address, or the other way round.
+  const keyThrottle = createThrottle(now, freeFailures);
+  const loginThrottle = createThrottle(now, freeFailures, { repeatLimit: freeFailures * REPEAT_FACTOR });
+  let verifying = 0; // password checks running now
   const clientOf = req => req.socket?.remoteAddress || 'unknown';
   const pauseCapFor = (req, auth) => (isLoopbackAddress(clientOf(req)) && auth.publicOrigins.length === 0
     && !hasProxyHeader(req) ? LOOPBACK_PAUSE_MS : MAX_PAUSE_MS);
+
+  // One line per refused request: what was asked and by whom, never a secret,
+  // a query string (an old client might put a key there) or a header.
+  const logRefusal = (what, req) => {
+    const target = String(req.path || '').replace(/[^\x21-\x7e]/g, '?').slice(0, 200);
+    logger.warn?.(`TaskServer ${what} refused: ${req.method} ${target} from ${clientOf(req)}`);
+  };
 
   // One read of config.yaml per request, shared by every check.
   const settingsFor = req => {
     if (!req.securitySettings) {
       req.securitySettings = loadAuth();
-      if (!req.securitySettings.enabled && sessions.size) sessions.clear(); // auth switched off: forget every session
+      if (!req.securitySettings.required && sessions.size) sessions.clear(); // auth switched off: forget every session
     }
     return req.securitySettings;
   };
@@ -359,34 +414,30 @@ function createSecurity({
   const keyMatches = (auth, given) => auth.apiKey !== '' && typeof given === 'string'
     && crypto.timingSafeEqual(sha256(given), sha256(auth.apiKey));
 
-  // Live sessions: id -> { expires, key }. `key` is a hash of the API key the
-  // session was made with, so changing the key ends every session.
+  // Live sessions: sha256(id) -> { expires, tag }. Only a hash of the id is kept.
+  // `tag` identifies the password the session was made with, so changing the
+  // password ends every session.
   const sessions = new Map();
-  const keyTag = auth => sha256(auth.apiKey).toString('hex');
+  const idKey = id => sha256(id).toString('hex');
   const newSession = auth => {
     const time = now();
-    for (const [id, session] of sessions) if (session.expires <= time) sessions.delete(id);
+    for (const [key, session] of sessions) if (session.expires <= time) sessions.delete(key);
     while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
     const id = crypto.randomBytes(32).toString('base64url');
-    sessions.set(id, { expires: time + SESSION_MS, key: keyTag(auth) });
+    sessions.set(idKey(id), { expires: time + SESSION_MS, tag: auth.passwordTag });
     return id;
   };
   const sessionValid = (auth, id) => {
-    const session = typeof id === 'string' ? sessions.get(id) : undefined;
+    const session = typeof id === 'string' && id ? sessions.get(idKey(id)) : undefined;
     if (!session) return false;
     if (session.expires <= now()) {
-      sessions.delete(id);
+      sessions.delete(idKey(id));
       return false;
     }
-    return auth.apiKey !== '' && session.key === keyTag(auth);
+    return auth.passwordTag !== '' && session.tag === auth.passwordTag;
   };
 
   const csrfFor = session => hmac(csrfSecret, `csrf|${session || ''}`);
-  // The CSRF token of the keyless local dashboard (see isLocalDashboard). With no
-  // session to bind it to, it is bound to this process: made from the random
-  // per-process secret under its own label, so it differs from every session's
-  // token and from the one used when authentication is off, and changes on restart.
-  const localDashboardToken = hmac(csrfSecret, 'csrf-local-dashboard');
 
   const sessionCookie = (req, value, maxAgeMs) => {
     const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
@@ -406,7 +457,7 @@ function createSecurity({
   // With authentication off, only loopback names are served.
   function hostGuard(req, res, next) {
     const auth = settingsFor(req);
-    if (auth.enabled) return next();
+    if (auth.required) return next();
     const name = hostNameOf(req.headers.host);
     const allowed = isLoopbackHost(name)
       || auth.allowedHosts.some(entry => entry.toLowerCase() === name)
@@ -415,94 +466,88 @@ function createSecurity({
     next();
   }
 
-  // May this request use the dashboard without a key (`api.dashboardAuth: false`)?
-  // Only when everything says it comes from this machine: the socket, the Host
-  // header, and no proxy headers, and no proxy configured. Any doubt means the
-  // usual key or session. `/api` is never open this way (see DASHBOARD_PATHS).
-  const isLocalDashboard = (req, auth) => auth.enabled && auth.dashboardAuth === false
-    && auth.publicOrigins.length === 0
-    && isLoopbackAddress(clientOf(req))
-    && isLoopbackHost(hostNameOf(req.headers.host))
-    && !hasProxyHeader(req);
-
-  // Where /login sends a keyless visitor: the page asked for, if it is one the
-  // keyless dashboard serves. Otherwise (a spelling such as /Scripts or /scripts/
-  // that asked for the key) /scripts, so /login and the page cannot send each
-  // other round in a loop.
-  const keylessTarget = next => (isDashboardPath(next.split(/[?#]/)[0]) ? next : '/scripts');
-
-  const wantsPage = req => req.method === 'GET' && !req.path.startsWith('/api/')
+  const wantsPage = req => req.method === 'GET' && !isApiPath(req.path)
     && String(req.headers.accept || '').includes('text/html');
 
-  const tooMany = (res, seconds) => res.set('Retry-After', String(seconds)).status(429)
-    .json({ error: 'Too Many Requests', message: 'Too many wrong keys; wait and try again' });
+  const tooMany = (res, seconds, message) => res.set('Retry-After', String(seconds)).status(429)
+    .json({ error: 'Too Many Requests', message });
+
+  // /api/* takes the X-API-Key header and nothing else.
+  function authenticateApi(req, res, next, auth) {
+    const given = req.headers['x-api-key'];
+    if (given !== undefined) {
+      // The key is checked first and a right one always works. A pause only
+      // silences clients that keep sending wrong keys.
+      if (keyMatches(auth, given)) {
+        keyThrottle.succeed(clientOf(req));
+        req.authMode = 'key';
+        return next();
+      }
+      const seconds = keyThrottle.wait(clientOf(req));
+      if (seconds) {
+        logRefusal('API', req);
+        return tooMany(res, seconds, 'Too many wrong keys; wait and try again');
+      }
+      keyThrottle.fail(clientOf(req), given, pauseCapFor(req, auth));
+    }
+    logRefusal('API', req);
+    return res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required' });
+  }
 
   function authenticate(req, res, next) {
     const auth = settingsFor(req);
     req.authMode = 'off';
-    res.locals.authEnabled = auth.enabled;
+    res.locals.authRequired = auth.required;
     res.locals.csrfToken = csrfFor('');
-    if (!auth.enabled) return next();
+    if (!auth.required) return next();
+    if (isApiPath(req.path)) return authenticateApi(req, res, next, auth);
 
-    const given = req.headers['x-api-key'];
-    if (given === undefined && isDashboardPath(req.path) && isLocalDashboard(req, auth)) {
-      req.authMode = 'local';
-      req.csrfToken = localDashboardToken;
-      res.locals.csrfToken = localDashboardToken;
-      res.locals.authEnabled = false; // nothing to sign in to or out of
+    // The dashboard: a session, never the API key.
+    const id = parseCookies(req.headers.cookie)[SESSION_COOKIE];
+    if (sessionValid(auth, id)) {
+      req.authMode = 'session';
+      req.sessionId = id;
+      res.locals.csrfToken = csrfFor(id);
+      req.csrfToken = res.locals.csrfToken;
       return next();
     }
-    if (given !== undefined) {
-      const seconds = throttle.wait(clientOf(req));
-      if (seconds) return tooMany(res, seconds);
-      if (keyMatches(auth, given)) {
-        throttle.succeed(clientOf(req));
-        req.authMode = 'key';
-        return next();
-      }
-      throttle.fail(clientOf(req), given, pauseCapFor(req, auth));
-    } else {
-      const id = parseCookies(req.headers.cookie)[SESSION_COOKIE];
-      if (sessionValid(auth, id)) {
-        req.authMode = 'session';
-        req.sessionId = id;
-        res.locals.csrfToken = csrfFor(id);
-        req.csrfToken = res.locals.csrfToken;
-        return next();
-      }
-    }
     if (wantsPage(req)) return res.redirect(`/login?next=${encodeURIComponent(req.originalUrl)}`);
-    return res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required' });
+    if (!SAFE_METHODS.has(req.method)) logRefusal('dashboard', req);
+    return res.status(401).json({ error: 'Unauthorized', message: 'Sign in required' });
   }
 
-  // Does the request come from a page of this site? Sec-Fetch-Site "none" (the
-  // user typing the address) is not accepted: nobody types in a POST.
+  // Does the request come from a page of this site? The Origin says so; when
+  // there is none, the Referer does. Sec-Fetch-Site "none" (the user typing the
+  // address) is not accepted: nobody types in a POST.
   //
   // `Origin: null` is no usable Origin. Browsers send it on a same-origin form
   // post when the Referrer-Policy is no-referrer, but also from sandboxed frames
-  // and file:// pages. So it counts only when Sec-Fetch-Site says same-origin,
-  // exactly as when there is no Origin at all.
+  // and file:// pages. So it counts only when Sec-Fetch-Site says same-origin.
   function fromThisSite(req, auth) {
-    const origin = req.headers.origin;
-    if (origin !== undefined && origin !== 'null') {
+    const sameSite = value => {
       try {
-        const url = new URL(origin);
+        const url = new URL(value);
         return url.host === req.headers.host || auth.publicOrigins.includes(url.origin);
       } catch (error) {
         return false;
       }
-    }
+    };
+    const { origin, referer } = req.headers;
+    if (origin !== undefined && origin !== 'null') return sameSite(origin);
+    if (origin === undefined && referer !== undefined) return sameSite(referer);
     return req.headers['sec-fetch-site'] === 'same-origin';
   }
 
   function csrfGuard(req, res, next) {
     if (SAFE_METHODS.has(req.method) || req.authMode === 'key') return next();
-    // Without a key or a session in the way, every state change counts as a
-    // browser's, even one that sends no Origin: it must prove it came from the page.
+    // Without a key or a session in the way, a state change counts as a
+    // browser's when it says so; a script that sends neither is let through
+    // only while authentication is off (with it on, a session is required).
     const browser = req.headers.origin !== undefined || req.headers['sec-fetch-site'] !== undefined
-      || req.authMode === 'session' || req.authMode === 'local';
+      || req.authMode === 'session';
     if (!browser) return next();
     if (!fromThisSite(req, settingsFor(req))) {
+      logRefusal('cross-site request', req);
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }
     const token = req.body?._csrf ?? req.headers['x-csrf-token'];
@@ -513,44 +558,63 @@ function createSecurity({
     next();
   }
 
-  // Sign in with the API key. Mounted before authenticate.
+  // Sign in with the dashboard password. Mounted before authenticate.
   const loginRouter = express.Router();
   loginRouter.use('/login', express.urlencoded({ extended: false, limit: '4kb' }));
   loginRouter.get('/login', (req, res) => {
     const auth = settingsFor(req);
     const next = localPath(req.query.next);
-    if (!auth.enabled || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
-    if (isLocalDashboard(req, auth)) return res.redirect(keylessTarget(next));
+    if (!auth.required || sessionValid(auth, parseCookies(req.headers.cookie)[SESSION_COOKIE])) return res.redirect(next);
     res.render('login', { next, error: null });
   });
-  loginRouter.post('/login', (req, res) => {
+  loginRouter.post('/login', asyncHandler(async (req, res) => {
     const auth = settingsFor(req);
     const next = localPath(req.body?.next);
-    if (!auth.enabled) return res.redirect(next);
-    if (isLocalDashboard(req, auth)) return res.redirect(keylessTarget(next));
-    if (req.headers.origin !== undefined && !fromThisSite(req, auth)) {
+    if (!auth.required) return res.redirect(next);
+    // A login is a state change like any other: it has to come from this site.
+    if (!fromThisSite(req, auth)) {
+      logRefusal('cross-site request', req);
       return res.status(403).type('text/plain').send('Cross-site request refused');
     }
-    const seconds = throttle.wait(clientOf(req));
+    const client = clientOf(req);
+    const seconds = loginThrottle.wait(client);
     if (seconds) {
+      logRefusal('login', req);
       return res.set('Retry-After', String(seconds)).status(429)
-        .render('login', { next, error: `Too many wrong keys. Wait ${seconds} s and try again.` });
+        .render('login', { next, error: `Too many wrong passwords. Wait ${seconds} s and try again.` });
     }
-    if (!keyMatches(auth, req.body?.apiKey)) {
-      throttle.fail(clientOf(req), String(req.body?.apiKey ?? ''), pauseCapFor(req, auth));
-      return res.status(401).render('login', { next, error: 'That key is not correct.' });
+    const given = req.body?.password;
+    let ok = false;
+    if (typeof given === 'string' && given.length <= MAX_PASSWORD_LENGTH) {
+      // Each check takes a lot of CPU and memory: only a few at a time, so a flood
+      // of attempts cannot starve the server.
+      if (verifying >= MAX_VERIFYING) {
+        logRefusal('login', req);
+        return res.set('Retry-After', '1').status(429)
+          .render('login', { next, error: 'Too many sign-in attempts at once. Try again in a moment.' });
+      }
+      verifying += 1;
+      try {
+        ok = await verify(given, auth.passwordHash);
+      } finally {
+        verifying -= 1;
+      }
     }
-    throttle.succeed(clientOf(req));
+    if (!ok) {
+      loginThrottle.fail(client, String(given ?? ''), pauseCapFor(req, auth));
+      logRefusal('login', req);
+      return res.status(401).render('login', { next, error: 'That password is not correct.' });
+    }
+    loginThrottle.succeed(client);
     res.set('Set-Cookie', sessionCookie(req, newSession(auth), SESSION_MS));
     res.redirect(next);
-  });
+  }));
 
   // Mounted after csrfGuard. Signing out forgets the session on the server, so a
   // copy of the cookie stops working too.
   const sessionRouter = express.Router();
   sessionRouter.post('/logout', (req, res) => {
-    if (req.authMode === 'local') return res.redirect('/scripts'); // no session to end
-    if (req.sessionId) sessions.delete(req.sessionId);
+    if (req.sessionId) sessions.delete(idKey(req.sessionId));
     res.set('Set-Cookie', sessionCookie(req, '', 0));
     res.redirect('/login');
   });
@@ -564,6 +628,7 @@ module.exports = {
   createThrottle,
   parseSettings,
   listenProblems,
+  startupCheck,
   isLoopbackHost,
   localPath,
   PROXY_HEADERS,
